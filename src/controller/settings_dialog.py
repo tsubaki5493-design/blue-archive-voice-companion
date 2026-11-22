@@ -274,8 +274,12 @@ class SettingsDialog(tk.Toplevel):
 
         title_prefix = "초기 설정 안내" if first_run else "MomoTalk 환경 설정"
         self.title(f"⚙️ {title_prefix} — 프롬프트 해석 · 1단계~3단계 · 개인정보 격리")
-        self.geometry("860x760")
-        self.minsize(780, 680)
+        sw = max(800, int(self.winfo_screenwidth() or 1280))
+        sh = max(600, int(self.winfo_screenheight() or 720))
+        self._dlg_w = min(860, max(720, sw - 40))
+        self._dlg_h = min(740, max(520, sh - 92))
+        self.geometry(f"{self._dlg_w}x{self._dlg_h}")
+        self.minsize(min(720, self._dlg_w), min(480, self._dlg_h))
         self.configure(bg="#F3F5F8")
         self.transient(parent)
         self.grab_set()
@@ -405,9 +409,13 @@ class SettingsDialog(tk.Toplevel):
         self._bind_app_live_sync()
         self.update_idletasks()
         try:
-            px = parent.winfo_rootx() + max(20, (parent.winfo_width() - 860) // 2)
-            py = parent.winfo_rooty() + max(10, (parent.winfo_height() - 760) // 2)
-            self.geometry(f"+{px}+{py}")
+            sw = max(800, int(self.winfo_screenwidth() or 1280))
+            sh = max(600, int(self.winfo_screenheight() or 720))
+            px = parent.winfo_rootx() + (parent.winfo_width() - self._dlg_w) // 2
+            py = parent.winfo_rooty() + (parent.winfo_height() - self._dlg_h) // 2
+            px = max(8, min(px, max(8, sw - self._dlg_w - 8)))
+            py = max(8, min(py, max(8, sh - self._dlg_h - 56)))
+            self.geometry(f"{self._dlg_w}x{self._dlg_h}+{px}+{py}")
         except Exception:
             pass
         if 0 <= self._initial_tab < 4:
@@ -536,27 +544,9 @@ class SettingsDialog(tk.Toplevel):
         except Exception:
             pass
 
-        self.notebook = ttk.Notebook(body, style="Momo.TNotebook")
-        self.notebook.pack(fill="both", expand=True)
-
-        tab_prompt = tk.Frame(self.notebook, bg="#F3F5F8", padx=6, pady=8)
-        tab_step1 = tk.Frame(self.notebook, bg="#F3F5F8", padx=6, pady=8)
-        tab_step2 = tk.Frame(self.notebook, bg="#F3F5F8", padx=6, pady=8)
-        tab_step3 = tk.Frame(self.notebook, bg="#F3F5F8", padx=6, pady=8)
-
-        self.notebook.add(tab_prompt, text=" 🎭 프롬프트 해석 버전 ")
-        self.notebook.add(tab_step1, text=" 🔑 1단계: 스팀음성·인증 ")
-        self.notebook.add(tab_step2, text=" 🎤 2단계: 보이스·디렉팅 ")
-        self.notebook.add(tab_step3, text=" 🎧 3단계: 통화모드·오디오·자막 ")
-
-        self._build_tab_prompt(tab_prompt)
-        self._build_tab_step1(tab_step1)
-        self._build_tab_step2(tab_step2)
-        self._build_tab_step3(tab_step3)
-
-        # Footer buttons
+        # Pack footer FIRST with side="bottom" so the Save button is NEVER clipped off-screen on laptops
         ftr = tk.Frame(body, bg="#F3F5F8", pady=4)
-        ftr.pack(fill="x", pady=(8, 0))
+        ftr.pack(side="bottom", fill="x", pady=(8, 0))
         if self.on_open_logs is not None:
             tk.Button(
                 ftr,
@@ -596,6 +586,24 @@ class SettingsDialog(tk.Toplevel):
             pady=7,
             cursor="hand2",
         ).pack(side="right")
+
+        self.notebook = ttk.Notebook(body, style="Momo.TNotebook")
+        self.notebook.pack(side="top", fill="both", expand=True)
+
+        tab_prompt = tk.Frame(self.notebook, bg="#F3F5F8", padx=6, pady=8)
+        tab_step1 = tk.Frame(self.notebook, bg="#F3F5F8", padx=6, pady=8)
+        tab_step2 = tk.Frame(self.notebook, bg="#F3F5F8", padx=6, pady=8)
+        tab_step3 = tk.Frame(self.notebook, bg="#F3F5F8", padx=6, pady=8)
+
+        self.notebook.add(tab_prompt, text=" 🎭 프롬프트 해석 버전 ")
+        self.notebook.add(tab_step1, text=" 🔑 1단계: 스팀음성·인증 ")
+        self.notebook.add(tab_step2, text=" 🎤 2단계: 보이스·디렉팅 ")
+        self.notebook.add(tab_step3, text=" 🎧 3단계: 통화모드·오디오·자막 ")
+
+        self._build_tab_prompt(tab_prompt)
+        self._build_tab_step1(tab_step1)
+        self._build_tab_step2(tab_step2)
+        self._build_tab_step3(tab_step3)
 
     def _card(self, parent: tk.Misc, title: str) -> tk.LabelFrame:
         card = tk.LabelFrame(
@@ -819,7 +827,7 @@ class SettingsDialog(tk.Toplevel):
                 guide,
                 text=(
                     "① 아래 [🔑 키 발급]을 눌러 본인 Fish Audio API 키를 복사한 뒤 [📋 붙여넣기] 클릭\n"
-                    "② 우측 하단 [💾 설정 저장 및 적용] 클릭 → 왼쪽 학생 선택 후 [통화 시작] 누르기 (구글 제미니 로그인 창 자동 실행)\n"
+                    "② 바로 옆 [💾 저장] 버튼(또는 Enter 키 / 하단 [💾 설정 저장 및 적용]) 클릭 → 학생 선택 후 [통화 시작]!\n"
                     "💡 사전 등록된 공개 보이스가 이미 연결되어 있어 별도의 음성 추출 없이 바로 통화할 수 있습니다."
                 ),
                 bg="#FFF1F4",
@@ -833,15 +841,30 @@ class SettingsDialog(tk.Toplevel):
 
         r_fk = tk.Frame(c_steam, bg="#FFFFFF")
         r_fk.pack(fill="x", pady=(0, 8))
-        tk.Label(r_fk, text="Fish Audio API Key:", width=20, anchor="w", bg="#FFFFFF", font=("Malgun Gothic", 9, "bold")).pack(
+        tk.Label(r_fk, text="Fish Audio API Key:", width=18, anchor="w", bg="#FFFFFF", font=("Malgun Gothic", 9, "bold")).pack(
             side="left"
         )
-        self.ent_fish_key = tk.Entry(r_fk, textvariable=self.fish_key_var, show="*", width=38, font=("Consolas", 9))
-        self.ent_fish_key.pack(side="left", padx=(0, 6))
+        self.ent_fish_key = tk.Entry(r_fk, textvariable=self.fish_key_var, show="*", width=28, font=("Consolas", 9))
+        self.ent_fish_key.pack(side="left", padx=(0, 5))
+        self.ent_fish_key.bind("<Return>", lambda _e: self._save_and_close())
         tk.Button(r_fk, text="👁", command=self._toggle_fish_eye, bg="#E2E8F0", width=3).pack(side="left", padx=(0, 4))
         tk.Button(r_fk, text="📋 붙여넣기", command=lambda: self._paste_into(self.fish_key_var), bg="#DCFCE7").pack(
             side="left", padx=(0, 4)
         )
+        tk.Button(
+            r_fk,
+            text="💾 저장",
+            command=self._save_and_close,
+            bg="#FB7390",
+            fg="#FFFFFF",
+            activebackground="#E45C7A",
+            activeforeground="#FFFFFF",
+            relief="flat",
+            font=("Malgun Gothic", 9, "bold"),
+            padx=9,
+            pady=2,
+            cursor="hand2",
+        ).pack(side="left", padx=(0, 4))
         tk.Button(
             r_fk,
             text="🔑 키 발급",
@@ -940,6 +963,7 @@ class SettingsDialog(tk.Toplevel):
         )
         self.ent_gem_key = tk.Entry(rg, textvariable=self.gemini_key_var, show="*", width=31, font=("Consolas", 9))
         self.ent_gem_key.pack(side="left", padx=(0, 4))
+        self.ent_gem_key.bind("<Return>", lambda _e: self._save_and_close())
         tk.Button(rg, text="👁", command=self._toggle_gem_eye, bg="#E2E8F0", width=3).pack(side="left", padx=(0, 4))
         tk.Button(rg, text="📋", command=lambda: self._paste_into(self.gemini_key_var), bg="#DCFCE7", width=3).pack(
             side="left", padx=(0, 4)
