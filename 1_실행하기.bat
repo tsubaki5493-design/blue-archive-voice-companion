@@ -22,29 +22,50 @@ echo [안심 안내] 현재 폴더의 .venv 안에 공식 PyPI 패키지만 설�
 echo [안심 안내] API 키와 로그인 정보는 %%LOCALAPPDATA%%\VoiceCompanionData\ 에만 저장됩니다.
 echo.
 
-echo [1/4] Python 설치 여부를 확인하는 중...
+echo [1/4] 64비트 Python 3.11~3.14 설치 여부를 확인하는 중...
 call :find_python
 if defined SYS_PY_EXE goto :python_ready
 
 echo.
-echo [안내] 이 PC에 Python 3.10 이상이 설치되어 있지 않습니다.
-where winget >nul 2>&1
-if errorlevel 1 goto :python_manual_guide
+echo [안내] 이 PC에 호환되는 64비트 Python 3.11~3.14가 설치되어 있지 않습니다.
 
-echo Microsoft 공식 설치 도구인 winget으로 Python 3.12를 자동 설치할 수 있습니다.
+where py >nul 2>&1
+if errorlevel 1 goto :try_winget_install
+py install --help >nul 2>&1
+if errorlevel 1 goto :try_winget_install
+
+echo Windows의 공식 Python 관리자에서 Python 3.12를 자동으로 설치할 수 있습니다.
 choice /C YN /M "공식 Python 3.12를 지금 자동 설치할까요"
 if errorlevel 2 goto :python_manual_guide
 
 echo.
-echo [설치 중] 공식 Python 3.12를 설치하는 중입니다. 약 30초~1분 정도 걸립니다...
-winget install -e --id Python.Python.3.12 --accept-source-agreements --accept-package-agreements
+echo [설치 중] py install 3.12 로 공식 Python 3.12를 설치하는 중입니다...
+py install 3.12
+call :find_python
+if defined SYS_PY_EXE goto :python_ready
+goto :try_winget_fallback
+
+:try_winget_install
+where winget >nul 2>&1
+if errorlevel 1 goto :python_manual_guide
+
+echo Microsoft 공식 설치 도구인 winget으로 64비트 Python 3.12를 자동 설치할 수 있습니다.
+choice /C YN /M "공식 64비트 Python 3.12를 지금 자동 설치할까요"
+if errorlevel 2 goto :python_manual_guide
+
+:try_winget_fallback
+where winget >nul 2>&1
+if errorlevel 1 goto :python_manual_guide
+echo.
+echo [설치 중] winget으로 공식 64비트 Python 3.12를 설치하는 중입니다. 약 30초~1분 걸립니다...
+winget install -e --id Python.Python.3.12 --architecture x64 --accept-source-agreements --accept-package-agreements
 call :find_python
 if defined SYS_PY_EXE goto :python_ready
 
 :python_manual_guide
 echo.
 echo [직접 설치 안내]
-echo   1. https://www.python.org/downloads/ 에서 Python 3.12 Windows 버전을 설치해 주세요.
+echo   1. https://www.python.org/downloads/ 에서 Python 3.12 64-bit Windows 버전을 설치해 주세요.
 echo   2. 설치 창 맨 아래 "Add python.exe to PATH" 를 체크한 뒤 설치해 주세요.
 echo   3. 설치 후 1_실행하기.bat 을 다시 더블클릭하면 자동으로 실행됩니다.
 echo.
@@ -52,13 +73,14 @@ pause
 exit /b 1
 
 :python_ready
-echo [1/4] Python 확인 완료: "%SYS_PY_EXE%" %SYS_PY_ARG%
+echo [1/4] Python 확인 완료: "%SYS_PY_EXE%"
 echo.
 
 if exist "%VENV_PY%" goto :venv_ready
 echo [2/4] 전용 실행 환경 .venv 생성 중... 약 10~20초 걸립니다.
-"%SYS_PY_EXE%" %SYS_PY_ARG% -m venv "%VENV_DIR%"
+"%SYS_PY_EXE%" -m venv "%VENV_DIR%"
 if errorlevel 1 goto :venv_failed
+if not exist "%VENV_PY%" goto :venv_failed
 goto :install_deps
 
 :venv_ready
@@ -69,12 +91,21 @@ echo.
 echo [3/4] 필수 파이썬 패키지 다운로드 및 설치 중... 최초 1회 약 1~2분 소요됩니다.
 echo       아래에 설치 진행 상황이 표시되니 완료될 때까지 창을 닫지 마세요.
 echo.
+"%VENV_PY%" -m pip --version >nul 2>&1
+if errorlevel 1 "%VENV_PY%" -m ensurepip --upgrade
+
 "%VENV_PY%" -m pip install --upgrade pip
 if errorlevel 1 echo [안내] pip 업그레이드는 건너뛰고 패키지 설치를 계속합니다.
 
-"%VENV_PY%" -m pip install -r "%APP_DIR%requirements.txt"
+"%VENV_PY%" -m pip install --prefer-binary --retries 5 --timeout 60 -r "%APP_DIR%requirements.txt"
+if not errorlevel 1 goto :check_gpu
+
+echo.
+echo [재시도] Windows 시스템 인증서 모드로 패키지 설치를 한 번 더 시도합니다...
+"%VENV_PY%" -m pip install --use-feature=truststore --prefer-binary --retries 5 --timeout 60 -r "%APP_DIR%requirements.txt"
 if errorlevel 1 goto :pip_failed
 
+:check_gpu
 if "%VOICE_COMPANION_SKIP_CUDA%"=="1" goto :verify_imports
 where nvidia-smi >nul 2>&1
 if errorlevel 1 goto :verify_imports
@@ -95,7 +126,7 @@ echo.
 echo [GPU 가속 설치 중] NVIDIA CUDA 런타임 약 1.9GB를 다운로드하는 중입니다.
 echo                     인터넷 속도에 따라 1~3분 걸릴 수 있으니 창을 닫지 마세요...
 echo.
-"%VENV_PY%" -m pip install -r "%APP_DIR%requirements-cuda.txt"
+"%VENV_PY%" -m pip install --prefer-binary --retries 5 --timeout 60 -r "%APP_DIR%requirements-cuda.txt"
 if errorlevel 1 echo [안내] GPU 가속 설치를 건너뛰고 CPU 모드로 자동 동작합니다.
 
 :verify_imports
@@ -126,7 +157,7 @@ exit /b 0
 :venv_failed
 echo.
 echo [오류] 전용 가상환경 .venv 생성에 실패했습니다.
-echo        경로에 접근 권한이 있는지 확인한 뒤 다시 실행해 주세요.
+echo        위 화면의 오류 메시지를 확인한 뒤 1_실행하기.bat 을 다시 실행해 주세요.
 echo.
 pause
 exit /b 1
@@ -134,7 +165,8 @@ exit /b 1
 :pip_failed
 echo.
 echo [오류] 필수 패키지 설치에 실패했습니다.
-echo        인터넷 연결 상태를 확인한 뒤 1_실행하기.bat 을 다시 실행해 주세요.
+echo        위 화면의 ERROR 메시지를 확인해 주세요.
+echo        인터넷 또는 방화벽/백신 차단 여부를 확인한 뒤 1_실행하기.bat 을 다시 실행해 주세요.
 echo.
 pause
 exit /b 1
@@ -149,7 +181,6 @@ exit /b 1
 
 :find_python
 set "SYS_PY_EXE="
-set "SYS_PY_ARG="
 call :try_py "py" "-3.12"
 if defined SYS_PY_EXE exit /b 0
 call :try_py "py" "-3.13"
@@ -158,11 +189,17 @@ call :try_py "py" "-3.14"
 if defined SYS_PY_EXE exit /b 0
 call :try_py "py" "-3.11"
 if defined SYS_PY_EXE exit /b 0
-call :try_py "py" "-3.10"
-if defined SYS_PY_EXE exit /b 0
 call :try_py "py" "-3"
 if defined SYS_PY_EXE exit /b 0
 call :try_py "python" ""
+if defined SYS_PY_EXE exit /b 0
+call :try_py_path "%LOCALAPPDATA%\Python\pythoncore-3.12-64\python.exe"
+if defined SYS_PY_EXE exit /b 0
+call :try_py_path "%LOCALAPPDATA%\Python\pythoncore-3.13-64\python.exe"
+if defined SYS_PY_EXE exit /b 0
+call :try_py_path "%LOCALAPPDATA%\Python\pythoncore-3.14-64\python.exe"
+if defined SYS_PY_EXE exit /b 0
+call :try_py_path "%LOCALAPPDATA%\Python\pythoncore-3.11-64\python.exe"
 if defined SYS_PY_EXE exit /b 0
 call :try_py_path "%LOCALAPPDATA%\Programs\Python\Python312\python.exe"
 if defined SYS_PY_EXE exit /b 0
@@ -176,22 +213,32 @@ call :try_py_path "C:\Program Files\Python312\python.exe"
 if defined SYS_PY_EXE exit /b 0
 call :try_py_path "C:\Program Files\Python313\python.exe"
 if defined SYS_PY_EXE exit /b 0
+call :try_py_path "C:\Program Files\Python314\python.exe"
+if defined SYS_PY_EXE exit /b 0
 call :try_py_path "C:\Program Files\Python311\python.exe"
 exit /b 0
 
 :try_py
 where "%~1" >nul 2>&1
 if errorlevel 1 exit /b 0
-"%~1" %~2 -c "import sys, tkinter; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)" >nul 2>&1
-if errorlevel 1 exit /b 0
-set "SYS_PY_EXE=%~1"
-set "SYS_PY_ARG=%~2"
+set "PROBE_OUT=%TEMP%\ba_py_probe_%RANDOM%.txt"
+call "%~1" %~2 -c "import sys, tkinter, venv; ok = sys.maxsize > 2**32 and sys.version_info[0] == 3 and 11 <= sys.version_info[1] <= 14; print('BA_PY_OK|' + sys.executable if ok else '')" > "%PROBE_OUT%" 2>nul
+call :read_probe "%PROBE_OUT%"
 exit /b 0
 
 :try_py_path
 if not exist "%~1" exit /b 0
-"%~1" -c "import sys, tkinter; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)" >nul 2>&1
-if errorlevel 1 exit /b 0
-set "SYS_PY_EXE=%~1"
-set "SYS_PY_ARG="
+set "PROBE_OUT=%TEMP%\ba_py_probe_%RANDOM%.txt"
+"%~1" -c "import sys, tkinter, venv; ok = sys.maxsize > 2**32 and sys.version_info[0] == 3 and 11 <= sys.version_info[1] <= 14; print('BA_PY_OK|' + sys.executable if ok else '')" > "%PROBE_OUT%" 2>nul
+call :read_probe "%PROBE_OUT%"
+exit /b 0
+
+:read_probe
+set "PY_PROBE="
+if not exist "%~1" exit /b 0
+for /f "usebackq tokens=1* delims=|" %%A in ("%~1") do if "%%A"=="BA_PY_OK" set "PY_PROBE=%%B"
+del /f /q "%~1" >nul 2>&1
+if not defined PY_PROBE exit /b 0
+if not exist "%PY_PROBE%" exit /b 0
+set "SYS_PY_EXE=%PY_PROBE%"
 exit /b 0
