@@ -14,6 +14,7 @@ set "PYTHONHOME="
 set "PYTHONUSERBASE="
 set "PYTHONINSPECT="
 set "PYTHONIOENCODING=utf-8"
+set "PYTHONUTF8=1"
 set "PIP_INDEX_URL="
 set "PIP_EXTRA_INDEX_URL="
 set "PIP_TRUSTED_HOST="
@@ -37,16 +38,18 @@ echo [안심 안내] API 키와 로그인 정보는 %%LOCALAPPDATA%%\VoiceCompan
 echo.
 
 echo [1/4] 64비트 Python 3.11~3.14 설치 여부를 확인하는 중...
+set "PY_REJECT_INFO="
 call :find_python
 if defined SYS_PY_EXE goto :python_ready
 
 echo.
 echo [안내] 이 PC에 호환되는 64비트 Python 3.11~3.14가 설치되어 있지 않습니다.
+if defined PY_REJECT_INFO echo [진단] 발견되었지만 호환되지 않은 Python: %PY_REJECT_INFO%
 
 call :resolve_safe_cmd "py"
 if not defined SAFE_CMD goto :try_winget_install
 set "PY_MGR_CMD=%SAFE_CMD%"
-call "%PY_MGR_CMD%" install --help >nul 2>&1
+call "%PY_MGR_CMD%" list >nul 2>&1
 if errorlevel 1 goto :try_winget_install
 
 echo Windows의 공식 Python 관리자에서 Python 3.12를 자동으로 설치할 수 있습니다.
@@ -79,8 +82,15 @@ echo [설치 중] winget으로 공식 64비트 Python 3.12를 설치하는 중�
 call :find_python
 if defined SYS_PY_EXE goto :python_ready
 
+echo.
+echo [추가 시도] Python 3.12가 인식되지 않아 공식 64비트 Python 3.13 설치를 시도합니다...
+"%WINGET_CMD%" install -e --id Python.Python.3.13 --architecture x64 --accept-source-agreements --accept-package-agreements
+call :find_python
+if defined SYS_PY_EXE goto :python_ready
+
 :python_manual_guide
 echo.
+if defined PY_REJECT_INFO echo [진단 정보] %PY_REJECT_INFO%
 echo [직접 설치 안내]
 echo   1. https://www.python.org/downloads/ 에서 Python 3.12 64-bit Windows 버전을 설치해 주세요.
 echo   2. 설치 창 맨 아래 "Add python.exe to PATH" 를 체크한 뒤 설치해 주세요.
@@ -234,6 +244,27 @@ if defined SYS_PY_EXE exit /b 0
 call :try_py_path "C:\Program Files\Python314\python.exe"
 if defined SYS_PY_EXE exit /b 0
 call :try_py_path "C:\Program Files\Python311\python.exe"
+if defined SYS_PY_EXE exit /b 0
+if exist "%LOCALAPPDATA%\Python" for /d %%D in ("%LOCALAPPDATA%\Python\*") do call :try_py_path "%%~fD\python.exe"
+if defined SYS_PY_EXE exit /b 0
+if exist "%LOCALAPPDATA%\Programs\Python" for /d %%D in ("%LOCALAPPDATA%\Programs\Python\Python*") do call :try_py_path "%%~fD\python.exe"
+if defined SYS_PY_EXE exit /b 0
+for /d %%D in ("C:\Program Files\Python*") do call :try_py_path "%%~fD\python.exe"
+if defined SYS_PY_EXE exit /b 0
+call :scan_reg_python "HKCU\Software\Python\PythonCore"
+if defined SYS_PY_EXE exit /b 0
+call :scan_reg_python "HKLM\Software\Python\PythonCore"
+exit /b 0
+
+:scan_reg_python
+for /f "usebackq tokens=1,2*" %%A in (`"%SystemRoot%\System32\reg.exe" query "%~1" /s /v ExecutablePath 2^>nul`) do call :accept_reg_python "%%A" "%%C"
+exit /b 0
+
+:accept_reg_python
+if defined SYS_PY_EXE exit /b 0
+if /I not "%~1"=="ExecutablePath" exit /b 0
+if "%~2"=="" exit /b 0
+call :try_py_path "%~2"
 exit /b 0
 
 :resolve_safe_cmd
@@ -308,17 +339,18 @@ call :check_not_in_app_dir "%~1"
 if "%IN_APP_DIR%"=="1" exit /b 0
 call :make_probe_file
 if errorlevel 1 exit /b 0
-call "%~1" %TRY_PY_ARG% -c "import os, sys, tkinter, venv; app = os.path.normcase(os.path.realpath(os.environ.get('APP_DIR', ''))).rstrip('\\/') + os.sep; exe = os.path.normcase(os.path.realpath(sys.executable)); ok = sys.maxsize > 2**32 and sys.version_info[0] == 3 and 11 <= sys.version_info[1] <= 14 and not exe.startswith(app); print('BA_PY_OK|' + sys.executable if ok else '')" > "%PROBE_OUT%" 2>nul
+call "%~1" %TRY_PY_ARG% -c "import importlib.util, os, sys; app = os.path.normcase(os.path.realpath(os.environ.get('APP_DIR', ''))).rstrip('\\/') + os.sep; exe = os.path.normcase(os.path.realpath(sys.executable)); errs = []; (sys.maxsize <= 2**32) and errs.append('32bit'); (not (sys.version_info[0] == 3 and 11 <= sys.version_info[1] <= 14)) and errs.append('ver=' + sys.version.split()[0]); (importlib.util.find_spec('tkinter') is None) and errs.append('no-tkinter'); (importlib.util.find_spec('venv') is None) and errs.append('no-venv'); exe.startswith(app) and errs.append('in-app-dir'); out = ('BA_PY_OK|' + sys.executable) if not errs else ('BA_PY_NO|' + sys.executable + ' (' + ','.join(errs) + ')'); open(os.environ['PROBE_OUT'], 'w', encoding='utf-8').write(out + '\n')" >nul 2>&1
 call :read_probe
 exit /b 0
 
 :try_py_path
+if defined SYS_PY_EXE exit /b 0
 if not exist "%~1" exit /b 0
 call :check_not_in_app_dir "%~1"
 if "%IN_APP_DIR%"=="1" exit /b 0
 call :make_probe_file
 if errorlevel 1 exit /b 0
-"%~1" -c "import os, sys, tkinter, venv; app = os.path.normcase(os.path.realpath(os.environ.get('APP_DIR', ''))).rstrip('\\/') + os.sep; exe = os.path.normcase(os.path.realpath(sys.executable)); ok = sys.maxsize > 2**32 and sys.version_info[0] == 3 and 11 <= sys.version_info[1] <= 14 and not exe.startswith(app); print('BA_PY_OK|' + sys.executable if ok else '')" > "%PROBE_OUT%" 2>nul
+"%~1" -c "import importlib.util, os, sys; app = os.path.normcase(os.path.realpath(os.environ.get('APP_DIR', ''))).rstrip('\\/') + os.sep; exe = os.path.normcase(os.path.realpath(sys.executable)); errs = []; (sys.maxsize <= 2**32) and errs.append('32bit'); (not (sys.version_info[0] == 3 and 11 <= sys.version_info[1] <= 14)) and errs.append('ver=' + sys.version.split()[0]); (importlib.util.find_spec('tkinter') is None) and errs.append('no-tkinter'); (importlib.util.find_spec('venv') is None) and errs.append('no-venv'); exe.startswith(app) and errs.append('in-app-dir'); out = ('BA_PY_OK|' + sys.executable) if not errs else ('BA_PY_NO|' + sys.executable + ' (' + ','.join(errs) + ')'); open(os.environ['PROBE_OUT'], 'w', encoding='utf-8').write(out + '\n')" >nul 2>&1
 call :read_probe
 exit /b 0
 
@@ -326,7 +358,7 @@ exit /b 0
 set "PY_PROBE="
 if not defined PROBE_OUT goto :cleanup_probe
 if not exist "%PROBE_OUT%" goto :cleanup_probe
-for /f "usebackq tokens=1* delims=|" %%A in ("%PROBE_OUT%") do if "%%A"=="BA_PY_OK" set "PY_PROBE=%%B"
+for /f "usebackq tokens=1* delims=|" %%A in ("%PROBE_OUT%") do call :parse_probe_line "%%A" "%%B"
 :cleanup_probe
 if defined PROBE_OUT del /f /q "%PROBE_OUT%" >nul 2>&1
 if defined PROBE_DIR rmdir /s /q "%PROBE_DIR%" >nul 2>&1
@@ -337,4 +369,9 @@ if not exist "%PY_PROBE%" exit /b 0
 call :check_not_in_app_dir "%PY_PROBE%"
 if "%IN_APP_DIR%"=="1" exit /b 0
 set "SYS_PY_EXE=%PY_PROBE%"
+exit /b 0
+
+:parse_probe_line
+if "%~1"=="BA_PY_OK" set "PY_PROBE=%~2"
+if "%~1"=="BA_PY_NO" if not defined PY_REJECT_INFO set "PY_REJECT_INFO=%~2"
 exit /b 0
