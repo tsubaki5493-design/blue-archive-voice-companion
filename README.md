@@ -11,6 +11,17 @@
 
 ---
 
+## 🎬 실제 사용 시연 영상 (음성 포함 · 18초)
+
+아래 이미지를 클릭하면 **브라우저에서 바로 음성 포함 시연 영상**을 재생할 수 있습니다.
+
+[![블루 아카이브 AI 보이스 컴패니언 — 미카 실시간 통화 시연 영상 보기 (음성 포함)](./docs/demo_preview.png)](https://tsubaki5493-design.github.io/blue-archive-voice-companion/)
+
+- **[▶ 웹 플레이어에서 바로 재생하기 (소리 켜고 시청)](https://tsubaki5493-design.github.io/blue-archive-voice-companion/)** · [MP4 직접 다운로드](https://github.com/tsubaki5493-design/blue-archive-voice-companion/releases/download/v1.0.0/demo_mika_call.mp4)
+- *(※ 시연 영상은 개발 환경 녹화 예시이며, 배포판에는 공개 보이스 링크가 확인된 33명 학생의 기본 프로필만 깔끔하게 포함되어 있습니다.)*
+
+---
+
 ## ⚡ 30초 시작하기 (딱 3단계!)
 
 ### 1단계. 압축 풀고 `1_실행하기.bat` 더블클릭

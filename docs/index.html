@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>블루 아카이브 AI 보이스 컴패니언 — 실시간 통화 시연 영상</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: "Malgun Gothic", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #F3F5F8;
+      color: #1E293B;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+    header {
+      width: 100%;
+      background: #FB7390;
+      color: #FFFFFF;
+      padding: 16px 20px;
+      text-align: center;
+      box-shadow: 0 2px 10px rgba(251, 115, 144, 0.25);
+    }
+    header h1 {
+      margin: 0;
+      font-size: 1.25rem;
+      font-weight: 700;
+    }
+    header p {
+      margin: 6px 0 0;
+      font-size: 0.9rem;
+      color: #FFF1F4;
+    }
+    main {
+      width: 100%;
+      max-width: 1020px;
+      padding: 24px 16px 40px;
+    }
+    .card {
+      background: #FFFFFF;
+      border-radius: 16px;
+      padding: 16px;
+      box-shadow: 0 8px 24px rgba(15, 23, 42, 0.08);
+    }
+    video {
+      width: 100%;
+      height: auto;
+      border-radius: 10px;
+      background: #0F172A;
+      display: block;
+    }
+    .caption {
+      margin: 12px 4px 0;
+      font-size: 0.9rem;
+      color: #475569;
+      line-height: 1.5;
+    }
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 18px;
+    }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 11px 18px;
+      border-radius: 10px;
+      text-decoration: none;
+      font-weight: 700;
+      font-size: 0.95rem;
+      transition: transform 0.12s ease, opacity 0.12s ease;
+    }
+    .btn:hover { opacity: 0.92; transform: translateY(-1px); }
+    .btn-primary { background: #FB7390; color: #FFFFFF; }
+    .btn-secondary { background: #E2E8F0; color: #1E293B; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>💬 블루 아카이브 AI 보이스 컴패니언 — 실시간 음성 통화 시연</h1>
+    <p>🔊 소리를 켜고 재생해 주세요 (미카 실시간 일본어 음성 + 한국어/일본어 자막 · 18초)</p>
+  </header>
+  <main>
+    <div class="card">
+      <video controls playsinline preload="metadata" poster="demo_preview.png">
+        <source src="demo_mika_call.mp4" type="video/mp4">
+        브라우저가 HTML5 비디오를 지원하지 않습니다. <a href="demo_mika_call.mp4">여기를 눌러 영상을 받아주세요.</a>
+      </video>
+      <p class="caption">
+        ※ 위 영상은 미카와의 실시간 음성 통화 및 자막 시연 예시입니다. 배포판에는 공개 Fish Audio 보이스가 확인된 <strong>33명 학생(기본 프로필 · 의상 변형 페르소나 통합)</strong>과 프로필 초상화가 모두 내장되어 있습니다.
+      </p>
+      <div class="actions">
+        <a class="btn btn-primary" href="https://github.com/tsubaki5493-design/blue-archive-voice-companion/releases/latest/download/BlueArchive_VoiceCompanion_Release.zip">
+          ⬇️ 최신 버전 ZIP 바로 다운로드 (2.53 MB)
+        </a>
+        <a class="btn btn-secondary" href="https://github.com/tsubaki5493-design/blue-archive-voice-companion">
+          📦 GitHub 저장소 &amp; 설치 가이드 보기
+        </a>
+      </div>
+    </div>
+  </main>
+</body>
+</html>
