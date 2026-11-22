@@ -23,6 +23,7 @@ import queue
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -31,12 +32,46 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from math import ceil, gcd
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlparse
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
+
+_FALLBACK_REDACT_PATS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"AIza[0-9A-Za-z\-_]{20,}"), "[REDACTED_GOOGLE_KEY]"),
+    (re.compile(r"\bsk-[0-9A-Za-z_\-]{16,}"), "[REDACTED_API_KEY]"),
+    (re.compile(r"(?i)(Bearer\s+)[^\s\"',;}\]]+"), r"\1[REDACTED]"),
+    (re.compile(r"(?i)(x-goog-api-key[\"']?\s*[:=]\s*[\"']?)[^\s\"',;}\]]+"), r"\1[REDACTED]"),
+    (re.compile(r"(?i)([?&](?:api_)?key=)[^&\s\"']+"), r"\1[REDACTED]"),
+    (re.compile(r'("(?:fish_api_key|gemini_api_key)"\s*:\s*")[^"]*(")'), r"\1[REDACTED]\2"),
+    (re.compile(r"dpapi:[A-Za-z0-9+/=]{16,}"), "dpapi:[REDACTED]"),
+)
+
+
+def _redact_secrets(text: str, extra_secrets: tuple[str, ...] = ()) -> str:
+    """Scrub API keys, Bearer tokens, and DPAPI blobs using `app_paths.redact_secrets` with inline fallback."""
+    s = str(text or "")
+    if not s:
+        return s
+    try:
+        from src.utils import app_paths as _ap
+
+        fn = getattr(_ap, "redact_secrets", None)
+        if callable(fn):
+            return str(fn(s, extra_secrets=extra_secrets))
+    except Exception:
+        pass
+    out = s
+    for sec in extra_secrets:
+        tok = str(sec or "").strip()
+        if len(tok) >= 8:
+            out = out.replace(tok, "[REDACTED]")
+    for pat, repl in _FALLBACK_REDACT_PATS:
+        out = pat.sub(repl, out)
+    return out
 
 
 def _ensure_project_venv_or_relaunch() -> None:
@@ -47,47 +82,65 @@ def _ensure_project_venv_or_relaunch() -> None:
     venv_dir = ROOT_DIR / ".venv"
     venv_pythonw = venv_dir / "Scripts" / "pythonw.exe"
     venv_python = venv_dir / "Scripts" / "python.exe"
-    if not venv_dir.exists():
+    if not venv_dir.exists() or venv_dir.is_symlink():
         return
     try:
-        in_venv = Path(sys.prefix).resolve() == venv_dir.resolve()
+        venv_res = venv_dir.resolve()
+        in_venv = Path(sys.prefix).resolve() == venv_res
     except Exception:
-        in_venv = False
+        return
     if not in_venv:
         target_exe = venv_pythonw if venv_pythonw.exists() else venv_python
-        if target_exe.exists():
-            env = os.environ.copy()
-            env["BA_VENV_BOOTSTRAPPED"] = "1"
-            si = None
-            if os.name == "nt":
-                si = subprocess.STARTUPINFO()
-                si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                si.wShowWindow = 1  # SW_SHOWNORMAL
-            subprocess.Popen(
-                [str(target_exe), str(Path(__file__).resolve()), *sys.argv[1:]],
-                cwd=str(ROOT_DIR),
-                env=env,
-                startupinfo=si,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                close_fds=True,
-            )
-            raise SystemExit(0)
+        try:
+            script_res = Path(__file__).resolve()
+            exe_res = target_exe.resolve()
+            if (
+                not target_exe.is_file()
+                or target_exe.is_symlink()
+                or not exe_res.is_relative_to(venv_res)
+                or not script_res.is_relative_to(ROOT_DIR.resolve())
+            ):
+                return
+        except OSError:
+            return
+        env = os.environ.copy()
+        for bad_var in ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONUSERBASE"):
+            env.pop(bad_var, None)
+        env["PYTHONNOUSERSITE"] = "1"
+        env["BA_VENV_BOOTSTRAPPED"] = "1"
+        si = None
+        if os.name == "nt":
+            si = subprocess.STARTUPINFO()
+            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            si.wShowWindow = 1  # SW_SHOWNORMAL
+        subprocess.Popen(
+            [str(exe_res), str(script_res), *sys.argv[1:]],
+            cwd=str(ROOT_DIR),
+            env=env,
+            startupinfo=si,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+        )
+        raise SystemExit(0)
 
 
 def _report_fatal_startup_error(title: str, err_text: str) -> None:
+    safe_title = _redact_secrets(title)
+    safe_err = _redact_secrets(err_text)
     try:
         from src.utils.app_paths import get_logs_dir
 
         crash_log = get_logs_dir() / "bridge_crash.log"
         crash_log.parent.mkdir(parents=True, exist_ok=True)
-        with open(crash_log, "a", encoding="utf-8") as f:
-            f.write(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] {title}\n{err_text}\n")
+        if not crash_log.is_symlink():
+            with open(crash_log, "a", encoding="utf-8") as f:
+                f.write(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] {safe_title}\n{safe_err}\n")
     except Exception:
         pass
     try:
-        ctypes.windll.user32.MessageBoxW(0, err_text[:1800], title, 0x10)
+        ctypes.windll.user32.MessageBoxW(0, safe_err[:1800], safe_title, 0x10)
     except Exception:
         pass
 
@@ -101,22 +154,32 @@ _RESAMPLE_POLY_FN: Any = None
 
 
 def _ensure_cuda_dll_paths() -> None:
-    """Inject CUDA (cuBLAS / cuDNN) DLL directories lazily right before loading faster_whisper."""
+    """Inject verified project-venv CUDA (cuBLAS / cuDNN) DLL directories lazily right before loading faster_whisper."""
     global _CUDA_DLL_READY
     if _CUDA_DLL_READY:
         return
     with _CUDA_DLL_LOCK:
         if _CUDA_DLL_READY:
             return
-        if _NVIDIA_SITE.exists():
-            for _bin_dir in _NVIDIA_SITE.glob("*/bin"):
-                _p = str(_bin_dir.resolve())
-                os.environ["PATH"] = _p + ";" + os.environ.get("PATH", "")
-                if hasattr(os, "add_dll_directory"):
-                    try:
-                        os.add_dll_directory(_p)
-                    except Exception:
-                        pass
+        try:
+            venv_res = (ROOT_DIR / ".venv").resolve()
+            nv_res = _NVIDIA_SITE.resolve()
+            if _NVIDIA_SITE.is_dir() and not _NVIDIA_SITE.is_symlink() and nv_res.is_relative_to(venv_res):
+                for _bin_dir in _NVIDIA_SITE.glob("*/bin"):
+                    if not _bin_dir.is_dir() or _bin_dir.is_symlink():
+                        continue
+                    _bin_res = _bin_dir.resolve()
+                    if not _bin_res.is_relative_to(nv_res):
+                        continue
+                    _p = str(_bin_res)
+                    os.environ["PATH"] = _p + ";" + os.environ.get("PATH", "")
+                    if hasattr(os, "add_dll_directory"):
+                        try:
+                            os.add_dll_directory(_p)
+                        except Exception:
+                            pass
+        except OSError:
+            pass
         _CUDA_DLL_READY = True
 
 
@@ -325,6 +388,129 @@ FISH_TTS_URL = "https://api.fish.audio/v1/tts"
 FISH_MODEL_URL = "https://api.fish.audio/model"
 FISH_PCM_SR = 44100
 WHISPER_SR = 16000
+
+# Runtime security & DoS guardrails
+MAX_TTS_STREAM_BYTES = 32 * 1024 * 1024           # 32 MB (~6 min 44.1kHz PCM) per TTS stream
+MAX_HTTP_ERROR_BYTES = 4096                       # 4 KB max read for HTTP error diagnostics
+MAX_FISH_SEARCH_RESPONSE_BYTES = 4 * 1024 * 1024  # 4 MB max JSON body for Fish model search
+MAX_ZEROSHOT_WAV_BYTES = 25 * 1024 * 1024         # 25 MB max local reference WAV read
+MAX_CHAR_CONFIG_BYTES = 5 * 1024 * 1024           # 5 MB max character JSON file size
+_ALLOWED_WHISPER_MODELS = frozenset({"tiny", "base", "small", "medium"})
+_SAFE_ENTITY_ID_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_\-]{0,79}\Z")
+_WIN_RESERVED_IDS = frozenset(
+    {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
+)
+_FISH_HEX_STRICT_RE = re.compile(r"\A[0-9a-fA-F]{32}\Z")
+_FISH_MODEL_PATH_RE = re.compile(r"\A/(?:[a-zA-Z_-]{2,10}/)?m/([0-9a-fA-F]{32})/?\Z")
+_ALLOWED_FISH_HOSTS = frozenset({"fish.audio", "www.fish.audio", "api.fish.audio"})
+
+
+def is_safe_entity_id(value: str) -> bool:
+    """Return True iff `value` is a strictly safe flat character/entry ID (zero path traversal or reserved names)."""
+    s = str(value or "").strip()
+    if not s or not _SAFE_ENTITY_ID_RE.match(s):
+        return False
+    return s.upper() not in _WIN_RESERVED_IDS
+
+
+def is_valid_fish_model_id(raw: str) -> bool:
+    """Return True iff `raw` is a strictly valid 32-char hexadecimal Fish Audio model ID."""
+    return bool(_FISH_HEX_STRICT_RE.match(str(raw or "").strip()))
+
+
+def _validate_fish_api_url(url: str) -> str:
+    """Enforce HTTPS-only requests strictly pinned to `api.fish.audio` (blocks SSRF / scheme downgrade / traversal)."""
+    raw = str(url or "").strip()
+    if not raw or "\\" in raw or any(ord(ch) < 32 or ord(ch) == 127 for ch in raw):
+        raise ValueError(f"Blocked malformed or control-char URL: {url!r}")
+    parsed = urlparse(raw)
+    host = (parsed.hostname or "").lower()
+    decoded_path = unquote(parsed.path)
+    if (
+        parsed.scheme != "https"
+        or host != "api.fish.audio"
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.port not in (None, 443)
+        or parsed.fragment
+        or "\\" in decoded_path
+        or ".." in decoded_path.split("/")
+    ):
+        raise ValueError(f"Blocked non-Fish-Audio or insecure URL: {url!r}")
+    return raw
+
+
+def build_fish_model_url(model_id: str) -> str:
+    """Validate `model_id` strictly before interpolating into `https://api.fish.audio/model/{id}`."""
+    clean_id = extract_model_id(model_id)
+    if not is_valid_fish_model_id(clean_id):
+        raise ValueError(f"Invalid Fish Audio model ID: {model_id!r}")
+    return _validate_fish_api_url(f"{FISH_MODEL_URL}/{clean_id}")
+
+
+def _safe_explorer_exe() -> Path:
+    """Return absolute path to Windows Explorer in %SystemRoot% to prevent CWD/PATH binary hijacking."""
+    sys_root = Path(os.environ.get("SystemRoot", r"C:\Windows"))
+    return sys_root / "explorer.exe"
+
+
+def _reveal_file_in_explorer(target_file: Path, allowed_roots: tuple[Path, ...]) -> bool:
+    """Reveal a verified regular file inside `allowed_roots` in Windows Explorer without PATH hijack."""
+    if os.name != "nt":
+        return False
+    try:
+        if target_file.is_symlink() or not target_file.is_file():
+            return False
+        res = target_file.resolve()
+        if not any(res.is_relative_to(r.resolve()) for r in allowed_roots):
+            return False
+        s_path = str(res)
+        if '"' in s_path or any(ord(ch) < 32 for ch in s_path):
+            return False
+        explorer = _safe_explorer_exe()
+        if not explorer.is_file():
+            return False
+        subprocess.Popen([str(explorer), f'/select,"{s_path}"'])
+        return True
+    except Exception:
+        return False
+
+
+def _open_directory_in_explorer(target_dir: Path, allowed_roots: tuple[Path, ...]) -> bool:
+    """Open a verified directory inside `allowed_roots` in Windows Explorer (avoids shell-verb `os.startfile`)."""
+    if os.name != "nt":
+        return False
+    try:
+        if target_dir.is_symlink() or not target_dir.is_dir():
+            return False
+        res = target_dir.resolve()
+        if not any(res == r.resolve() or res.is_relative_to(r.resolve()) for r in allowed_roots):
+            return False
+        explorer = _safe_explorer_exe()
+        if not explorer.is_file():
+            return False
+        subprocess.Popen([str(explorer), str(res)])
+        return True
+    except Exception:
+        return False
+
+
+def _read_bounded_httpx_error(resp: Any, max_bytes: int = MAX_HTTP_ERROR_BYTES) -> str:
+    """Read at most `max_bytes` from a streaming httpx error response to prevent OOM on hostile bodies."""
+    buf = bytearray()
+    try:
+        for chunk in resp.iter_bytes(chunk_size=1024):
+            if not chunk:
+                continue
+            need = max_bytes - len(buf)
+            if need <= 0:
+                break
+            buf.extend(chunk[:need])
+            if len(buf) >= max_bytes:
+                break
+    except Exception:
+        pass
+    return buf.decode("utf-8", errors="replace")
 
 # Common Whisper silence/chime hallucinations to ignore (JP, KO, EN)
 HALLUCINATION_PHRASES = {
@@ -802,24 +988,32 @@ def save_bridge_config(cfg: dict) -> None:
 def load_all_character_configs() -> dict[str, dict]:
     """Load all config/characters/*.json sorted by Korean name using a signature-validated cache."""
     CHARACTERS_DIR.mkdir(parents=True, exist_ok=True)
+    chars_dir_res = CHARACTERS_DIR.resolve()
     dir_entries: list[tuple[str, int, int]] = []
     total_size = 0
     max_mtime_ns = 0
     with os.scandir(CHARACTERS_DIR) as it:
         for de in it:
-            if de.is_file() and de.name.endswith(".json"):
-                st = de.stat()
+            if de.is_file(follow_symlinks=False) and de.name.endswith(".json"):
+                st = de.stat(follow_symlinks=False)
+                if st.st_size > MAX_CHAR_CONFIG_BYTES:
+                    continue
                 dir_entries.append((de.name, int(st.st_mtime_ns), int(st.st_size)))
                 total_size += int(st.st_size)
                 if st.st_mtime_ns > max_mtime_ns:
                     max_mtime_ns = int(st.st_mtime_ns)
-    sig = [str(CHARACTERS_DIR.resolve()), len(dir_entries), max_mtime_ns, total_size]
+    sig = [str(chars_dir_res), len(dir_entries), max_mtime_ns, total_size]
     cache_path = get_cache_dir() / "characters_bundle_v1.json"
-    if cache_path.is_file():
+    if cache_path.is_file() and not cache_path.is_symlink():
         try:
             cached = json.loads(cache_path.read_text(encoding="utf-8"))
             if isinstance(cached, dict) and cached.get("sig") == sig and isinstance(cached.get("chars"), dict):
-                return cached["chars"]
+                cached_chars = cached["chars"]
+                if all(
+                    is_safe_entity_id(k) and isinstance(v, dict) and is_safe_entity_id(str(v.get("id") or ""))
+                    for k, v in cached_chars.items()
+                ):
+                    return cached_chars
         except Exception:
             pass
 
@@ -827,19 +1021,45 @@ def load_all_character_configs() -> dict[str, dict]:
     items = []
     for fname, _, _ in dir_entries:
         try:
-            d = json.loads((CHARACTERS_DIR / fname).read_text(encoding="utf-8"))
-            if isinstance(d, dict) and d.get("id"):
-                items.append(d)
+            fpath = (CHARACTERS_DIR / fname).resolve()
+            if not fpath.is_relative_to(chars_dir_res):
+                continue
+            d = json.loads(fpath.read_text(encoding="utf-8"))
+            if not isinstance(d, dict):
+                continue
+            cid = str(d.get("id") or "").strip()
+            if not is_safe_entity_id(cid):
+                continue
+            d["id"] = cid
+            alts = d.get("alt_voice_personas")
+            if isinstance(alts, dict):
+                safe_alts = {}
+                for ak, spec in alts.items():
+                    if not isinstance(spec, dict) or not is_safe_entity_id(str(ak)):
+                        continue
+                    vsid = str(spec.get("voice_slot_id") or f"{cid}_{str(ak).capitalize()}").strip()
+                    if is_safe_entity_id(vsid):
+                        safe_alts[ak] = spec
+                d["alt_voice_personas"] = safe_alts
+            items.append(d)
         except Exception:
             continue
     items.sort(key=lambda x: (0 if x.get("category", "playable") == "playable" else 1, x.get("school", ""), x.get("name_kr", x["id"])))
     for d in items:
         chars[d["id"]] = d
     try:
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = cache_path.with_suffix(".tmp")
-        tmp_path.write_text(json.dumps({"sig": sig, "chars": chars}, ensure_ascii=False), encoding="utf-8")
-        tmp_path.replace(cache_path)
+        if not cache_path.is_symlink():
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp_name = tempfile.mkstemp(prefix=".chars_", suffix=".tmp", dir=str(cache_path.parent))
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fh.write(json.dumps({"sig": sig, "chars": chars}, ensure_ascii=False))
+                os.replace(tmp_name, cache_path)
+            except Exception:
+                try:
+                    os.unlink(tmp_name)
+                except OSError:
+                    pass
     except Exception:
         pass
     return chars
@@ -851,7 +1071,7 @@ def load_momotalk_profiles(characters: dict[str, dict]) -> tuple[list[dict[str, 
     entry_map: dict[str, dict[str, Any]] = {}
     covered_bases: set[str] = set()
 
-    if MOMOTALK_PROFILES_PATH.is_file():
+    if MOMOTALK_PROFILES_PATH.is_file() and not MOMOTALK_PROFILES_PATH.is_symlink():
         try:
             raw = json.loads(MOMOTALK_PROFILES_PATH.read_text(encoding="utf-8"))
             for item in raw.get("entries") or []:
@@ -859,11 +1079,22 @@ def load_momotalk_profiles(characters: dict[str, dict]) -> tuple[list[dict[str, 
                     continue
                 eid = str(item.get("entry_id") or "").strip()
                 bcid = str(item.get("base_cid") or eid).strip()
-                if not eid or bcid not in characters:
+                if not is_safe_entity_id(eid) or not is_safe_entity_id(bcid) or bcid not in characters:
                     continue
                 ent = dict(item)
                 ent["entry_id"] = eid
                 ent["base_cid"] = bcid
+                raw_ptoks = ent.get("portrait_tokens")
+                if isinstance(raw_ptoks, list):
+                    ent["portrait_tokens"] = [
+                        str(tok).strip()
+                        for tok in raw_ptoks
+                        if str(tok or "").strip()
+                        and "/" not in str(tok)
+                        and "\\" not in str(tok)
+                        and ".." not in str(tok)
+                        and "\x00" not in str(tok)
+                    ]
                 ent["name_kr"] = str(ent.get("name_kr") or characters[bcid].get("name_kr") or eid).strip()
                 ent["status_message_kr"] = str(ent.get("status_message_kr") or "").strip()
                 entries.append(ent)
@@ -876,7 +1107,7 @@ def load_momotalk_profiles(characters: dict[str, dict]) -> tuple[list[dict[str, 
 
     # Auto-include any custom/drop-in character JSONs not present in momotalk_profiles.json
     for cid, ch in characters.items():
-        if cid in covered_bases:
+        if cid in covered_bases or not is_safe_entity_id(cid):
             continue
         full_nm = str(ch.get("name_kr") or cid).strip()
         short_nm = full_nm.split()[-1] if (" " in full_nm and ch.get("category", "playable") == "playable") else full_nm
@@ -900,17 +1131,32 @@ def load_momotalk_profiles(characters: dict[str, dict]) -> tuple[list[dict[str, 
 
 
 def extract_model_id(raw: str) -> str:
-    """Extract clean model ID even if user pastes full https://fish.audio/ko/m/<id>/ URL."""
-    s = raw.strip()
+    """
+    Strictly extract a 32-char hexadecimal Fish Audio model ID from either a raw ID or
+    an official `https://fish.audio/.../m/<32-hex>` URL. Rejects path traversal / SSRF inputs with `""`.
+    """
+    s = str(raw or "").strip()
     if not s:
         return ""
-    m = _FISH_URL_RE.search(s)
-    if m:
-        return m.group(1)
-    m_hex = _FISH_HEX_RE.search(s)
-    if m_hex:
-        return m_hex.group(1).lower()
-    return s.split("?")[0].strip("/")
+    if _FISH_HEX_STRICT_RE.match(s):
+        return s.lower()
+    candidate = s
+    if "://" not in candidate and candidate.lower().startswith(("fish.audio/", "www.fish.audio/", "api.fish.audio/")):
+        candidate = "https://" + candidate
+    if "://" in candidate:
+        parsed = urlparse(candidate)
+        host = (parsed.hostname or "").lower()
+        if (
+            parsed.scheme == "https"
+            and host in _ALLOWED_FISH_HOSTS
+            and parsed.username is None
+            and parsed.password is None
+            and parsed.port in (None, 443)
+        ):
+            m = _FISH_MODEL_PATH_RE.match(parsed.path)
+            if m:
+                return m.group(1).lower()
+    return ""
 
 
 def list_audio_devices() -> tuple[list[tuple[int, str, int]], list[tuple[int, str, int]]]:
@@ -1423,6 +1669,8 @@ class AruFishBridgeApp:
         with self._http_client_lock:
             if self._http_client is None:
                 self._http_client = httpx.Client(
+                    verify=True,
+                    follow_redirects=False,
                     timeout=httpx.Timeout(25.0, connect=8.0),
                     limits=httpx.Limits(max_keepalive_connections=4, max_connections=8, keepalive_expiry=120.0),
                 )
@@ -1575,14 +1823,23 @@ class AruFishBridgeApp:
         return self._resolve_momotalk_photo("ui", "heart", size=size, bg_hex="#FFFFFF", ring_hex="#FB7390", enqueue=enqueue)
 
     def _char_ref_paths(self, char_id: str | None = None, lang: str | None = None) -> tuple[Path, Path]:
-        cid = char_id or self.current_char_id
-        lang_up = (lang or self._voice_lang_code()).upper()
-        user_dir = get_user_models_dir() / cid / lang_up
+        cid = str(char_id or self.current_char_id or "").strip()
+        if not is_safe_entity_id(cid):
+            raise ValueError(f"Invalid or unsafe character_id: {cid!r}")
+        lang_up = str(lang or self._voice_lang_code()).strip().upper()
+        if lang_up not in ("JP", "KR"):
+            raise ValueError(f"Invalid voice language code: {lang_up!r}")
+        user_models_root = get_user_models_dir().resolve()
+        user_dir = (user_models_root / cid / lang_up).resolve()
+        if not user_dir.is_relative_to(user_models_root):
+            raise ValueError(f"Path traversal blocked for character_id={cid!r}")
         user_wav = user_dir / f"{cid}_{lang_up}_FishAudio_Reference.wav"
-        legacy_dir = ROOT_DIR / "models" / cid / lang_up
-        legacy_wav = legacy_dir / f"{cid}_{lang_up}_FishAudio_Reference.wav"
-        if legacy_wav.exists() and not user_wav.exists():
-            return legacy_wav, legacy_dir / "fish_samples"
+        legacy_models_root = (ROOT_DIR / "models").resolve()
+        legacy_dir = (legacy_models_root / cid / lang_up).resolve()
+        if legacy_dir.is_relative_to(legacy_models_root):
+            legacy_wav = legacy_dir / f"{cid}_{lang_up}_FishAudio_Reference.wav"
+            if legacy_wav.exists() and not legacy_wav.is_symlink() and not user_wav.exists():
+                return legacy_wav, legacy_dir / "fish_samples"
         return user_wav, user_dir / "fish_samples"
 
     def _is_audio_pipeline_active(self) -> bool:
@@ -5445,7 +5702,7 @@ class AruFishBridgeApp:
 
         def _open_log_dir() -> None:
             if os.name == "nt":
-                os.startfile(str(RUNTIME_LOG_PATH.parent))
+                _open_directory_in_explorer(RUNTIME_LOG_PATH.parent, (get_logs_dir(),))
 
         def _clear_view() -> None:
             box.configure(state="normal")
@@ -5476,17 +5733,39 @@ class AruFishBridgeApp:
         self._status_log_box = box
         win.protocol("WM_DELETE_WINDOW", _on_close)
 
+    def _active_secret_values(self) -> tuple[str, ...]:
+        secrets_out: list[str] = []
+        try:
+            cfg = getattr(self, "cfg", None)
+            if isinstance(cfg, dict):
+                for k in ("fish_api_key", "gemini_api_key"):
+                    v = str(cfg.get(k) or "").strip()
+                    if len(v) >= 8:
+                        secrets_out.append(v)
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "api_key_var"):
+                v2 = str(self.api_key_var.get() or "").strip()
+                if len(v2) >= 8 and v2 not in secrets_out:
+                    secrets_out.append(v2)
+        except Exception:
+            pass
+        return tuple(secrets_out)
+
     def log(self, msg: str) -> None:
+        safe_msg = _redact_secrets(str(msg or ""), extra_secrets=self._active_secret_values())
         ts = time.strftime("%H:%M:%S")
-        line = f"[{ts}] {msg}"
+        line = f"[{ts}] {safe_msg}"
         with self._log_lock:
             self._log_history.append(line)
             try:
                 if not self._log_dir_ready:
                     RUNTIME_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
                     self._log_dir_ready = True
-                with open(RUNTIME_LOG_PATH, "a", encoding="utf-8") as f:
-                    f.write(line + "\n")
+                if not RUNTIME_LOG_PATH.is_symlink():
+                    with open(RUNTIME_LOG_PATH, "a", encoding="utf-8") as f:
+                        f.write(line + "\n")
             except Exception:
                 pass
 
@@ -5516,10 +5795,13 @@ class AruFishBridgeApp:
                 api_key = str(self.cfg.get("fish_api_key", "") or "").strip()
                 if api_key and (time.time() - self.last_http_activity >= 18.0):
                     try:
-                        self.http_client.get(
-                            f"{FISH_MODEL_URL}?page_size=1",
+                        keepalive_url = _validate_fish_api_url(f"{FISH_MODEL_URL}?page_size=1")
+                        with self.http_client.stream(
+                            "GET",
+                            keepalive_url,
                             headers={"Authorization": f"Bearer {api_key}"},
-                        )
+                        ) as _resp:
+                            pass
                         self.last_http_activity = time.time()
                     except Exception:
                         pass
@@ -5539,9 +5821,15 @@ class AruFishBridgeApp:
                 self.whisper_loading = False
                 self.log(f"[오류] faster-whisper 모듈 로드 실패: {imp_exc}")
                 return
+            whisper_model_name = "small"
+            if whisper_model_name not in _ALLOWED_WHISPER_MODELS or "/" in whisper_model_name or "\\" in whisper_model_name:
+                self.whisper_loading = False
+                self.log(f"[오류] 허용되지 않은 Whisper 모델 이름: {whisper_model_name!r}")
+                return
             try:
                 # CUDA GPU: native INT8 + Dynamic 8s Mel Window runs in ~0.10-0.16s
-                self.whisper_model = WhisperModel("small", device="cuda", compute_type="int8_float32")
+                # faster-whisper loads CTranslate2 binary model.bin + JSON vocab only (zero remote code execution)
+                self.whisper_model = WhisperModel(whisper_model_name, device="cuda", compute_type="int8_float32")
                 self.tokenizers = {
                     "ja": Tokenizer(self.whisper_model.hf_tokenizer, True, task="transcribe", language="ja"),
                     "ko": Tokenizer(self.whisper_model.hf_tokenizer, True, task="transcribe", language="ko"),
@@ -5567,7 +5855,7 @@ class AruFishBridgeApp:
             except Exception as exc:
                 self.log(f"[GPU 경고] CUDA 로딩 실패, CPU 폴백 시도: {exc}")
                 try:
-                    self.whisper_model = WhisperModel("small", device="cpu", compute_type="int8")
+                    self.whisper_model = WhisperModel(whisper_model_name, device="cpu", compute_type="int8")
                     self.tokenizers = {
                         "ja": Tokenizer(self.whisper_model.hf_tokenizer, True, task="transcribe", language="ja"),
                         "ko": Tokenizer(self.whisper_model.hf_tokenizer, True, task="transcribe", language="ko"),
@@ -5594,8 +5882,9 @@ class AruFishBridgeApp:
         c = self.current_char
         v_lang = self._voice_lang_code()
         comb_wav, _ = self._char_ref_paths(c["id"], lang=v_lang)
+        allowed_roots = (get_user_models_dir(), ROOT_DIR / "models")
         if comb_wav.exists():
-            subprocess.Popen(["explorer.exe", f'/select,"{comb_wav}"'])
+            _reveal_file_in_explorer(comb_wav, allowed_roots)
             return
 
         def _extract_worker() -> None:
@@ -5603,10 +5892,11 @@ class AruFishBridgeApp:
             try:
                 res = build_character_fish_reference(c, lang=v_lang, game_dir=self._get_resolved_ba_game_dir())
                 self.log(f"[추출 완료] {res['clip_count']}개 클립 ({res['total_duration_sec']}초) -> {res['combined_wav']}")
-                subprocess.Popen(["explorer.exe", f'/select,"{res["combined_wav"]}"'])
+                _reveal_file_in_explorer(Path(res["combined_wav"]), allowed_roots)
             except Exception as exc:
-                self.log(f"[스팀 추출 안내] {exc}")
-                self.root.after(0, lambda: messagebox.showwarning("스팀 음성 팩 안내", str(exc)))
+                safe_exc = _redact_secrets(str(exc), extra_secrets=self._active_secret_values())
+                self.log(f"[스팀 추출 안내] {safe_exc}")
+                self.root.after(0, lambda m=safe_exc: messagebox.showwarning("스팀 음성 팩 안내", m))
 
         threading.Thread(target=_extract_worker, daemon=True).start()
 
@@ -5937,6 +6227,12 @@ class AruFishBridgeApp:
             messagebox.showwarning("클립보드 비어있음", "먼저 Fish Audio 사이트에서 원하는 블루 아카이브 캐릭터 페이지 주소(URL)를 복사해 주세요!")
             return
         mid = extract_model_id(raw)
+        if not mid:
+            messagebox.showwarning(
+                "유효하지 않은 보이스 ID",
+                "올바른 Fish Audio 모델 ID(32자리 16진수) 또는 https://fish.audio/.../m/<ID> 주소가 아닙니다.",
+            )
+            return
         self.ref_id_var.set(mid)
         self.save_settings_ui(silent=True)
         cname = self.current_char.get("name_kr", self.current_char_id)
@@ -5980,38 +6276,56 @@ class AruFishBridgeApp:
         tree.column("id", width=190)
         tree.pack(fill="both", expand=True, padx=12, pady=4)
 
+        def _fetch_search_items(query_text: str) -> tuple[int, list[dict[str, Any]], str]:
+            search_url = _validate_fish_api_url(FISH_MODEL_URL)
+            with requests.get(
+                search_url,
+                headers={"Authorization": f"Bearer {api_key}"},
+                params={"page_size": 25, "title": query_text, "sort_by": "task_count"},
+                timeout=15,
+                verify=True,
+                allow_redirects=False,
+                stream=True,
+            ) as resp:
+                buf = bytearray()
+                for chunk in resp.iter_content(chunk_size=32768):
+                    if not chunk:
+                        continue
+                    buf.extend(chunk)
+                    if len(buf) > MAX_FISH_SEARCH_RESPONSE_BYTES:
+                        raise ValueError("Fish Audio 검색 응답 크기가 허용 한도를 초과했습니다.")
+                raw_txt = buf.decode("utf-8", errors="replace")
+                if resp.status_code != 200:
+                    return resp.status_code, [], _redact_secrets(raw_txt[:200], extra_secrets=(api_key,))
+                parsed = json.loads(raw_txt) if raw_txt else {}
+                raw_items = parsed.get("items") if isinstance(parsed, dict) else []
+                return 200, (raw_items if isinstance(raw_items, list) else []), ""
+
         def _do_search() -> None:
             for row in tree.get_children():
                 tree.delete(row)
             try:
-                r = requests.get(
-                    FISH_MODEL_URL,
-                    headers={"Authorization": f"Bearer {api_key}"},
-                    params={"page_size": 25, "title": q_var.get().strip(), "sort_by": "task_count"},
-                    timeout=15,
-                )
-                if r.status_code == 200:
-                    items = r.json().get("items") or []
+                status_code, items, err_preview = _fetch_search_items(q_var.get().strip())
+                if status_code == 200:
                     # If full name has 0 hits, automatically fall back to given name in katakana/kanji
                     if not items and len(q_var.get().strip()) >= 4:
                         short_q = c.get("name_jp", "")[-3:]
-                        r2 = requests.get(
-                            FISH_MODEL_URL,
-                            headers={"Authorization": f"Bearer {api_key}"},
-                            params={"page_size": 25, "title": short_q, "sort_by": "task_count"},
-                            timeout=15,
-                        )
-                        if r2.status_code == 200:
-                            items = r2.json().get("items") or []
+                        st2, items2, _ = _fetch_search_items(short_q)
+                        if st2 == 200:
+                            items = items2
                     for it in items:
-                        mid = it.get("_id") or it.get("id") or ""
-                        title = it.get("title") or ""
-                        tasks = it.get("task_count") or 0
+                        if not isinstance(it, dict):
+                            continue
+                        mid = extract_model_id(str(it.get("_id") or it.get("id") or ""))
+                        if not mid:
+                            continue
+                        title = str(it.get("title") or "")
+                        tasks = int(it.get("task_count") or 0)
                         tree.insert("", tk.END, values=(title, f"{tasks:,}", mid))
                 else:
-                    messagebox.showerror("검색 실패", f"HTTP {r.status_code}: {r.text[:200]}")
+                    messagebox.showerror("검색 실패", f"HTTP {status_code}: {err_preview}")
             except Exception as exc:
-                messagebox.showerror("오류", str(exc))
+                messagebox.showerror("오류", _redact_secrets(str(exc), extra_secrets=(api_key,)))
 
         def _select_item(_event=None) -> None:
             sel = tree.selection()
@@ -6296,10 +6610,11 @@ class AruFishBridgeApp:
                     if q_choice2 is True:
                         self.open_voice_search_dialog()
                     elif q_choice2 is False and target_wav.exists():
-                        subprocess.Popen(["explorer.exe", f'/select,"{target_wav}"'])
+                        _reveal_file_in_explorer(target_wav, (get_user_models_dir(), ROOT_DIR / "models"))
                     return
 
-                messagebox.showerror("보이스 자동 생성 실패", err_txt[:380])
+                safe_err_popup = _redact_secrets(err_txt, extra_secrets=self._active_secret_values())
+                messagebox.showerror("보이스 자동 생성 실패", safe_err_popup[:380])
 
             self._schedule_ui(_finish_on_ui)
 
@@ -6616,8 +6931,13 @@ class AruFishBridgeApp:
             ref_wavs = sample_wavs[:3] if sample_wavs else ([comb_wav] if comb_wav.exists() else [])
             references_payload = []
             for ref_wav in ref_wavs:
+                if ref_wav.is_symlink() or not ref_wav.is_file():
+                    continue
+                st_wav = ref_wav.stat()
+                if st_wav.st_size > MAX_ZEROSHOT_WAV_BYTES:
+                    continue
                 ref_key = str(ref_wav)
-                ref_mtime = int(ref_wav.stat().st_mtime_ns) if ref_wav.exists() else 0
+                ref_mtime = int(st_wav.st_mtime_ns)
                 cached_wav = self._zero_shot_wav_cache.get(ref_key)
                 if cached_wav is not None and cached_wav[0] == ref_mtime:
                     wav_bytes = cached_wav[1]
@@ -6672,10 +6992,12 @@ class AruFishBridgeApp:
             fade_tail_n = max(4, int(play_sr * 0.004))
             tail_hold = np.empty(0, dtype=np.float32)
 
-            with self.http_client.stream("POST", FISH_TTS_URL, headers=headers, content=payload_bytes) as resp:
+            tts_url = _validate_fish_api_url(FISH_TTS_URL)
+            total_pcm_bytes = 0
+            with self.http_client.stream("POST", tts_url, headers=headers, content=payload_bytes) as resp:
                 self.last_http_activity = time.time()
                 if resp.status_code != 200:
-                    err_body = resp.read().decode("utf-8", errors="replace")
+                    err_body = _read_bounded_httpx_error(resp, MAX_HTTP_ERROR_BYTES)
                     self.log(f"[Fish TTS 오류 HTTP {resp.status_code}] {err_body[:250]}")
                     return
 
@@ -6684,6 +7006,10 @@ class AruFishBridgeApp:
                         break
                     if not chunk:
                         continue
+                    total_pcm_bytes += len(chunk)
+                    if total_pcm_bytes > MAX_TTS_STREAM_BYTES:
+                        self.log(f"[Fish TTS 보안 경고] 단일 스트림 크기 한도({MAX_TTS_STREAM_BYTES} bytes) 초과로 중단했습니다.")
+                        break
                     if first_chunk:
                         first_chunk = False
                         ttfa = time.time() - t_start
@@ -7007,10 +7333,12 @@ class AruFishBridgeApp:
             first_chunk = True
             first_emitted = True
             leftover = b""
-            with self.http_client.stream("POST", FISH_TTS_URL, headers=headers, content=payload_bytes) as resp:
+            tts_url = _validate_fish_api_url(FISH_TTS_URL)
+            total_pcm_bytes = 0
+            with self.http_client.stream("POST", tts_url, headers=headers, content=payload_bytes) as resp:
                 self.last_http_activity = time.time()
                 if resp.status_code != 200:
-                    err_body = resp.read().decode("utf-8", errors="replace")
+                    err_body = _read_bounded_httpx_error(resp, MAX_HTTP_ERROR_BYTES)
                     self.log(f"[Fish TTS 오류 HTTP {resp.status_code}] {err_body[:220]}")
                     return
 
@@ -7019,6 +7347,10 @@ class AruFishBridgeApp:
                         break
                     if not chunk:
                         continue
+                    total_pcm_bytes += len(chunk)
+                    if total_pcm_bytes > MAX_TTS_STREAM_BYTES:
+                        self.log(f"[Fish TTS 보안 경고] 단일 스트림 크기 한도({MAX_TTS_STREAM_BYTES} bytes) 초과로 중단했습니다.")
+                        break
                     if first_chunk:
                         first_chunk = False
                         ttfa = time.time() - t_req
@@ -8779,11 +9111,13 @@ def _get_bridge_pid_file() -> Path:
 def _write_bridge_pid_file() -> None:
     try:
         pid_file = _get_bridge_pid_file()
+        if pid_file.is_symlink():
+            return
         pid_file.write_text(str(os.getpid()), encoding="utf-8")
 
         def _cleanup_pid() -> None:
             try:
-                if pid_file.exists() and pid_file.read_text(encoding="utf-8").strip() == str(os.getpid()):
+                if pid_file.exists() and not pid_file.is_symlink() and pid_file.read_text(encoding="utf-8").strip() == str(os.getpid()):
                     pid_file.unlink(missing_ok=True)
             except Exception:
                 pass
@@ -8799,7 +9133,7 @@ def _terminate_stale_windowless_bridges() -> None:
         return
     try:
         pid_file = _get_bridge_pid_file()
-        if not pid_file.is_file():
+        if not pid_file.is_file() or pid_file.is_symlink():
             return
         raw_pid = pid_file.read_text(encoding="utf-8").strip()
         if not raw_pid.isdigit():
@@ -8831,7 +9165,7 @@ def _terminate_stale_windowless_bridges() -> None:
             buf = ctypes.create_unicode_buffer(512)
             size = ctypes.c_uint32(len(buf))
             if k32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
-                if "python" in Path(buf.value).name.lower():
+                if Path(buf.value).name.lower() in ("python.exe", "pythonw.exe"):
                     k32.TerminateProcess(handle, 1)
         finally:
             k32.CloseHandle(handle)

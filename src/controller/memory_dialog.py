@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import datetime
 import os
+import re
 import subprocess
 import tkinter as tk
 from pathlib import Path
@@ -23,9 +24,38 @@ from src.controller.memory_manager import (
     MEMORY_CATEGORY_LABELS,
     MEMORY_TRACK_LABELS,
     MemoryManager,
+    _validate_student_id,
 )
+from src.utils.app_paths import redact_secrets
 
 _CAT_LABEL_TO_CODE: dict[str, str] = {v: k for k, v in MEMORY_CATEGORY_LABELS.items()}
+_SAFE_FILENAME_TOKEN_RE = re.compile(r"[^A-Za-z0-9_-]+")
+
+
+def _safe_backup_filename(base_cid: str, stamp: str, single_student: bool) -> str:
+    """Build a strictly sanitized default JSON backup filename (zero traversal/separator risk)."""
+    clean_stamp = _SAFE_FILENAME_TOKEN_RE.sub("", str(stamp or ""))[:20] or "backup"
+    if single_student and base_cid:
+        token = _SAFE_FILENAME_TOKEN_RE.sub("_", str(base_cid)).strip("_")[:48]
+        if token:
+            return f"momotalk_memory_{token}_{clean_stamp}.json"
+    return f"momotalk_memory_all_{clean_stamp}.json"
+
+
+def _validate_open_folder_target(folder: Path, expected_dir: Path) -> Path:
+    """Verify folder target is an existing non-symlink directory matching `expected_dir`."""
+    raw_str = str(folder)
+    if "\x00" in raw_str:
+        raise ValueError("Invalid folder path")
+    if folder.is_symlink():
+        raise ValueError("Refusing to open symlinked memory directory")
+    resolved = folder.resolve()
+    expected = expected_dir.resolve()
+    if resolved != expected or not resolved.is_dir() or not resolved.is_absolute():
+        raise ValueError("Memory folder path validation failed")
+    if os.name == "nt" and str(resolved).startswith(("/", "-")):
+        raise ValueError("Invalid Windows directory path")
+    return resolved
 
 
 class MemoryNoteDialog(tk.Toplevel):
@@ -43,8 +73,15 @@ class MemoryNoteDialog(tk.Toplevel):
     ) -> None:
         super().__init__(parent)
         self.memory_mgr = memory_mgr
-        self.base_cid = (base_cid or "").strip()
-        self.student_name_kr = (student_name_kr or base_cid or "학생").strip()
+        raw_cid = (base_cid or "").strip()
+        if raw_cid:
+            try:
+                self.base_cid = _validate_student_id(raw_cid)
+            except ValueError:
+                self.base_cid = ""
+        else:
+            self.base_cid = ""
+        self.student_name_kr = (student_name_kr or self.base_cid or "학생").strip()
         self.active_track = track if track in ("official", "fanon", "custom") else "official"
         self.on_changed = on_changed
         self._confirmed_ids: list[str] = []
@@ -800,20 +837,19 @@ class MemoryNoteDialog(tk.Toplevel):
     def _open_memory_folder(self) -> None:
         folder = self.memory_mgr.memory_dir
         try:
+            resolved = _validate_open_folder_target(folder, self.memory_mgr.memory_dir)
             if os.name == "nt":
-                os.startfile(str(folder))  # type: ignore[attr-defined]
+                os.startfile(str(resolved), "explore")  # type: ignore[attr-defined]
             else:
-                subprocess.Popen(["xdg-open", str(folder)])
+                if not str(resolved).startswith("/"):
+                    raise ValueError("Invalid directory path")
+                subprocess.Popen(["xdg-open", str(resolved)], shell=False)
         except Exception as exc:
-            messagebox.showerror("폴더 열기 실패", str(exc), parent=self)
+            messagebox.showerror("폴더 열기 실패", redact_secrets(str(exc)), parent=self)
 
     def _on_export_backup(self, single_student: bool) -> None:
         stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
-        default_name = (
-            f"momotalk_memory_{self.base_cid}_{stamp}.json"
-            if (single_student and self.base_cid)
-            else f"momotalk_memory_all_{stamp}.json"
-        )
+        default_name = _safe_backup_filename(self.base_cid, stamp, single_student)
         dest = filedialog.asksaveasfilename(
             parent=self,
             title="모모톡 기억 백업 저장",
@@ -824,8 +860,15 @@ class MemoryNoteDialog(tk.Toplevel):
         if not dest:
             return
         try:
+            if "\x00" in str(dest):
+                raise ValueError("유효하지 않은 저장 경로입니다.")
+            dest_path = Path(dest)
+            if dest_path.is_symlink():
+                raise ValueError("심볼릭 링크 대상에는 백업을 저장할 수 없습니다.")
+            if dest_path.suffix.lower() != ".json":
+                raise ValueError("백업 파일은 .json 확장자만 저장할 수 있습니다.")
             stats = self.memory_mgr.export_backup(
-                Path(dest),
+                dest_path,
                 base_cid=self.base_cid if single_student else None,
                 track=self.active_track if single_student else None,
             )
@@ -833,7 +876,7 @@ class MemoryNoteDialog(tk.Toplevel):
                 f"📤 백업 완료: 학생버킷 {stats['buckets']}개 · 기억 {stats['memories']}개 · 통화 {stats['sessions']}건"
             )
         except Exception as exc:
-            messagebox.showerror("백업 실패", str(exc), parent=self)
+            messagebox.showerror("백업 실패", redact_secrets(str(exc)), parent=self)
 
     def _on_import_backup(self, merge: bool) -> None:
         if not merge:
@@ -851,7 +894,12 @@ class MemoryNoteDialog(tk.Toplevel):
         if not src:
             return
         try:
-            stats = self.memory_mgr.import_backup(Path(src), merge=merge)
+            if "\x00" in str(src):
+                raise ValueError("유효하지 않은 파일 경로입니다.")
+            src_path = Path(src)
+            if src_path.is_symlink() or not src_path.is_file():
+                raise ValueError("유효한 일반 JSON 백업 파일만 불러올 수 있습니다.")
+            stats = self.memory_mgr.import_backup(src_path, merge=merge)
             self._refresh_student_tab()
             self._load_sensei_profile_into_ui()
             self._notify_changed()
@@ -859,4 +907,4 @@ class MemoryNoteDialog(tk.Toplevel):
                 f"📥 복원 완료: 버킷 {stats['buckets']}개 · 기억 {stats['memories']}개 · 통화 {stats['sessions']}건"
             )
         except Exception as exc:
-            messagebox.showerror("복원 실패", str(exc), parent=self)
+            messagebox.showerror("복원 실패", redact_secrets(str(exc)), parent=self)

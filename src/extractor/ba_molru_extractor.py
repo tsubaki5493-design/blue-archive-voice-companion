@@ -36,6 +36,90 @@ from src.utils.app_paths import get_user_data_dir
 
 DEFAULT_DATA_DIR = get_user_data_dir() / "data"
 
+# Security & resource limits for untrusted/corrupted binary archive parsing
+MAX_CATALOG_FILE_BYTES = 128 * 1024 * 1024   # 128 MB hard cap on MediaCatalog.bytes
+MAX_CATALOG_ENTRIES = 500_000                # Max catalog entries parsed
+MAX_MOLRU_FILE_BYTES = 256 * 1024 * 1024     # 256 MB hard cap on a single .molru pack
+MAX_OGG_STREAM_BYTES = 32 * 1024 * 1024      # 32 MB hard cap per extracted .ogg stream
+MAX_OGG_STREAMS_PER_PACK = 4096              # Max streams per .molru pack
+
+_SAFE_ENTITY_ID_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_\-]{0,79}\Z")
+_WIN_UNSAFE_FILE_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]+')
+_WIN_RESERVED_NAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
+)
+_SAFE_EXT_RE = re.compile(r"\A\.[A-Za-z0-9]{1,8}\Z")
+
+
+def is_safe_entity_id(value: str) -> bool:
+    """Return True iff `value` is a strictly safe flat identifier (no traversal, separators, dots, or device names)."""
+    s = str(value or "").strip()
+    if not s or not _SAFE_ENTITY_ID_RE.match(s):
+        return False
+    return s.upper() not in _WIN_RESERVED_NAMES
+
+
+def sanitize_extract_filename(
+    raw_name: str,
+    *,
+    default_ext: str = ".ogg",
+    fallback_stem: str = "clip",
+) -> str:
+    """
+    Strictly sanitize an archive/catalog filename against Zip-Slip, path traversal (`..`, `/`, `\\`),
+    Windows reserved device names, and control characters.
+    """
+    text = str(raw_name or "").replace("\x00", "")
+    # Take only the final path component across BOTH POSIX and Windows separators
+    parts = [p for p in re.split(r"[/\\]+", text) if p and p not in (".", "..")]
+    leaf = parts[-1] if parts else ""
+    if leaf:
+        p_leaf = Path(leaf)
+        raw_stem = p_leaf.stem
+        raw_ext = p_leaf.suffix
+    else:
+        raw_stem = ""
+        raw_ext = ""
+
+    cleaned = _WIN_UNSAFE_FILE_RE.sub("_", raw_stem)
+    cleaned = re.sub(r"\.{2,}", "_", cleaned)
+    cleaned = re.sub(r"\s+", "_", cleaned).strip(" .")
+    if not cleaned or cleaned.upper() in _WIN_RESERVED_NAMES:
+        fb = _WIN_UNSAFE_FILE_RE.sub("_", str(fallback_stem or "clip"))
+        fb = re.sub(r"\.{2,}", "_", fb).strip(" .") or "clip"
+        cleaned = f"_{cleaned}" if (cleaned and cleaned.upper() in _WIN_RESERVED_NAMES) else fb
+    cleaned = cleaned[:96]
+
+    if default_ext:
+        ext = default_ext if default_ext.startswith(".") else f".{default_ext}"
+    else:
+        ext = raw_ext if _SAFE_EXT_RE.match(raw_ext) else ""
+    return f"{cleaned}{ext}"
+
+
+def _ensure_path_within(base_dir: Path, target_path: Path) -> Path:
+    """Verify `target_path` resolves strictly inside `base_dir` and is not a symlink."""
+    base_res = base_dir.resolve()
+    if target_path.is_symlink():
+        raise ValueError(f"Refusing to access symlink target: {target_path}")
+    target_res = target_path.resolve()
+    if not target_res.is_relative_to(base_res):
+        raise ValueError(f"Path traversal blocked: {target_path} escapes {base_dir}")
+    return target_res
+
+
+def _assert_not_inside_game_dir(out_dir: Path, game_dir: Path) -> None:
+    """Ensure extractor outputs are NEVER written inside the read-only Steam Blue Archive directory."""
+    try:
+        out_res = out_dir.resolve()
+        game_res = game_dir.resolve()
+        if out_res == game_res or out_res.is_relative_to(game_res):
+            raise ValueError(f"Refusing to write inside read-only Steam game directory: {out_dir}")
+    except ValueError:
+        raise
+    except OSError:
+        pass
+
 
 def _normalize_ba_candidate(candidate: Path | str | None) -> Optional[Path]:
     """Normalize a user-supplied folder (also accepting BlueArchive_Data or BlueArchive.exe)."""
@@ -223,6 +307,9 @@ class CatalogEntry:
 
 def parse_media_catalog(catalog_bytes_path: Path) -> Dict[str, List[CatalogEntry]]:
     """Parse Steam Blue Archive MediaCatalog.bytes (MXMC format) into molru_key -> ordered file list."""
+    file_size = catalog_bytes_path.stat().st_size
+    if file_size > MAX_CATALOG_FILE_BYTES:
+        raise ValueError(f"MediaCatalog.bytes exceeds maximum allowed size ({file_size} > {MAX_CATALOG_FILE_BYTES})")
     raw = catalog_bytes_path.read_bytes()
     if len(raw) <= 9:
         raise ValueError(f"Invalid or empty MediaCatalog.bytes: {catalog_bytes_path}")
@@ -230,8 +317,9 @@ def parse_media_catalog(catalog_bytes_path: Path) -> Dict[str, List[CatalogEntry
     pos = 9
     total_len = len(raw)
     catalog: Dict[str, List[CatalogEntry]] = {}
+    parsed_count = 0
 
-    while pos + 4 <= total_len:
+    while pos + 4 <= total_len and parsed_count < MAX_CATALOG_ENTRIES:
         (internal_len,) = struct.unpack_from("<I", raw, pos)
         pos += 4
         if internal_len > 4096 or pos + internal_len + 5 + 4 > total_len:
@@ -256,12 +344,13 @@ def parse_media_catalog(catalog_bytes_path: Path) -> Dict[str, List[CatalogEntry
             "BlueArchive_Data/StreamingAssets/PUB/Resource/GameData/MediaResources/",
         )
         internal_str = internal_bytes.decode("utf-8", errors="replace")
-        external_str = external_bytes.decode("utf-8", errors="replace")
+        external_str = external_bytes.decode("utf-8", errors="replace").replace("\\", "/")
 
-        parts = external_str.split("/")
+        parts = [p for p in external_str.split("/") if p not in ("", ".", "..")]
         dir_part = "/".join(parts[:-1]) if len(parts) > 1 else ""
         key = f"{prefix}{dir_part}"
-        external_file = parts[-1] if parts else external_str
+        raw_external_file = parts[-1] if parts else external_str
+        external_file = sanitize_extract_filename(raw_external_file, default_ext="", fallback_stem="clip")
 
         catalog.setdefault(key, []).append(
             CatalogEntry(
@@ -270,6 +359,7 @@ def parse_media_catalog(catalog_bytes_path: Path) -> Dict[str, List[CatalogEntry
                 external_file=external_file,
             )
         )
+        parsed_count += 1
 
     return catalog
 
@@ -289,6 +379,9 @@ def load_or_build_catalog(game_dir: Path, cache_path: Path, force_refresh: bool 
         / "MediaResources"
         / "MediaCatalog.bytes"
     )
+    _assert_not_inside_game_dir(cache_path, game_dir)
+    if cache_path.is_symlink():
+        raise ValueError(f"Refusing to access symlink catalog cache: {cache_path}")
     resolved_cache = str(cache_path.resolve())
     cache_stale = False
     if cache_path.exists() and catalog_bytes.exists():
@@ -300,13 +393,14 @@ def load_or_build_catalog(game_dir: Path, cache_path: Path, force_refresh: bool 
     if cache_path.exists() and not force_refresh and not cache_stale:
         try:
             st = cache_path.stat()
-            mem = _CATALOG_MEM_CACHE.get(resolved_cache)
-            if mem and mem[0] == st.st_mtime_ns and mem[1] == st.st_size:
-                return mem[2]
-            data = json.loads(cache_path.read_text(encoding="utf-8"))
-            if isinstance(data, dict) and data:
-                _CATALOG_MEM_CACHE[resolved_cache] = (st.st_mtime_ns, st.st_size, data)
-                return data
+            if st.st_size <= MAX_CATALOG_FILE_BYTES:
+                mem = _CATALOG_MEM_CACHE.get(resolved_cache)
+                if mem and mem[0] == st.st_mtime_ns and mem[1] == st.st_size:
+                    return mem[2]
+                data = json.loads(cache_path.read_text(encoding="utf-8"))
+                if isinstance(data, dict) and data:
+                    _CATALOG_MEM_CACHE[resolved_cache] = (st.st_mtime_ns, st.st_size, data)
+                    return data
         except Exception:
             # Corrupted/truncated cache file -> fall through and rebuild cleanly from MediaCatalog.bytes
             pass
@@ -343,19 +437,26 @@ def load_or_build_catalog(game_dir: Path, cache_path: Path, force_refresh: bool 
     return serializable
 
 
-def compute_exact_ogg_stream_end(data: bytes, start_offset: int, max_end: int) -> int:
+def compute_exact_ogg_stream_end(
+    data: bytes,
+    start_offset: int,
+    max_end: int,
+    *,
+    max_stream_bytes: int = MAX_OGG_STREAM_BYTES,
+) -> int:
     """
     Walk RFC 3533 OGG pages from start_offset for the same bitstream serial number
-    so trailing .molru gap metadata bytes are cleanly excluded.
+    so trailing .molru gap metadata bytes are cleanly excluded, bounded by `max_stream_bytes`.
     """
-    if start_offset + 27 > max_end or data[start_offset : start_offset + 4] != b"OggS":
-        return max_end
+    capped_max_end = min(max_end, start_offset + max(1, int(max_stream_bytes)))
+    if start_offset + 27 > capped_max_end or data[start_offset : start_offset + 4] != b"OggS":
+        return capped_max_end
 
     target_serial = data[start_offset + 14 : start_offset + 18]
     pos = start_offset
     last_valid_end = start_offset
 
-    while pos + 27 <= max_end and data[pos : pos + 4] == b"OggS":
+    while pos + 27 <= capped_max_end and data[pos : pos + 4] == b"OggS":
         version = data[pos + 4]
         header_type = data[pos + 5]
         serial = data[pos + 14 : pos + 18]
@@ -364,12 +465,12 @@ def compute_exact_ogg_stream_end(data: bytes, start_offset: int, max_end: int) -
 
         num_segments = data[pos + 26]
         seg_table_end = pos + 27 + num_segments
-        if seg_table_end > max_end:
+        if seg_table_end > capped_max_end:
             break
 
         body_size = sum(data[pos + 27 : seg_table_end])
         page_end = seg_table_end + body_size
-        if page_end > max_end:
+        if page_end > capped_max_end:
             break
 
         last_valid_end = page_end
@@ -378,17 +479,27 @@ def compute_exact_ogg_stream_end(data: bytes, start_offset: int, max_end: int) -
             break
         pos = page_end
 
-    return last_valid_end if last_valid_end > start_offset else max_end
+    return last_valid_end if last_valid_end > start_offset else capped_max_end
 
 
-def extract_ogg_streams_from_molru(molru_bytes: bytes) -> List[Tuple[int, int, bytes]]:
-    """Scan a .molru archive and extract all distinct OGG audio streams in order."""
+def extract_ogg_streams_from_molru(
+    molru_bytes: bytes,
+    *,
+    max_stream_bytes: int = MAX_OGG_STREAM_BYTES,
+    max_streams: int = MAX_OGG_STREAMS_PER_PACK,
+) -> List[Tuple[int, int, bytes]]:
+    """Scan a .molru archive and extract all distinct OGG audio streams in order with strict size caps."""
+    total_len = len(molru_bytes)
+    if total_len > MAX_MOLRU_FILE_BYTES:
+        raise ValueError(f".molru pack exceeds maximum allowed size ({total_len} > {MAX_MOLRU_FILE_BYTES})")
+    eff_max_stream = max(1, min(int(max_stream_bytes), MAX_OGG_STREAM_BYTES))
+    eff_max_streams = max(1, min(int(max_streams), MAX_OGG_STREAMS_PER_PACK))
+
     streams_raw_starts: List[int] = []
     current_serial: Optional[bytes] = None
 
     search_pos = 0
-    total_len = len(molru_bytes)
-    while True:
+    while len(streams_raw_starts) < eff_max_streams:
         idx = molru_bytes.find(b"OggS", search_pos)
         if idx == -1 or idx + 27 > total_len:
             break
@@ -412,7 +523,12 @@ def extract_ogg_streams_from_molru(molru_bytes: bytes) -> List[Tuple[int, int, b
     extracted: List[Tuple[int, int, bytes]] = []
     for i, start in enumerate(streams_raw_starts):
         next_boundary = streams_raw_starts[i + 1] if i + 1 < len(streams_raw_starts) else total_len
-        exact_end = compute_exact_ogg_stream_end(molru_bytes, start, next_boundary)
+        exact_end = compute_exact_ogg_stream_end(
+            molru_bytes, start, next_boundary, max_stream_bytes=eff_max_stream
+        )
+        stream_len = exact_end - start
+        if stream_len <= 0 or stream_len > eff_max_stream:
+            continue
         extracted.append((start, exact_end, molru_bytes[start:exact_end]))
 
     return extracted
@@ -439,6 +555,9 @@ def find_character_molru_files(
     Also supports explicit pack stems from config/characters/<id>.json (e.g. ['JP_CH0069', 'JP_NP0035'])
     and case-insensitive matching (e.g. JP_erika.molru) plus romanization aliases (e.g. Reijo -> reizyo).
     """
+    lang_up = str(lang or "JP").strip().upper()
+    if lang_up not in ("JP", "KR"):
+        return []
     voc_dir = (
         game_dir
         / "BlueArchive_Data"
@@ -448,12 +567,12 @@ def find_character_molru_files(
         / "GameData"
         / "MediaResources"
         / "Audio"
-        / f"VOC_{lang.upper()}"
+        / f"VOC_{lang_up}"
     )
     if not voc_dir.exists():
         return []
 
-    lang_up = lang.upper()
+    voc_dir_res = voc_dir.resolve()
     all_molrus = sorted(voc_dir.glob("*.molru"))
     stem_to_path_ci = {p.stem.lower(): p for p in all_molrus}
 
@@ -462,15 +581,20 @@ def find_character_molru_files(
     if explicit_packs:
         for pk in explicit_packs:
             raw_pk = str(pk or "").strip()
-            if not raw_pk:
+            if not raw_pk or "/" in raw_pk or "\\" in raw_pk or ".." in raw_pk or "\x00" in raw_pk:
                 continue
             stem = raw_pk if raw_pk.upper().startswith(f"{lang_up}_") else f"{lang_up}_{raw_pk}"
+            if not _SAFE_ENTITY_ID_RE.match(stem):
+                continue
             cand = voc_dir / f"{stem}.molru"
             if not cand.exists():
                 cand = stem_to_path_ci.get(stem.lower(), cand)
-            if cand.exists() and cand not in seen:
-                seen.add(cand)
-                found.append(cand)
+            try:
+                if cand.exists() and not cand.is_symlink() and cand.resolve().is_relative_to(voc_dir_res) and cand not in seen:
+                    seen.add(cand)
+                    found.append(cand)
+            except OSError:
+                continue
 
     # Collect deduplicated candidate prefixes (primary molru_prefix + extra_prefixes + romanization aliases)
     prefixes: List[str] = []
@@ -604,15 +728,19 @@ def build_clean_rvc_wav_dataset(
         if peak > 1e-4:
             audio = audio * (0.84 / peak)
 
-        wav_path = wav_out_dir / f"{ogg_path.stem}.wav"
+        safe_wav_name = sanitize_extract_filename(ogg_path.stem, default_ext=".wav", fallback_stem="clip")
+        wav_path = _ensure_path_within(wav_out_dir, wav_out_dir / safe_wav_name)
         sf.write(str(wav_path), audio, target_sr, subtype="PCM_16")
         kept_files.append(wav_path)
         total_duration_sec += duration
 
+    if zip_out_path.is_symlink():
+        raise ValueError(f"Refusing to overwrite symlink ZIP target: {zip_out_path}")
     # Create RVC dataset ZIP archive
     with zipfile.ZipFile(zip_out_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for wav_file in kept_files:
-            zf.write(wav_file, arcname=wav_file.name)
+            arc_name = sanitize_extract_filename(wav_file.name, default_ext=".wav", fallback_stem="clip")
+            zf.write(wav_file, arcname=arc_name)
 
     return {
         "total_raw_ogg": len(raw_ogg_files),
@@ -632,11 +760,15 @@ def extract_character(
     langs: List[str],
     build_wav: bool = True,
 ) -> dict:
+    if not is_safe_entity_id(character):
+        raise ValueError(f"Invalid or unsafe character identifier: {character!r}")
+    _assert_not_inside_game_dir(data_dir, game_dir)
     catalog_cache_path = data_dir / "catalog_cache.json"
     catalog = load_or_build_catalog(game_dir, catalog_cache_path)
 
     # Auto-resolve molru_prefix and explicit local_voice_packs if config/characters/<id>.json exists
-    char_cfg_path = WORKSPACE_ROOT / "config" / "characters" / f"{character.lower()}.json"
+    chars_cfg_dir = WORKSPACE_ROOT / "config" / "characters"
+    char_cfg_path = _ensure_path_within(chars_cfg_dir, chars_cfg_dir / f"{character.lower()}.json")
     molru_prefix = character
     local_packs_cfg: dict = {}
     if char_cfg_path.exists():
@@ -648,25 +780,33 @@ def extract_character(
             pass
 
     summary = {"character": character, "languages": {}}
+    game_dir_res = game_dir.resolve()
 
     for lang in langs:
-        lang_upper = lang.upper()
+        lang_upper = str(lang or "").strip().upper()
+        if lang_upper not in ("JP", "KR"):
+            raise ValueError(f"Invalid language code: {lang!r}")
         explicit_list = local_packs_cfg.get(lang_upper.lower()) or []
         molru_files = find_character_molru_files(game_dir, molru_prefix, lang_upper, explicit_packs=explicit_list)
         if not molru_files:
             print(f"[WARN] No .molru files found for character='{character}' (prefix='{molru_prefix}') lang='{lang_upper}'")
             continue
 
-        char_lang_dir = data_dir / "characters" / character / lang_upper
-        raw_ogg_dir = char_lang_dir / "raw_ogg"
-        wav_40k_dir = char_lang_dir / "clean_wav_40k"
-        zip_path = char_lang_dir / f"{character}_{lang_upper}_rvc_dataset.zip"
+        char_lang_dir = _ensure_path_within(data_dir, data_dir / "characters" / character / lang_upper)
+        raw_ogg_dir = _ensure_path_within(char_lang_dir, char_lang_dir / "raw_ogg")
+        wav_40k_dir = _ensure_path_within(char_lang_dir, char_lang_dir / "clean_wav_40k")
+        zip_path = _ensure_path_within(char_lang_dir, char_lang_dir / f"{character}_{lang_upper}_rvc_dataset.zip")
         raw_ogg_dir.mkdir(parents=True, exist_ok=True)
 
         extracted_ogg_paths: List[Path] = []
         pack_details = []
 
         for molru_path in molru_files:
+            if molru_path.is_symlink() or not molru_path.resolve().is_relative_to(game_dir_res):
+                continue
+            if molru_path.stat().st_size > MAX_MOLRU_FILE_BYTES:
+                print(f"[WARN] Skipping oversized .molru pack: {molru_path.name}")
+                continue
             rel_from_game = molru_path.relative_to(game_dir).as_posix()
             mxmc_key = rel_from_game[:-6] if rel_from_game.endswith(".molru") else rel_from_game
             name_queue = list(catalog.get(mxmc_key, []))
@@ -675,14 +815,18 @@ def extract_character(
             streams = extract_ogg_streams_from_molru(molru_bytes)
 
             for idx, (start, end, ogg_data) in enumerate(streams):
+                fallback_stem = f"{molru_path.stem}_{idx:04d}"
                 if idx < len(name_queue):
-                    fname = name_queue[idx]["external_file"]
+                    raw_fname = str((name_queue[idx] or {}).get("external_file") or "")
                 else:
-                    fname = f"{molru_path.stem}_{idx:04d}.ogg"
+                    raw_fname = f"{fallback_stem}.ogg"
+                fname = sanitize_extract_filename(raw_fname, default_ext=".ogg", fallback_stem=fallback_stem)
 
                 # Prefix costume pack stem if needed to avoid collisions across variants
-                out_name = fname if fname.lower().startswith(molru_path.stem.split("_", 1)[-1].lower()) else f"{molru_path.stem}_{fname}"
-                out_path = raw_ogg_dir / out_name
+                stem_suffix = molru_path.stem.split("_", 1)[-1].lower()
+                raw_out_name = fname if fname.lower().startswith(stem_suffix) else f"{molru_path.stem}_{fname}"
+                out_name = sanitize_extract_filename(raw_out_name, default_ext=".ogg", fallback_stem=fallback_stem)
+                out_path = _ensure_path_within(raw_ogg_dir, raw_ogg_dir / out_name)
                 out_path.write_bytes(ogg_data)
                 extracted_ogg_paths.append(out_path)
 

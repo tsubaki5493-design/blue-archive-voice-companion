@@ -9,6 +9,7 @@ enhanced with a Blue Archive proper-noun glossary and punctuation normalization.
 from __future__ import annotations
 
 import inspect
+import json
 import re
 import threading
 from collections import OrderedDict, deque
@@ -16,6 +17,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Callable
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -176,6 +178,27 @@ _INTERJECTION_GLOSSARY: dict[str, str] = {
 
 _PRIMARY_TRANSLATE_URL = "https://translate.googleapis.com/translate_a/single"
 _FALLBACK_TRANSLATE_URL = "https://clients5.google.com/translate_a/t"
+_ALLOWED_TRANSLATE_HOSTS: tuple[str, ...] = ("translate.googleapis.com", "clients5.google.com")
+_MAX_TRANSLATE_QUERY_CHARS = 4000
+_MAX_TRANSLATE_RESPONSE_BYTES = 256 * 1024  # 256 KiB cap per subtitle response
+_RE_CTRL_OR_WS = re.compile(r"[\x00-\x20\x7f]")
+
+
+def _validate_translate_url(url: str) -> str:
+    """Enforce strict HTTPS-only requests to allowed Google Translate endpoints."""
+    raw = str(url or "").strip()
+    if not raw or _RE_CTRL_OR_WS.search(raw):
+        raise ValueError("Invalid translate URL")
+    parsed = urlsplit(raw)
+    if parsed.scheme.lower() != "https":
+        raise ValueError("Refusing non-HTTPS translate endpoint")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("Refusing credentials in translate URL")
+    if (parsed.hostname or "").lower() not in _ALLOWED_TRANSLATE_HOSTS:
+        raise ValueError("Refusing untrusted translate host")
+    if parsed.port not in (None, 443):
+        raise ValueError("Refusing non-standard port for translate endpoint")
+    return raw
 
 
 @dataclass
@@ -427,10 +450,18 @@ class RealtimeSubtitleTranslator:
             return self._http
         with self._http_lock:
             if self._http is None:
+                limits = httpx.Limits(max_keepalive_connections=4, max_connections=6, keepalive_expiry=120.0)
                 self._http = httpx.Client(
-                    transport=httpx.HTTPTransport(local_address="0.0.0.0", retries=1),
-                    timeout=httpx.Timeout(2.5, connect=1.5),
-                    limits=httpx.Limits(max_keepalive_connections=4, max_connections=6, keepalive_expiry=120.0),
+                    verify=True,
+                    follow_redirects=False,
+                    transport=httpx.HTTPTransport(
+                        verify=True,
+                        local_address="0.0.0.0",
+                        retries=1,
+                        limits=limits,
+                    ),
+                    timeout=httpx.Timeout(2.5, connect=1.5, read=2.5, write=2.0, pool=2.0),
+                    limits=limits,
                 )
             return self._http
 
@@ -495,26 +526,57 @@ class RealtimeSubtitleTranslator:
     def should_refine_with_llm(self, engine: str) -> bool:
         return (engine or "auto_inline") != "fast_nmt" and self._llm_translator is not None and not self._closed
 
+    def _get_json_bounded(self, url: str, params: dict[str, str], label: str) -> Any:
+        safe_url = _validate_translate_url(url)
+        safe_params = dict(params)
+        if "q" in safe_params:
+            safe_params["q"] = str(safe_params["q"] or "")[:_MAX_TRANSLATE_QUERY_CHARS]
+
+        client = self._get_http_client()
+        if isinstance(client, httpx.Client):
+            with client.stream("GET", safe_url, params=safe_params) as resp:
+                if resp.status_code != 200:
+                    raise RuntimeError(f"{label} translate HTTP {resp.status_code}")
+                cl_raw = resp.headers.get("content-length")
+                if cl_raw is not None:
+                    try:
+                        if int(cl_raw) > _MAX_TRANSLATE_RESPONSE_BYTES:
+                            raise RuntimeError(f"{label} translate response too large")
+                    except ValueError:
+                        pass
+                buf = bytearray()
+                for chunk in resp.iter_bytes():
+                    if not chunk:
+                        continue
+                    buf.extend(chunk)
+                    if len(buf) > _MAX_TRANSLATE_RESPONSE_BYTES:
+                        raise RuntimeError(f"{label} translate response too large")
+                return json.loads(buf.decode("utf-8", errors="replace"))
+
+        resp = client.get(safe_url, params=safe_params)
+        if resp.status_code != 200:
+            raise RuntimeError(f"{label} translate HTTP {resp.status_code}")
+        raw_content = getattr(resp, "content", None)
+        if isinstance(raw_content, (bytes, bytearray)) and len(raw_content) > _MAX_TRANSLATE_RESPONSE_BYTES:
+            raise RuntimeError(f"{label} translate response too large")
+        return resp.json()
+
     def _query_primary(self, prepared: str) -> str:
-        resp = self._get_http_client().get(
+        data = self._get_json_bounded(
             _PRIMARY_TRANSLATE_URL,
             params={"client": "gtx", "sl": "ja", "tl": "ko", "dt": "t", "q": prepared},
+            label="Primary",
         )
-        if resp.status_code != 200:
-            raise RuntimeError(f"Primary translate HTTP {resp.status_code}")
-        data = resp.json()
         if not isinstance(data, list) or not data or not isinstance(data[0], list):
             return ""
         return "".join(str(seg[0]) for seg in data[0] if isinstance(seg, list) and seg and seg[0])
 
     def _query_fallback(self, prepared: str) -> str:
-        resp = self._get_http_client().get(
+        data = self._get_json_bounded(
             _FALLBACK_TRANSLATE_URL,
             params={"client": "dict-chrome-ex", "sl": "ja", "tl": "ko", "q": prepared},
+            label="Fallback",
         )
-        if resp.status_code != 200:
-            raise RuntimeError(f"Fallback translate HTTP {resp.status_code}")
-        data = resp.json()
         if isinstance(data, list):
             parts = []
             for item in data:

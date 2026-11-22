@@ -35,11 +35,17 @@ if str(ROOT_DIR) not in sys.path:
 
 from src.extractor.ba_molru_extractor import (
     DEFAULT_GAME_DIR,
+    MAX_MOLRU_FILE_BYTES,
+    MAX_OGG_STREAM_BYTES,
+    _assert_not_inside_game_dir,
+    _ensure_path_within,
     extract_ogg_streams_from_molru,
     find_character_molru_files,
+    is_safe_entity_id,
     is_valid_ba_game_dir,
     load_or_build_catalog,
     resolve_ba_game_dir,
+    sanitize_extract_filename,
 )
 from src.utils.app_paths import get_app_root, get_cache_dir, get_user_data_dir, get_user_models_dir
 
@@ -47,6 +53,10 @@ TARGET_SR = 44100
 TARGET_RMS_DBFS = -18.0
 PEAK_CEILING_DBFS = -1.5
 HIGHPASS_HZ = 75.0
+MAX_ZIP_MEMBER_BYTES = 32 * 1024 * 1024      # 32 MB per WAV inside dataset ZIP
+MAX_ZIP_TOTAL_BYTES = 256 * 1024 * 1024      # 256 MB total uncompressed read per dataset ZIP
+MAX_ZIP_ENTRIES = 4096                       # Max entries inspected per dataset ZIP
+MAX_GAMEDATA_JSON_BYTES = 64 * 1024 * 1024   # 64 MB cap on optional transcript JSON files
 _ENV_GAMEDATA_DIR = os.environ.get("BA_GAMEDATA_DIR", "").strip()
 OPTIONAL_GAMEDATA_DIR: Optional[Path] = Path(_ENV_GAMEDATA_DIR) if _ENV_GAMEDATA_DIR else None
 _TRANSCRIPT_CACHE: Dict[str, Dict[str, str]] = {}
@@ -75,19 +85,42 @@ REFERENCE_QUALITY_PROFILES: Dict[str, Dict[str, object]] = {
 }
 
 _WIN_UNSAFE_FILENAME_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]+')
+_WIN_RESERVED_STEMS = frozenset(
+    {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
+)
 _HARD_SCREAM_KEYWORDS = ("damage", "retire", "defeat", "shout", "groggy", "panic")
 
 
 def sanitize_filename_stem(raw_stem: str, fallback: str = "clip") -> str:
-    """Make an audio clip stem 100% safe for Windows/macOS/Linux filesystems."""
+    """Make an audio clip stem 100% safe for Windows/macOS/Linux filesystems (blocks traversal & device names)."""
     cleaned = _WIN_UNSAFE_FILENAME_RE.sub("_", str(raw_stem or "")).strip(" .")
-    cleaned = re.sub(r"\s+", "_", cleaned)
+    cleaned = re.sub(r"\.{2,}", "_", cleaned)
+    cleaned = re.sub(r"\s+", "_", cleaned).strip(" .")
     if not cleaned:
         cleaned = fallback
+    if cleaned.upper() in _WIN_RESERVED_STEMS:
+        cleaned = f"_{cleaned}"
     return cleaned[:96]
 
 
+def _is_safe_zip_member_name(name: str) -> bool:
+    """Reject Zip-Slip member paths containing `..`, absolute roots, Windows drive letters, or NUL."""
+    if not name or "\x00" in name:
+        return False
+    if name.startswith(("/", "\\")):
+        return False
+    norm = name.replace("\\", "/")
+    parts = norm.split("/")
+    if not parts:
+        return False
+    if ":" in parts[0]:
+        return False
+    return all(part not in ("..", "") for part in parts)
+
+
 def _atomic_write_text(target: Path, content: str) -> None:
+    if target.is_symlink():
+        raise ValueError(f"Refusing to overwrite symlink file: {target}")
     target.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=".ref_", suffix=".tmp", dir=str(target.parent))
     try:
@@ -378,7 +411,7 @@ def load_optional_official_transcripts(lang: str = "JP", gamedata_dir: Optional[
 
     try:
         sv_file = gamedata_dir / ("schale_kr_voice.json" if lang_up == "KR" else "schale_jp_voice.json")
-        if sv_file.exists():
+        if sv_file.exists() and not sv_file.is_symlink() and sv_file.stat().st_size <= MAX_GAMEDATA_JSON_BYTES:
             sv = json.loads(sv_file.read_text(encoding="utf-8"))
             for v in (sv.values() if isinstance(sv, dict) else []):
                 if not isinstance(v, dict):
@@ -394,7 +427,14 @@ def load_optional_official_transcripts(lang: str = "JP", gamedata_dir: Optional[
 
         cd_file = gamedata_dir / "CharacterDialogExcel.json"
         sk_file = gamedata_dir / ("schale_kr_students.json" if (gamedata_dir / "schale_kr_students.json").exists() else "schale_jp_students.json")
-        if cd_file.exists() and sk_file.exists():
+        if (
+            cd_file.exists()
+            and sk_file.exists()
+            and not cd_file.is_symlink()
+            and not sk_file.is_symlink()
+            and cd_file.stat().st_size <= MAX_GAMEDATA_JSON_BYTES
+            and sk_file.stat().st_size <= MAX_GAMEDATA_JSON_BYTES
+        ):
             raw_sk = json.loads(sk_file.read_text(encoding="utf-8"))
             sk_map = {int(s["Id"]): s for s in (raw_sk.values() if isinstance(raw_sk, dict) else raw_sk)}
             raw_cd = json.loads(cd_file.read_text(encoding="utf-8"))
@@ -449,7 +489,7 @@ def build_alt_voice_char_data(base_char_data: dict, alt_key: str) -> Optional[di
         return None
     base_id = str(base_char_data.get("id") or "").strip()
     slot_id = str(spec.get("voice_slot_id") or f"{base_id}_{alt_key.capitalize()}").strip()
-    if not slot_id:
+    if not is_safe_entity_id(base_id) or not is_safe_entity_id(slot_id):
         return None
     base_persona = dict(base_char_data.get("persona") or {})
     if isinstance(spec.get("voice_acting_profile"), dict):
@@ -602,18 +642,30 @@ def build_character_fish_reference(
     max_clips = int(prof_cfg["max_clips"])
     min_matched_dur_sec = float(prof_cfg["min_matched_dur_sec"])
 
-    char_id = char_data.get("id", "Aru")
+    char_id = str(char_data.get("id") or "Aru").strip()
+    if not is_safe_entity_id(char_id):
+        raise ValueError(f"Invalid or unsafe character_id: {char_id!r}")
     archetype = (((char_data.get("persona") or {}).get("voice_acting_profile")) or {}).get(
         "archetype", "gentle_earnest_passion"
     )
-    lang_up = lang.upper()
-    user_dataset_zip = get_user_data_dir() / "data" / "characters" / char_id / lang_up / f"{char_id}_{lang_up}_rvc_dataset.zip"
-    legacy_dataset_zip = ROOT_DIR / "data" / "characters" / char_id / lang_up / f"{char_id}_{lang_up}_rvc_dataset.zip"
+    lang_up = str(lang or "JP").strip().upper()
+    if lang_up not in ("JP", "KR"):
+        raise ValueError(f"Invalid voice language code: {lang!r}")
+    user_data_root = get_user_data_dir()
+    user_dataset_zip = _ensure_path_within(
+        user_data_root, user_data_root / "data" / "characters" / char_id / lang_up / f"{char_id}_{lang_up}_rvc_dataset.zip"
+    )
+    legacy_data_root = ROOT_DIR / "data"
+    legacy_dataset_zip = _ensure_path_within(
+        legacy_data_root, legacy_data_root / "characters" / char_id / lang_up / f"{char_id}_{lang_up}_rvc_dataset.zip"
+    )
     dataset_zip = user_dataset_zip if user_dataset_zip.exists() else legacy_dataset_zip
 
-    out_dir = get_user_models_dir() / char_id / lang_up
-    samples_dir = out_dir / "fish_samples"
-    combined_wav = out_dir / f"{char_id}_{lang_up}_FishAudio_Reference.wav"
+    models_root = get_user_models_dir()
+    out_dir = _ensure_path_within(models_root, models_root / char_id / lang_up)
+    _assert_not_inside_game_dir(out_dir, game_dir)
+    samples_dir = _ensure_path_within(out_dir, out_dir / "fish_samples")
+    combined_wav = _ensure_path_within(out_dir, out_dir / f"{char_id}_{lang_up}_FishAudio_Reference.wav")
 
     candidates: List[Tuple[float, str, str, np.ndarray, int, float]] = []
     relaxed_candidates: List[Tuple[float, str, str, np.ndarray, int, float]] = []
@@ -624,17 +676,30 @@ def build_character_fish_reference(
 
     transcript_lookup = load_optional_official_transcripts(lang=lang_up)
 
-    if dataset_zip.exists():
+    if dataset_zip.exists() and not dataset_zip.is_symlink():
+        total_zip_bytes = 0
         with zipfile.ZipFile(dataset_zip, "r") as zf:
-            for name in sorted(zf.namelist()):
-                if not name.lower().endswith(".wav"):
+            infos = sorted(zf.infolist(), key=lambda zi: zi.filename)[:MAX_ZIP_ENTRIES]
+            for info in infos:
+                name = info.filename
+                if info.is_dir() or not name.lower().endswith(".wav"):
                     continue
-                raw_stem = Path(name).stem
+                if not _is_safe_zip_member_name(name):
+                    continue
+                if info.file_size > MAX_ZIP_MEMBER_BYTES:
+                    continue
+                raw_stem = Path(name.replace("\\", "/")).stem
                 raw_stem_low = raw_stem.lower()
                 allowed_by_flt, explicit_inc = _passes_clip_filter(raw_stem_low, clip_filter)
                 if not allowed_by_flt:
                     continue
-                raw = zf.read(name)
+                with zf.open(info, "r") as member_fh:
+                    raw = member_fh.read(MAX_ZIP_MEMBER_BYTES + 1)
+                if len(raw) > MAX_ZIP_MEMBER_BYTES:
+                    continue
+                total_zip_bytes += len(raw)
+                if total_zip_bytes > MAX_ZIP_TOTAL_BYTES:
+                    break
                 try:
                     y, sr = sf.read(io.BytesIO(raw), dtype="float32")
                 except Exception:
@@ -668,14 +733,27 @@ def build_character_fish_reference(
 
         user_catalog = get_cache_dir() / "catalog_cache.json"
         catalog = load_or_build_catalog(game_dir, user_catalog)
+        game_dir_res = game_dir.resolve()
         for molru_path in molru_files:
+            if molru_path.is_symlink() or not molru_path.resolve().is_relative_to(game_dir_res):
+                continue
+            if molru_path.stat().st_size > MAX_MOLRU_FILE_BYTES:
+                continue
             rel_from_game = molru_path.relative_to(game_dir).as_posix()
             mxmc_key = rel_from_game[:-6] if rel_from_game.endswith(".molru") else rel_from_game
             name_queue = list(catalog.get(mxmc_key, []))
-            streams = extract_ogg_streams_from_molru(molru_path.read_bytes())
+            streams = extract_ogg_streams_from_molru(
+                molru_path.read_bytes(), max_stream_bytes=MAX_OGG_STREAM_BYTES
+            )
 
             for idx, (_, _, ogg_bytes) in enumerate(streams):
-                orig_name = name_queue[idx]["external_file"] if idx < len(name_queue) else f"{molru_path.stem}_{idx:04d}.ogg"
+                fallback_stem = f"{molru_path.stem}_{idx:04d}"
+                raw_orig = (
+                    str((name_queue[idx] or {}).get("external_file") or "")
+                    if idx < len(name_queue)
+                    else f"{fallback_stem}.ogg"
+                )
+                orig_name = sanitize_extract_filename(raw_orig, default_ext=".ogg", fallback_stem=fallback_stem)
                 raw_stem = Path(orig_name).stem
                 raw_stem_low = raw_stem.lower()
                 allowed_by_flt, explicit_inc = _passes_clip_filter(raw_stem_low, clip_filter)
@@ -782,8 +860,8 @@ def build_character_fish_reference(
     transcripts_map: Dict[str, str] = {}
     transcript_matched = 0
     for idx, (fname, raw_stem_low, y_44k, dur, sc) in enumerate(selected, 1):
-        out_name = f"{idx:02d}_{fname}"
-        out_sample = samples_dir / out_name
+        out_name = sanitize_extract_filename(f"{idx:02d}_{fname}", default_ext=".wav", fallback_stem=f"{idx:02d}_clip")
+        out_sample = _ensure_path_within(samples_dir, samples_dir / out_name)
         sf.write(out_sample, y_44k, TARGET_SR, subtype="PCM_16")
         saved_samples.append(out_sample)
         tr_text = transcript_lookup.get(raw_stem_low, "")
@@ -864,7 +942,10 @@ def main() -> None:
     parser.add_argument("--game-dir", type=Path, default=DEFAULT_GAME_DIR, help="Path to Steam BlueArchive directory")
     args = parser.parse_args()
 
-    cfg_file = ROOT_DIR / "config" / "characters" / f"{args.character.lower()}.json"
+    if not is_safe_entity_id(args.character):
+        raise ValueError(f"Invalid character identifier: {args.character!r}")
+    chars_dir = ROOT_DIR / "config" / "characters"
+    cfg_file = _ensure_path_within(chars_dir, chars_dir / f"{args.character.lower()}.json")
     if cfg_file.exists():
         char_data = json.loads(cfg_file.read_text(encoding="utf-8"))
     else:

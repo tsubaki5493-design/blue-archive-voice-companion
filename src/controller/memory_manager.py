@@ -38,7 +38,7 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
-from src.utils.app_paths import get_memory_dir
+from src.utils.app_paths import get_memory_dir, harden_user_data_acl, redact_secrets
 
 MEMORY_SCHEMA_VERSION = 1
 MAX_CONFIRMED_MEMORIES = 30
@@ -47,8 +47,39 @@ MAX_OPEN_THREADS = 5
 MAX_SNAPSHOTS = 5
 MAX_SESSIONS_PER_BUCKET = 60
 MAX_TURNS_PER_SESSION = 300
+MAX_MEMORY_JSON_BYTES = 5 * 1024 * 1024
+MAX_BACKUP_JSON_BYTES = 32 * 1024 * 1024
+MAX_IMPORT_BUCKETS = 1000
+MAX_EXTRACTION_RESPONSE_CHARS = 512_000
 DEFAULT_CHECKPOINT_TURN_DELTA = 20
 DEFAULT_MIN_SUBSTANTIVE_USER_TURNS = 2
+
+VALID_MEMORY_TRACKS: tuple[str, ...] = ("official", "fanon", "custom")
+_STRICT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_WINDOWS_RESERVED_NAMES = frozenset(
+    {
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
+        *(f"COM{i}" for i in range(1, 10)),
+        *(f"LPT{i}" for i in range(1, 10)),
+    }
+)
+_ALLOWED_BUCKET_KEYS = frozenset(
+    {
+        "schema_version",
+        "base_cid",
+        "track",
+        "total_calls",
+        "last_called_at",
+        "confirmed_memories",
+        "pending_memories",
+        "open_threads",
+        "snapshots",
+        "sessions",
+    }
+)
 
 MEMORY_CATEGORIES: tuple[str, ...] = (
     "preference",
@@ -148,26 +179,145 @@ def _is_near_duplicate(a: str, b: str) -> bool:
     return False
 
 
+def _validate_student_id(base_cid: str) -> str:
+    """Validate a character/student ID strictly so traversal, drive letters, or NULs can never enter paths."""
+    if not isinstance(base_cid, str):
+        raise ValueError("Invalid student ID type")
+    if "\x00" in base_cid:
+        raise ValueError("Invalid student ID: NUL byte not allowed")
+    s = base_cid.strip()
+    if not s or ".." in s or "/" in s or "\\" in s or ":" in s:
+        raise ValueError(f"Invalid student ID: path traversal characters not allowed ({base_cid!r})")
+    if not _STRICT_ID_RE.fullmatch(s):
+        raise ValueError(f"Invalid student ID format: {base_cid!r}")
+    if s.upper() in _WINDOWS_RESERVED_NAMES:
+        raise ValueError(f"Invalid student ID: reserved device name ({s!r})")
+    return s
+
+
+def _validate_track(track: str) -> str:
+    """Validate memory track strictly against allowed track names."""
+    if track is None:
+        return "official"
+    if not isinstance(track, str):
+        raise ValueError("Invalid memory track type")
+    if "\x00" in track or ".." in track or "/" in track or "\\" in track or ":" in track:
+        raise ValueError(f"Invalid memory track: path traversal characters not allowed ({track!r})")
+    s = track.strip()
+    if not s:
+        return "official"
+    if s not in VALID_MEMORY_TRACKS:
+        raise ValueError(f"Unsupported memory track: {track!r}")
+    return s
+
+
+def _validate_session_id(session_id: str) -> str:
+    """Validate session_id against NUL bytes, path separators, traversal sequences, and excessive length."""
+    if not isinstance(session_id, str):
+        raise ValueError("Invalid session_id type")
+    if "\x00" in session_id:
+        raise ValueError("Invalid session_id: NUL byte not allowed")
+    s = session_id.strip()
+    if not s or len(s) > 128 or ".." in s or "/" in s or "\\" in s or ":" in s:
+        raise ValueError(f"Invalid session_id: {session_id!r}")
+    return s
+
+
 def _safe_bucket_key(base_cid: str, track: str) -> str:
-    cid_s = _SAFE_ID_RE.sub("_", (base_cid or "unknown").strip()) or "unknown"
-    tr_s = track if track in ("official", "fanon", "custom") else "official"
+    cid_s = _validate_student_id(base_cid)
+    tr_s = _validate_track(track)
     return f"{cid_s}__{tr_s}"
 
 
-def _atomic_write_json(target: Path, data: Any) -> Path:
+def _ensure_within_dir(root_dir: Path, candidate: Path) -> Path:
+    """Verify `candidate` is not a symlink and resolves strictly inside `root_dir`."""
+    if "\x00" in str(candidate):
+        raise ValueError("Path contains NUL byte")
+    if candidate.is_symlink():
+        raise ValueError(f"Refusing to access symlink inside memory directory: {candidate.name}")
+    root = root_dir.resolve()
+    resolved = candidate.resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"Resolved path escapes memory directory: {candidate}") from exc
+    if resolved == root:
+        raise ValueError("Resolved path must point to a child file")
+    return resolved
+
+
+def _safe_read_json(path: Path, max_bytes: int = MAX_MEMORY_JSON_BYTES) -> Any:
+    """Load UTF-8 JSON from a non-symlink file with a strict byte-size ceiling."""
+    if "\x00" in str(path):
+        raise ValueError("Path contains NUL byte")
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"Refusing to read non-regular or symlinked file: {path.name}")
+    if path.stat().st_size > max_bytes:
+        raise ValueError(f"JSON file exceeds size limit ({max_bytes} bytes): {path.name}")
+    with open(path, "rb") as fh:
+        raw = fh.read(max_bytes + 1)
+    if len(raw) > max_bytes:
+        raise ValueError(f"JSON file exceeds size limit ({max_bytes} bytes): {path.name}")
+    return json.loads(raw.decode("utf-8"))
+
+
+def _scrub_str(value: Any) -> str:
+    return redact_secrets(str(value or ""))
+
+
+def _atomic_write_json(target: Path, data: Any, *, harden_parent: bool = True) -> Path:
+    if "\x00" in str(target):
+        raise ValueError("Path contains NUL byte")
+    if target.is_symlink():
+        raise ValueError(f"Refusing to overwrite symlinked file: {target.name}")
     target.parent.mkdir(parents=True, exist_ok=True)
+    if harden_parent:
+        harden_user_data_acl(target.parent)
     payload = json.dumps(data, ensure_ascii=False, indent=2)
     fd, tmp_name = tempfile.mkstemp(prefix=".mem_", suffix=".tmp", dir=str(target.parent))
+    fd_closed = False
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(payload)
-        os.replace(tmp_name, target)
-    except Exception:
         try:
-            os.unlink(tmp_name)
+            os.chmod(tmp_name, 0o600)
+        except OSError:
+            pass
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fd_closed = True
+            fh.write(payload)
+            fh.flush()
+            try:
+                os.fsync(fh.fileno())
+            except OSError:
+                pass
+        last_perm_err: Exception | None = None
+        for attempt in range(6):
+            try:
+                os.replace(tmp_name, target)
+                last_perm_err = None
+                break
+            except PermissionError as exc:
+                last_perm_err = exc
+                time.sleep(0.04 * (attempt + 1))
+        if last_perm_err is not None:
+            raise last_perm_err
+    except Exception:
+        if not fd_closed:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            if os.path.exists(tmp_name):
+                os.unlink(tmp_name)
         except OSError:
             pass
         raise
+    finally:
+        if os.path.exists(tmp_name):
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
     return target
 
 
@@ -381,7 +531,7 @@ def build_memory_extraction_prompt(
 def parse_memory_extraction_json(raw_text: str) -> dict[str, Any] | None:
     """Safely extract and normalize the JSON response from the LLM memory extractor."""
     s = (raw_text or "").strip()
-    if not s:
+    if not s or len(s) > MAX_EXTRACTION_RESPONSE_CHARS:
         return None
     # Strip markdown code fences if present
     fence_m = re.search(r"```(?:json)?\s*([\s\S]*?)```", s, re.IGNORECASE)
@@ -410,7 +560,7 @@ def parse_memory_extraction_json(raw_text: str) -> dict[str, Any] | None:
         return c if c in MEMORY_CATEGORIES else "fact"
 
     out: dict[str, Any] = {
-        "skip_reason": str(parsed.get("skip_reason") or "").strip(),
+        "skip_reason": _scrub_str(parsed.get("skip_reason")).strip(),
         "stt_corrections": [],
         "add_confirmed": [],
         "promote_pending_ids": [],
@@ -427,19 +577,21 @@ def parse_memory_extraction_json(raw_text: str) -> dict[str, Any] | None:
             t_idx = int(item.get("turn_index"))
         except Exception:
             continue
-        corr = str(item.get("corrected") or "").strip()
-        raw_v = str(item.get("raw") or "").strip()
+        corr = _scrub_str(item.get("corrected")).strip()
+        raw_v = _scrub_str(item.get("raw")).strip()
         conf = str(item.get("confidence") or "high").strip().lower()
         if corr and corr != raw_v and conf in ("high", "medium"):
             out["stt_corrections"].append(
-                {"turn_index": t_idx, "raw": raw_v, "corrected": corr[:200], "confidence": conf}
+                {"turn_index": t_idx, "raw": raw_v[:200], "corrected": corr[:200], "confidence": conf}
             )
 
     for item in parsed.get("add_confirmed") or []:
         if isinstance(item, str) and item.strip():
-            out["add_confirmed"].append({"category": "fact", "text": item.strip()[:120]})
+            txt = _scrub_str(item).strip()
+            if txt and not is_test_or_noise_utterance(txt):
+                out["add_confirmed"].append({"category": "fact", "text": txt[:120]})
         elif isinstance(item, dict):
-            txt = str(item.get("text") or "").strip()
+            txt = _scrub_str(item.get("text")).strip()
             if txt and not is_test_or_noise_utterance(txt):
                 out["add_confirmed"].append({"category": _clean_cat(item.get("category")), "text": txt[:120]})
 
@@ -452,7 +604,7 @@ def parse_memory_extraction_json(raw_text: str) -> dict[str, Any] | None:
         if not isinstance(item, dict):
             continue
         mid = str(item.get("id") or "").strip()
-        txt = str(item.get("text") or "").strip()
+        txt = _scrub_str(item.get("text")).strip()
         if mid and txt:
             out["update_confirmed"].append({"id": mid, "text": txt[:120]})
 
@@ -464,8 +616,8 @@ def parse_memory_extraction_json(raw_text: str) -> dict[str, Any] | None:
     for item in parsed.get("add_pending") or []:
         if not isinstance(item, dict):
             continue
-        txt = str(item.get("text") or "").strip()
-        reason = str(item.get("reason") or "문맥 확인 필요").strip()
+        txt = _scrub_str(item.get("text")).strip()
+        reason = _scrub_str(item.get("reason") or "문맥 확인 필요").strip()
         if txt and not is_test_or_noise_utterance(txt):
             out["add_pending"].append(
                 {"category": _clean_cat(item.get("category")), "text": txt[:120], "reason": reason[:80]}
@@ -474,7 +626,7 @@ def parse_memory_extraction_json(raw_text: str) -> dict[str, Any] | None:
     if "open_threads" in parsed and isinstance(parsed.get("open_threads"), list):
         threads: list[str] = []
         for t in parsed.get("open_threads") or []:
-            st = str(t or "").strip()
+            st = _scrub_str(t).strip()
             if st and not any(_is_near_duplicate(st, prev) for prev in threads):
                 threads.append(st[:100])
         out["open_threads"] = threads[:MAX_OPEN_THREADS]
@@ -493,6 +645,7 @@ class MemoryManager:
     def memory_dir(self) -> Path:
         if self._base_dir_override is not None:
             self._base_dir_override.mkdir(parents=True, exist_ok=True)
+            harden_user_data_acl(self._base_dir_override)
             return self._base_dir_override
         return get_memory_dir()
 
@@ -504,21 +657,28 @@ class MemoryManager:
 
     @property
     def sensei_profile_path(self) -> Path:
-        return self.memory_dir / "sensei_profile.json"
+        return _ensure_within_dir(self.memory_dir, self.memory_dir / "sensei_profile.json")
 
     @property
     def recent_calls_path(self) -> Path:
-        return self.memory_dir / "recent_calls.json"
+        return _ensure_within_dir(self.memory_dir, self.memory_dir / "recent_calls.json")
 
     def _bucket_path(self, base_cid: str, track: str) -> Path:
-        return self.students_dir / f"{_safe_bucket_key(base_cid, track)}.json"
+        key = _safe_bucket_key(base_cid, track)
+        candidate = self.students_dir / f"{key}.json"
+        resolved = _ensure_within_dir(self.students_dir, candidate)
+        if resolved.parent != self.students_dir.resolve():
+            raise ValueError("Bucket path must be a direct child of students directory")
+        return resolved
 
     @staticmethod
     def _default_bucket(base_cid: str, track: str) -> dict[str, Any]:
+        clean_cid = _validate_student_id(base_cid)
+        clean_track = _validate_track(track)
         return {
             "schema_version": MEMORY_SCHEMA_VERSION,
-            "base_cid": str(base_cid or "unknown"),
-            "track": track if track in ("official", "fanon", "custom") else "official",
+            "base_cid": clean_cid,
+            "track": clean_track,
             "total_calls": 0,
             "last_called_at": 0.0,
             "confirmed_memories": [],
@@ -533,9 +693,13 @@ class MemoryManager:
         base = self._default_bucket(base_cid, track)
         if path.is_file():
             try:
-                raw = json.loads(path.read_text(encoding="utf-8"))
+                raw = _safe_read_json(path, max_bytes=MAX_MEMORY_JSON_BYTES)
                 if isinstance(raw, dict):
-                    base.update(raw)
+                    for k in _ALLOWED_BUCKET_KEYS:
+                        if k in raw:
+                            base[k] = raw[k]
+                    base["base_cid"] = _validate_student_id(base_cid)
+                    base["track"] = _validate_track(track)
                     for k in ("confirmed_memories", "pending_memories", "open_threads", "snapshots", "sessions"):
                         if not isinstance(base.get(k), list):
                             base[k] = []
@@ -546,14 +710,18 @@ class MemoryManager:
         return base
 
     def _save_bucket_unlocked(self, base_cid: str, track: str, bucket: dict[str, Any]) -> Path:
-        bucket["schema_version"] = MEMORY_SCHEMA_VERSION
-        bucket["base_cid"] = str(base_cid or bucket.get("base_cid") or "unknown")
-        bucket["track"] = track if track in ("official", "fanon", "custom") else "official"
-        if len(bucket.get("sessions", [])) > MAX_SESSIONS_PER_BUCKET:
-            bucket["sessions"] = bucket["sessions"][-MAX_SESSIONS_PER_BUCKET:]
-        if len(bucket.get("snapshots", [])) > MAX_SNAPSHOTS:
-            bucket["snapshots"] = bucket["snapshots"][-MAX_SNAPSHOTS:]
-        return _atomic_write_json(self._bucket_path(base_cid, track), bucket)
+        clean_cid = _validate_student_id(base_cid)
+        clean_track = _validate_track(track)
+        target = self._bucket_path(clean_cid, clean_track)
+        sanitized: dict[str, Any] = {k: bucket[k] for k in _ALLOWED_BUCKET_KEYS if k in bucket}
+        sanitized["schema_version"] = MEMORY_SCHEMA_VERSION
+        sanitized["base_cid"] = clean_cid
+        sanitized["track"] = clean_track
+        if len(sanitized.get("sessions", [])) > MAX_SESSIONS_PER_BUCKET:
+            sanitized["sessions"] = sanitized["sessions"][-MAX_SESSIONS_PER_BUCKET:]
+        if len(sanitized.get("snapshots", [])) > MAX_SNAPSHOTS:
+            sanitized["snapshots"] = sanitized["snapshots"][-MAX_SNAPSHOTS:]
+        return _atomic_write_json(target, sanitized)
 
     # ------------------------------------------------------------------
     # Shared Sensei Profile
@@ -569,13 +737,13 @@ class MemoryManager:
             }
             if self.sensei_profile_path.is_file():
                 try:
-                    raw = json.loads(self.sensei_profile_path.read_text(encoding="utf-8"))
+                    raw = _safe_read_json(self.sensei_profile_path, max_bytes=MAX_MEMORY_JSON_BYTES)
                     if isinstance(raw, dict):
-                        default["nickname"] = str(raw.get("nickname") or "").strip()
-                        default["bio_notes"] = str(raw.get("bio_notes") or "").strip()
+                        default["nickname"] = _scrub_str(raw.get("nickname")).strip()
+                        default["bio_notes"] = _scrub_str(raw.get("bio_notes")).strip()
                         prefs = raw.get("preferences") or []
                         if isinstance(prefs, list):
-                            default["preferences"] = [str(p).strip() for p in prefs if str(p).strip()][:20]
+                            default["preferences"] = [_scrub_str(p).strip() for p in prefs if str(p).strip()][:20]
                         default["updated_at"] = float(raw.get("updated_at", 0.0) or 0.0)
                 except Exception:
                     pass
@@ -590,12 +758,12 @@ class MemoryManager:
         with self._lock:
             clean_prefs: list[str] = []
             for p in preferences or []:
-                sp = str(p or "").strip()
+                sp = _scrub_str(p).strip()
                 if sp and sp not in clean_prefs:
                     clean_prefs.append(sp[:50])
             data = {
-                "nickname": (nickname or "").strip()[:40],
-                "bio_notes": (bio_notes or "").strip()[:600],
+                "nickname": _scrub_str(nickname).strip()[:40],
+                "bio_notes": _scrub_str(bio_notes).strip()[:600],
                 "preferences": clean_prefs[:20],
                 "updated_at": time.time(),
             }
@@ -609,7 +777,7 @@ class MemoryManager:
     def _load_recent_unlocked(self) -> list[dict[str, Any]]:
         if self.recent_calls_path.is_file():
             try:
-                raw = json.loads(self.recent_calls_path.read_text(encoding="utf-8"))
+                raw = _safe_read_json(self.recent_calls_path, max_bytes=MAX_MEMORY_JSON_BYTES)
                 entries = raw.get("entries") if isinstance(raw, dict) else None
                 if isinstance(entries, list):
                     return [e for e in entries if isinstance(e, dict) and str(e.get("entry_id") or "").strip()]
@@ -638,12 +806,12 @@ class MemoryManager:
     ) -> None:
         with self._lock:
             entries = self._load_recent_unlocked()
-            eid = str(entry_id or base_cid).strip()
-            bcid = str(base_cid or eid).strip()
+            eid = _validate_student_id(str(entry_id or base_cid).strip())
+            bcid = _validate_student_id(str(base_cid or eid).strip())
             ts = time.time() if called_at is None else float(called_at)
             existing = next((e for e in entries if e.get("entry_id") == eid or e.get("base_cid") == bcid), None)
             prev_calls = int(existing.get("total_calls", 0) or 0) if existing else 0
-            prev_preview = str(existing.get("last_preview") or "") if existing else ""
+            prev_preview = _scrub_str(existing.get("last_preview")) if existing else ""
             entries = [e for e in entries if e.get("entry_id") != eid and e.get("base_cid") != bcid]
             entries.insert(
                 0,
@@ -651,7 +819,7 @@ class MemoryManager:
                     "base_cid": bcid,
                     "entry_id": eid,
                     "last_called_at": ts,
-                    "last_preview": (last_preview or prev_preview).strip()[:120],
+                    "last_preview": _scrub_str(last_preview or prev_preview).strip()[:120],
                     "total_calls": prev_calls + (1 if increment_calls else 0),
                 },
             )
@@ -735,16 +903,19 @@ class MemoryManager:
         started_at: float | None = None,
     ) -> str:
         """Create and persist a new active call session for `(base_cid, track)`."""
+        clean_cid = _validate_student_id(base_cid)
+        clean_track = _validate_track(track)
+        clean_eid = _validate_student_id(entry_id) if str(entry_id or "").strip() else clean_cid
         with self._lock:
             ts = time.time() if started_at is None else float(started_at)
             dt_tag = datetime.datetime.fromtimestamp(ts).strftime("%Y%m%d_%H%M%S")
             sess_id = f"sess_{dt_tag}_{uuid.uuid4().hex[:6]}"
-            b = self._load_bucket_unlocked(base_cid, track)
+            b = self._load_bucket_unlocked(clean_cid, clean_track)
             b["sessions"].append(
                 {
                     "session_id": sess_id,
-                    "entry_id": str(entry_id or base_cid),
-                    "costume_label_kr": str(costume_label_kr or "").strip(),
+                    "entry_id": clean_eid,
+                    "costume_label_kr": _scrub_str(costume_label_kr).strip()[:80],
                     "reply_language": "ko" if str(reply_language).lower() == "ko" else "ja",
                     "started_at": ts,
                     "ended_at": 0.0,
@@ -753,7 +924,7 @@ class MemoryManager:
                     "turns": [],
                 }
             )
-            self._save_bucket_unlocked(base_cid, track, b)
+            self._save_bucket_unlocked(clean_cid, clean_track, b)
             return sess_id
 
     def append_turn(
@@ -773,10 +944,13 @@ class MemoryManager:
         Append a conversation turn to an active session.
         Returns `(total_turns_in_session, should_checkpoint_now)`.
         """
+        clean_cid = _validate_student_id(base_cid)
+        clean_track = _validate_track(track)
+        clean_sid = _validate_session_id(session_id)
         clean_role = "user" if str(role).strip().lower() == "user" else "assistant"
-        jp_s = (jp_text or "").strip()
-        kr_s = (kr_text or "").strip()
-        stt_s = (raw_stt or (kr_s or jp_s if clean_role == "user" else "")).strip()
+        jp_s = _scrub_str(jp_text).strip()
+        kr_s = _scrub_str(kr_text).strip()
+        stt_s = _scrub_str(raw_stt or (kr_s or jp_s if clean_role == "user" else "")).strip()
         if not jp_s and not kr_s and not stt_s:
             return 0, False
 
@@ -784,8 +958,8 @@ class MemoryManager:
         is_noise = (clean_role == "user") and is_test_or_noise_utterance(stt_s)
 
         with self._lock:
-            b = self._load_bucket_unlocked(base_cid, track)
-            sess = next((s for s in reversed(b["sessions"]) if s.get("session_id") == session_id), None)
+            b = self._load_bucket_unlocked(clean_cid, clean_track)
+            sess = next((s for s in reversed(b["sessions"]) if s.get("session_id") == clean_sid), None)
             if sess is None:
                 return 0, False
             turns = sess.setdefault("turns", [])
@@ -816,7 +990,7 @@ class MemoryManager:
                 sess["needs_summary"] = True
 
             b["last_called_at"] = now
-            self._save_bucket_unlocked(base_cid, track, b)
+            self._save_bucket_unlocked(clean_cid, clean_track, b)
 
             delta = len(sess["turns"]) - int(sess.get("summarized_turn_count", 0))
             should_cp = bool(substantive_pending and delta >= max(6, int(checkpoint_delta)))
@@ -834,10 +1008,13 @@ class MemoryManager:
         calls don't leave empty dividers in the MomoTalk timeline.
         Returns `{"kept": bool, "needs_summary": bool, "turn_count": int}`.
         """
+        clean_cid = _validate_student_id(base_cid)
+        clean_track = _validate_track(track)
+        clean_sid = _validate_session_id(session_id)
         now = time.time() if ended_at is None else float(ended_at)
         with self._lock:
-            b = self._load_bucket_unlocked(base_cid, track)
-            idx = next((i for i in range(len(b["sessions"]) - 1, -1, -1) if b["sessions"][i].get("session_id") == session_id), -1)
+            b = self._load_bucket_unlocked(clean_cid, clean_track)
+            idx = next((i for i in range(len(b["sessions"]) - 1, -1, -1) if b["sessions"][i].get("session_id") == clean_sid), -1)
             if idx < 0:
                 return {"kept": False, "needs_summary": False, "turn_count": 0}
 
@@ -845,7 +1022,7 @@ class MemoryManager:
             turns = sess.get("turns") or []
             if not turns:
                 b["sessions"].pop(idx)
-                self._save_bucket_unlocked(base_cid, track, b)
+                self._save_bucket_unlocked(clean_cid, clean_track, b)
                 return {"kept": False, "needs_summary": False, "turn_count": 0}
 
             sess["ended_at"] = now
@@ -858,16 +1035,16 @@ class MemoryManager:
 
             last_preview = ""
             for t in reversed(turns):
-                cand = str(t.get("kr_text") or t.get("jp_text") or "").strip()
+                cand = _scrub_str(t.get("kr_text") or t.get("jp_text")).strip()
                 if cand:
                     last_preview = cand[:120]
                     break
-            self._save_bucket_unlocked(base_cid, track, b)
+            self._save_bucket_unlocked(clean_cid, clean_track, b)
 
             # Update persisted recent calls list (collapsing costume entry_id cleanly)
             self.record_recent_call(
-                base_cid=base_cid,
-                entry_id=str(sess.get("entry_id") or base_cid),
+                base_cid=clean_cid,
+                entry_id=str(sess.get("entry_id") or clean_cid),
                 last_preview=last_preview,
                 called_at=now,
                 increment_calls=True,
@@ -876,10 +1053,13 @@ class MemoryManager:
 
     def delete_session(self, base_cid: str, track: str, session_id: str) -> bool:
         """Delete a single call session from a student's MomoTalk timeline."""
+        clean_cid = _validate_student_id(base_cid)
+        clean_track = _validate_track(track)
+        clean_sid = _validate_session_id(session_id)
         with self._lock:
-            b = self._load_bucket_unlocked(base_cid, track)
+            b = self._load_bucket_unlocked(clean_cid, clean_track)
             before = len(b["sessions"])
-            b["sessions"] = [s for s in b["sessions"] if s.get("session_id") != session_id]
+            b["sessions"] = [s for s in b["sessions"] if s.get("session_id") != clean_sid]
             if len(b["sessions"]) == before:
                 return False
             b["total_calls"] = len(b["sessions"])
@@ -888,8 +1068,8 @@ class MemoryManager:
                 b["last_called_at"] = float(last_s.get("ended_at") or last_s.get("started_at") or 0.0)
             else:
                 b["last_called_at"] = 0.0
-            self._save_bucket_unlocked(base_cid, track, b)
-            self._refresh_recent_entry_for_student_unlocked(base_cid)
+            self._save_bucket_unlocked(clean_cid, clean_track, b)
+            self._refresh_recent_entry_for_student_unlocked(clean_cid)
             return True
 
     # ------------------------------------------------------------------
@@ -907,9 +1087,12 @@ class MemoryManager:
         Build a Stage 1+2 summarization payload for unsummarized turns in `session_id`.
         Returns None when there are not enough substantive turns (skipping LLM cost).
         """
+        clean_cid = _validate_student_id(base_cid)
+        clean_track = _validate_track(track)
+        clean_sid = _validate_session_id(session_id)
         with self._lock:
-            b = self._load_bucket_unlocked(base_cid, track)
-            sess = next((s for s in reversed(b["sessions"]) if s.get("session_id") == session_id), None)
+            b = self._load_bucket_unlocked(clean_cid, clean_track)
+            sess = next((s for s in reversed(b["sessions"]) if s.get("session_id") == clean_sid), None)
             if sess is None:
                 return None
             turns = sess.get("turns") or []
@@ -923,13 +1106,13 @@ class MemoryManager:
                 if float(sess.get("ended_at", 0.0) or 0.0) > 0:
                     sess["needs_summary"] = False
                     sess["summarized_turn_count"] = len(turns)
-                    self._save_bucket_unlocked(base_cid, track, b)
+                    self._save_bucket_unlocked(clean_cid, clean_track, b)
                 return None
             # Re-index turn_index to absolute session turn indices for accurate STT correction mapping
             abs_filtered = [{**item, "turn_index": start_idx + int(item["turn_index"])} for item in filtered]
             prompt = build_memory_extraction_prompt(
                 char_data=char_data,
-                track=track,
+                track=clean_track,
                 existing_confirmed=b.get("confirmed_memories") or [],
                 existing_pending=b.get("pending_memories") or [],
                 existing_threads=b.get("open_threads") or [],
@@ -937,9 +1120,9 @@ class MemoryManager:
                 sensei_profile=self.load_sensei_profile(),
             )
             return {
-                "base_cid": base_cid,
-                "track": track,
-                "session_id": session_id,
+                "base_cid": clean_cid,
+                "track": clean_track,
+                "session_id": clean_sid,
                 "covered_turn_count": len(turns),
                 "prompt": prompt,
             }
@@ -957,23 +1140,26 @@ class MemoryManager:
         Stage 3 atomic commit with automatic pre-update snapshot backup, STT typo repair overlay,
         pending->confirmed promotion, and fuzzy deduplication.
         """
+        clean_cid = _validate_student_id(base_cid)
+        clean_track = _validate_track(track)
+        clean_sid = _validate_session_id(session_id)
         now = time.time()
         stats = {"added_confirmed": 0, "promoted": 0, "added_pending": 0, "stt_repaired": 0, "updated": 0, "removed": 0}
         with self._lock:
-            b = self._load_bucket_unlocked(base_cid, track)
-            sess = next((s for s in reversed(b["sessions"]) if s.get("session_id") == session_id), None)
+            b = self._load_bucket_unlocked(clean_cid, clean_track)
+            sess = next((s for s in reversed(b["sessions"]) if s.get("session_id") == clean_sid), None)
 
             # 1. Apply contextual STT corrections non-destructively (preserving `raw_stt`)
             if sess is not None:
                 turns = sess.get("turns") or []
                 for corr in parsed.get("stt_corrections") or []:
                     idx = int(corr.get("turn_index", -1))
-                    fixed = str(corr.get("corrected") or "").strip()
+                    fixed = _scrub_str(corr.get("corrected")).strip()[:200]
                     if 0 <= idx < len(turns) and turns[idx].get("role") == "user" and fixed:
                         turns[idx]["corrected_text"] = fixed
                         stats["stt_repaired"] += 1
 
-            skip_reason = str(parsed.get("skip_reason") or "").strip()
+            skip_reason = _scrub_str(parsed.get("skip_reason")).strip()
             has_memory_mutations = bool(
                 (not skip_reason)
                 and (
@@ -1009,7 +1195,7 @@ class MemoryManager:
                     stats["removed"] = before - len(b["confirmed_memories"])
 
                 # Update existing confirmed items
-                upd_map = {str(u["id"]): str(u["text"]).strip() for u in (parsed.get("update_confirmed") or [])}
+                upd_map = {str(u["id"]): _scrub_str(u["text"]).strip()[:120] for u in (parsed.get("update_confirmed") or [])}
                 for m in b["confirmed_memories"]:
                     mid = str(m.get("id") or "")
                     if mid in upd_map and upd_map[mid]:
@@ -1023,7 +1209,7 @@ class MemoryManager:
                     still_pending: list[dict[str, Any]] = []
                     for pm in b["pending_memories"]:
                         if pm.get("id") in promote_ids:
-                            txt = str(pm.get("text") or "").strip()
+                            txt = _scrub_str(pm.get("text")).strip()[:120]
                             if txt and not any(_is_near_duplicate(txt, cm.get("text", "")) for cm in b["confirmed_memories"]):
                                 b["confirmed_memories"].append(
                                     {
@@ -1043,7 +1229,7 @@ class MemoryManager:
 
                 # Add newly confirmed items (with fuzzy dedupe; bump mentions if already present)
                 for item in parsed.get("add_confirmed") or []:
-                    txt = str(item.get("text") or "").strip()
+                    txt = _scrub_str(item.get("text")).strip()[:120]
                     cat = str(item.get("category") or "fact")
                     if not txt:
                         continue
@@ -1071,9 +1257,9 @@ class MemoryManager:
 
                 # Add pending items (held for confirmation)
                 for item in parsed.get("add_pending") or []:
-                    txt = str(item.get("text") or "").strip()
+                    txt = _scrub_str(item.get("text")).strip()[:120]
                     cat = str(item.get("category") or "event")
-                    reason = str(item.get("reason") or "문맥 확인 필요").strip()
+                    reason = _scrub_str(item.get("reason") or "문맥 확인 필요").strip()[:80]
                     if not txt:
                         continue
                     if any(_is_near_duplicate(txt, cm.get("text", "")) for cm in b["confirmed_memories"]):
@@ -1093,7 +1279,11 @@ class MemoryManager:
 
                 # Update open threads if provided
                 if parsed.get("open_threads") is not None:
-                    b["open_threads"] = list(parsed["open_threads"])[:MAX_OPEN_THREADS]
+                    b["open_threads"] = [
+                        _scrub_str(t).strip()[:100]
+                        for t in list(parsed["open_threads"])[:MAX_OPEN_THREADS]
+                        if _scrub_str(t).strip()
+                    ]
 
                 # Respect caps (preserve manual & most recently refreshed confirmed items)
                 if len(b["confirmed_memories"]) > MAX_CONFIRMED_MEMORIES:
@@ -1113,7 +1303,7 @@ class MemoryManager:
                 sess["summarized_turn_count"] = max(int(sess.get("summarized_turn_count", 0) or 0), int(covered_turn_count))
                 sess["needs_summary"] = False
 
-            self._save_bucket_unlocked(base_cid, track, b)
+            self._save_bucket_unlocked(clean_cid, clean_track, b)
             return stats
 
     def rollback_to_snapshot(
@@ -1153,14 +1343,16 @@ class MemoryManager:
                 return out
             for fp in sorted(self.students_dir.glob("*.json")):
                 try:
-                    raw = json.loads(fp.read_text(encoding="utf-8"))
+                    _ensure_within_dir(self.students_dir, fp)
+                    raw = _safe_read_json(fp, max_bytes=MAX_MEMORY_JSON_BYTES)
                     if not isinstance(raw, dict):
                         continue
-                    bcid = str(raw.get("base_cid") or "")
-                    tr = str(raw.get("track") or "official")
+                    bcid = _validate_student_id(str(raw.get("base_cid") or ""))
+                    tr = _validate_track(str(raw.get("track") or "official"))
                     for sess in raw.get("sessions") or []:
                         if isinstance(sess, dict) and bool(sess.get("needs_summary")) and sess.get("session_id"):
-                            out.append((bcid, tr, str(sess["session_id"])))
+                            sid = _validate_session_id(str(sess["session_id"]))
+                            out.append((bcid, tr, sid))
                 except Exception:
                     continue
         return out
@@ -1170,7 +1362,7 @@ class MemoryManager:
     # ------------------------------------------------------------------
 
     def add_manual_memory(self, base_cid: str, track: str, text: str, category: str = "fact") -> dict[str, Any] | None:
-        clean = (text or "").strip()[:120]
+        clean = _scrub_str(text).strip()[:120]
         if not clean:
             return None
         cat = category if category in MEMORY_CATEGORIES else "fact"
@@ -1193,7 +1385,7 @@ class MemoryManager:
             return deepcopy(item)
 
     def update_memory_text(self, base_cid: str, track: str, mem_id: str, new_text: str, category: str | None = None) -> bool:
-        clean = (new_text or "").strip()[:120]
+        clean = _scrub_str(new_text).strip()[:120]
         if not clean or not mem_id:
             return False
         now = time.time()
@@ -1233,7 +1425,7 @@ class MemoryManager:
             if target is None:
                 return False
             b["pending_memories"] = [m for m in b["pending_memories"] if m.get("id") != pending_id]
-            txt = str(target.get("text") or "").strip()
+            txt = _scrub_str(target.get("text")).strip()[:120]
             if txt and not any(_is_near_duplicate(txt, cm.get("text", "")) for cm in b["confirmed_memories"]):
                 b["confirmed_memories"].insert(
                     0,
@@ -1253,7 +1445,7 @@ class MemoryManager:
     def update_open_threads(self, base_cid: str, track: str, threads: list[str]) -> list[str]:
         clean = []
         for t in threads or []:
-            st = str(t or "").strip()[:100]
+            st = _scrub_str(t).strip()[:100]
             if st and st not in clean:
                 clean.append(st)
         clean = clean[:MAX_OPEN_THREADS]
@@ -1397,6 +1589,85 @@ class MemoryManager:
     # JSON Backup & Restore
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _sanitize_memory_item(raw_item: Any, *, pending: bool = False) -> dict[str, Any] | None:
+        if not isinstance(raw_item, dict):
+            return None
+        txt = _scrub_str(raw_item.get("text")).strip()[:120]
+        if not txt:
+            return None
+        cat = str(raw_item.get("category") or "fact").strip().lower()
+        if cat not in MEMORY_CATEGORIES:
+            cat = "fact"
+        now = time.time()
+        item_id = str(raw_item.get("id") or f"{'pnd' if pending else 'mem'}_{uuid.uuid4().hex[:8]}").strip()[:64]
+        if pending:
+            return {
+                "id": item_id,
+                "category": cat,
+                "text": txt,
+                "reason": _scrub_str(raw_item.get("reason") or "문맥 확인 필요").strip()[:80],
+                "created_at": float(raw_item.get("created_at", now) or now),
+            }
+        src = "manual" if str(raw_item.get("source") or "") == "manual" else "auto"
+        return {
+            "id": item_id,
+            "category": cat,
+            "text": txt,
+            "source": src,
+            "mentions": max(1, int(raw_item.get("mentions", 1) or 1)),
+            "created_at": float(raw_item.get("created_at", now) or now),
+            "updated_at": float(raw_item.get("updated_at", now) or now),
+        }
+
+    @staticmethod
+    def _sanitize_session_item(raw_sess: Any, default_cid: str) -> dict[str, Any] | None:
+        if not isinstance(raw_sess, dict):
+            return None
+        raw_sid = str(raw_sess.get("session_id") or "").strip()
+        if not raw_sid:
+            return None
+        clean_sid = _validate_session_id(raw_sid)
+        raw_eid = str(raw_sess.get("entry_id") or default_cid).strip()
+        try:
+            clean_eid = _validate_student_id(raw_eid)
+        except ValueError:
+            clean_eid = default_cid
+        clean_turns: list[dict[str, Any]] = []
+        for t in (raw_sess.get("turns") or [])[-MAX_TURNS_PER_SESSION:]:
+            if not isinstance(t, dict):
+                continue
+            role = "user" if str(t.get("role") or "").strip().lower() == "user" else "assistant"
+            jp_t = _scrub_str(t.get("jp_text")).strip()
+            kr_t = _scrub_str(t.get("kr_text")).strip()
+            raw_stt = _scrub_str(t.get("raw_stt")).strip() if role == "user" else ""
+            corr_t = _scrub_str(t.get("corrected_text")).strip() if role == "user" else ""
+            if not jp_t and not kr_t and not raw_stt:
+                continue
+            clean_turns.append(
+                {
+                    "ts": float(t.get("ts", 0.0) or 0.0),
+                    "role": role,
+                    "jp_text": jp_t,
+                    "kr_text": kr_t,
+                    "raw_stt": raw_stt,
+                    "corrected_text": corr_t,
+                    "is_proactive_ping": bool(t.get("is_proactive_ping", False)),
+                    "filtered_noise": bool(t.get("filtered_noise", False)),
+                }
+            )
+        return {
+            "session_id": clean_sid,
+            "entry_id": clean_eid,
+            "costume_label_kr": _scrub_str(raw_sess.get("costume_label_kr")).strip()[:80],
+            "reply_language": "ko" if str(raw_sess.get("reply_language") or "").lower() == "ko" else "ja",
+            "started_at": float(raw_sess.get("started_at", 0.0) or 0.0),
+            "ended_at": float(raw_sess.get("ended_at", 0.0) or 0.0),
+            "summarized_turn_count": max(0, min(len(clean_turns), int(raw_sess.get("summarized_turn_count", 0) or 0))),
+            "needs_summary": bool(raw_sess.get("needs_summary", False)),
+            "turns": clean_turns,
+        }
+
     def export_backup(
         self,
         dest_path: Path,
@@ -1404,6 +1675,11 @@ class MemoryManager:
         track: str | None = None,
     ) -> dict[str, int]:
         """Export either all memory data or a single student bucket into a clean JSON backup."""
+        dest = Path(dest_path)
+        if "\x00" in str(dest):
+            raise ValueError("Invalid backup destination path")
+        if dest.is_symlink():
+            raise ValueError("Refusing to overwrite symlinked backup file")
         with self._lock:
             payload: dict[str, Any] = {
                 "backup_schema_version": MEMORY_SCHEMA_VERSION,
@@ -1414,31 +1690,37 @@ class MemoryManager:
                 "buckets": {},
             }
             if base_cid:
-                tracks = [track] if track in ("official", "fanon", "custom") else ["official", "fanon", "custom"]
+                clean_cid = _validate_student_id(base_cid)
+                tracks = [_validate_track(track)] if track else list(VALID_MEMORY_TRACKS)
                 for tr in tracks:
-                    p = self._bucket_path(base_cid, tr)
+                    p = self._bucket_path(clean_cid, tr)
                     if p.is_file() or tr == track:
-                        b = self._load_bucket_unlocked(base_cid, tr)
-                        payload["buckets"][_safe_bucket_key(base_cid, tr)] = b
+                        b = self._load_bucket_unlocked(clean_cid, tr)
+                        payload["buckets"][_safe_bucket_key(clean_cid, tr)] = b
             else:
                 if self.students_dir.is_dir():
                     for fp in sorted(self.students_dir.glob("*.json")):
                         try:
-                            raw = json.loads(fp.read_text(encoding="utf-8"))
+                            _ensure_within_dir(self.students_dir, fp)
+                            raw = _safe_read_json(fp, max_bytes=MAX_MEMORY_JSON_BYTES)
                             if isinstance(raw, dict):
-                                payload["buckets"][fp.stem] = raw
+                                payload["buckets"][fp.stem] = {k: raw[k] for k in _ALLOWED_BUCKET_KEYS if k in raw}
                         except Exception:
                             continue
-            _atomic_write_json(Path(dest_path), payload)
+            _atomic_write_json(dest, payload, harden_parent=False)
             total_sessions = sum(len(b.get("sessions") or []) for b in payload["buckets"].values())
             total_mems = sum(len(b.get("confirmed_memories") or []) for b in payload["buckets"].values())
             return {"buckets": len(payload["buckets"]), "memories": total_mems, "sessions": total_sessions}
 
     def import_backup(self, src_path: Path, merge: bool = True) -> dict[str, int]:
         """Restore memory backup JSON into `%LOCALAPPDATA%\\VoiceCompanionData\\memory\\`."""
-        raw = json.loads(Path(src_path).read_text(encoding="utf-8"))
+        src = Path(src_path)
+        raw = _safe_read_json(src, max_bytes=MAX_BACKUP_JSON_BYTES)
         if not isinstance(raw, dict) or not isinstance(raw.get("buckets"), dict):
             raise ValueError("유효한 모모톡 기억 백업 JSON 파일이 아닙니다.")
+        raw_buckets = raw.get("buckets") or {}
+        if len(raw_buckets) > MAX_IMPORT_BUCKETS:
+            raise ValueError(f"백업 파일의 학생 버킷 수가 허용 한도({MAX_IMPORT_BUCKETS})를 초과했습니다.")
 
         restored_buckets = 0
         restored_memories = 0
@@ -1449,57 +1731,88 @@ class MemoryManager:
             if isinstance(sp_in, dict):
                 if merge:
                     cur_sp = self.load_sensei_profile()
-                    nick = cur_sp["nickname"] or str(sp_in.get("nickname") or "").strip()
-                    bio = cur_sp["bio_notes"] or str(sp_in.get("bio_notes") or "").strip()
-                    prefs = list(dict.fromkeys([*(cur_sp.get("preferences") or []), *(sp_in.get("preferences") or [])]))
+                    nick = cur_sp["nickname"] or _scrub_str(sp_in.get("nickname")).strip()
+                    bio = cur_sp["bio_notes"] or _scrub_str(sp_in.get("bio_notes")).strip()
+                    in_prefs = sp_in.get("preferences") if isinstance(sp_in.get("preferences"), list) else []
+                    prefs = list(dict.fromkeys([*(cur_sp.get("preferences") or []), *in_prefs]))
                     self.save_sensei_profile(nickname=nick, bio_notes=bio, preferences=prefs)
                 else:
+                    in_prefs = sp_in.get("preferences") if isinstance(sp_in.get("preferences"), list) else []
                     self.save_sensei_profile(
-                        nickname=str(sp_in.get("nickname") or ""),
-                        bio_notes=str(sp_in.get("bio_notes") or ""),
-                        preferences=list(sp_in.get("preferences") or []),
+                        nickname=_scrub_str(sp_in.get("nickname")),
+                        bio_notes=_scrub_str(sp_in.get("bio_notes")),
+                        preferences=list(in_prefs),
                     )
 
             touched_cids: set[str] = set()
-            for _key, b_in in (raw.get("buckets") or {}).items():
+            for _key, b_in in raw_buckets.items():
                 if not isinstance(b_in, dict):
                     continue
-                bcid = str(b_in.get("base_cid") or "").strip()
-                tr = str(b_in.get("track") or "official").strip()
-                if not bcid or tr not in ("official", "fanon", "custom"):
+                raw_bcid = str(b_in.get("base_cid") or "").strip()
+                raw_tr = str(b_in.get("track") or "official").strip()
+                if not raw_bcid:
                     continue
+                bcid = _validate_student_id(raw_bcid)
+                tr = _validate_track(raw_tr)
                 touched_cids.add(bcid)
+
+                clean_confirmed = [
+                    item
+                    for cm in (b_in.get("confirmed_memories") or [])
+                    if (item := self._sanitize_memory_item(cm, pending=False)) is not None
+                ][:MAX_CONFIRMED_MEMORIES]
+                clean_pending = [
+                    item
+                    for pm in (b_in.get("pending_memories") or [])
+                    if (item := self._sanitize_memory_item(pm, pending=True)) is not None
+                ][:MAX_PENDING_MEMORIES]
+                clean_threads = [
+                    st
+                    for th in (b_in.get("open_threads") or [])
+                    if (st := _scrub_str(th).strip()[:100])
+                ][:MAX_OPEN_THREADS]
+                clean_sessions = [
+                    sess
+                    for raw_s in (b_in.get("sessions") or [])
+                    if (sess := self._sanitize_session_item(raw_s, bcid)) is not None
+                ][-MAX_SESSIONS_PER_BUCKET:]
+
                 if not merge:
                     target_b = self._default_bucket(bcid, tr)
-                    target_b.update(b_in)
+                    target_b["confirmed_memories"] = clean_confirmed
+                    target_b["pending_memories"] = clean_pending
+                    target_b["open_threads"] = clean_threads
+                    target_b["sessions"] = clean_sessions
+                    target_b["total_calls"] = max(int(b_in.get("total_calls", 0) or 0), len(clean_sessions))
+                    target_b["last_called_at"] = float(b_in.get("last_called_at", 0.0) or 0.0)
                     self._save_bucket_unlocked(bcid, tr, target_b)
                     restored_buckets += 1
-                    restored_memories += len(target_b.get("confirmed_memories") or [])
-                    restored_sessions += len(target_b.get("sessions") or [])
+                    restored_memories += len(clean_confirmed)
+                    restored_sessions += len(clean_sessions)
                 else:
                     cur_b = self._load_bucket_unlocked(bcid, tr)
-                    for cm in b_in.get("confirmed_memories") or []:
-                        if isinstance(cm, dict) and str(cm.get("text") or "").strip():
-                            if not any(_is_near_duplicate(cm["text"], x.get("text", "")) for x in cur_b["confirmed_memories"]):
-                                cur_b["confirmed_memories"].append(deepcopy(cm))
-                                restored_memories += 1
-                    for pm in b_in.get("pending_memories") or []:
-                        if isinstance(pm, dict) and str(pm.get("text") or "").strip():
-                            if not any(_is_near_duplicate(pm["text"], x.get("text", "")) for x in cur_b["pending_memories"]):
-                                cur_b["pending_memories"].append(deepcopy(pm))
-                    for th in b_in.get("open_threads") or []:
-                        st = str(th or "").strip()
-                        if st and not any(_is_near_duplicate(st, x) for x in cur_b["open_threads"]):
+                    for cm in clean_confirmed:
+                        if not any(_is_near_duplicate(cm["text"], x.get("text", "")) for x in cur_b["confirmed_memories"]):
+                            cur_b["confirmed_memories"].append(cm)
+                            restored_memories += 1
+                    cur_b["confirmed_memories"] = cur_b["confirmed_memories"][:MAX_CONFIRMED_MEMORIES]
+                    for pm in clean_pending:
+                        if not any(_is_near_duplicate(pm["text"], x.get("text", "")) for x in cur_b["pending_memories"]):
+                            cur_b["pending_memories"].append(pm)
+                    cur_b["pending_memories"] = cur_b["pending_memories"][-MAX_PENDING_MEMORIES:]
+                    for st in clean_threads:
+                        if not any(_is_near_duplicate(st, x) for x in cur_b["open_threads"]):
                             cur_b["open_threads"].append(st)
                     cur_b["open_threads"] = cur_b["open_threads"][:MAX_OPEN_THREADS]
 
                     existing_sids = {str(s.get("session_id") or "") for s in cur_b["sessions"]}
-                    for sess in b_in.get("sessions") or []:
-                        if isinstance(sess, dict) and str(sess.get("session_id") or "") not in existing_sids:
-                            cur_b["sessions"].append(deepcopy(sess))
-                            existing_sids.add(str(sess.get("session_id") or ""))
+                    for sess in clean_sessions:
+                        if sess["session_id"] not in existing_sids:
+                            cur_b["sessions"].append(sess)
+                            existing_sids.add(sess["session_id"])
                             restored_sessions += 1
                     cur_b["sessions"].sort(key=lambda s: float(s.get("started_at", 0.0) or 0.0))
+                    cur_b["sessions"] = cur_b["sessions"][-MAX_SESSIONS_PER_BUCKET:]
                     cur_b["total_calls"] = max(int(cur_b.get("total_calls", 0) or 0), len(cur_b["sessions"]))
                     cur_b["last_called_at"] = max(
                         float(cur_b.get("last_called_at", 0.0) or 0.0),

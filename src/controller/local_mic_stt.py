@@ -22,6 +22,56 @@ import sounddevice as sd
 from src.controller.proactive_lead_engine import _extract_dev_base_name, _norm_dev_key
 
 _RESAMPLE_POLY_FN: Any = None
+_MIN_MIC_SR = 8000
+_MAX_MIC_SR = 192000
+_MAX_UTTERANCE_SAMPLES = _MAX_MIC_SR * 25
+_MAX_PROMPT_HINT_CHARS = 512
+_CTRL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]+")
+
+_FALLBACK_REDACT_PATS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"AIza[0-9A-Za-z\-_]{20,}"), "[REDACTED_GOOGLE_KEY]"),
+    (re.compile(r"\bsk-[0-9A-Za-z_\-]{16,}"), "[REDACTED_API_KEY]"),
+    (re.compile(r"(?i)(Bearer\s+)[^\s\"',;}\]]+"), r"\1[REDACTED]"),
+    (re.compile(r"(?i)(x-goog-api-key[\"']?\s*[:=]\s*[\"']?)[^\s\"',;}\]]+"), r"\1[REDACTED]"),
+    (re.compile(r"(?i)([?&](?:api_)?key=)[^&\s\"']+"), r"\1[REDACTED]"),
+    (re.compile(r'("(?:fish_api_key|gemini_api_key)"\s*:\s*")[^"]*(")'), r"\1[REDACTED]\2"),
+    (re.compile(r"dpapi:[A-Za-z0-9+/=]{16,}"), "dpapi:[REDACTED]"),
+)
+
+
+def _redact_secrets(text: str, extra_secrets: tuple[str, ...] = ()) -> str:
+    s = str(text or "")
+    if not s:
+        return s
+    try:
+        from src.utils import app_paths as _ap
+
+        fn = getattr(_ap, "redact_secrets", None)
+        if callable(fn):
+            return str(fn(s, extra_secrets=extra_secrets))
+    except Exception:
+        pass
+    out = s
+    for sec in extra_secrets:
+        tok = str(sec or "").strip()
+        if len(tok) >= 8:
+            out = out.replace(tok, "[REDACTED]")
+    for pat, repl in _FALLBACK_REDACT_PATS:
+        out = pat.sub(repl, out)
+    return out
+
+
+def _clamp_sample_rate(sr: Any, default: int = 44100) -> int:
+    try:
+        v = int(sr or default)
+    except Exception:
+        v = default
+    return max(_MIN_MIC_SR, min(_MAX_MIC_SR, v))
+
+
+def _sanitize_prompt_hint(raw: Any) -> str:
+    s = _CTRL_CHARS_RE.sub(" ", str(raw or "")).strip()
+    return s[:_MAX_PROMPT_HINT_CHARS]
 
 
 def _resample_1d(audio: np.ndarray, up: int, down: int) -> np.ndarray:
@@ -149,8 +199,8 @@ def build_character_mic_hints(char_data: dict[str, Any] | None) -> tuple[str, st
     ko_terms = _dedupe([user_title_kr, "샬레", raw_name_kr, given_kr, school_kr])
     ja_terms = _dedupe([user_title_jp, "シャーレ", name_jp_compact, given_jp, school_jp])
 
-    ko_hint = ", ".join(ko_terms)
-    ja_hint = "、".join(ja_terms)
+    ko_hint = _sanitize_prompt_hint(", ".join(ko_terms))
+    ja_hint = _sanitize_prompt_hint("、".join(ja_terms))
 
     echo_phrases: set[str] = set()
     for sep, terms in ((", ", ko_terms), ("、", ja_terms)):
@@ -274,9 +324,9 @@ class LocalMicSttEngine:
         if ko_prompt_hint is not None or ja_prompt_hint is not None:
             with self._hint_lock:
                 if ko_prompt_hint is not None:
-                    self._ko_prompt_hint = str(ko_prompt_hint).strip()
+                    self._ko_prompt_hint = _sanitize_prompt_hint(ko_prompt_hint)
                 if ja_prompt_hint is not None:
-                    self._ja_prompt_hint = str(ja_prompt_hint).strip()
+                    self._ja_prompt_hint = _sanitize_prompt_hint(ja_prompt_hint)
                 self._hint_token_cache.clear()
                 self._update_echo_phrases(self._ko_prompt_hint, self._ja_prompt_hint)
 
@@ -298,11 +348,11 @@ class LocalMicSttEngine:
 
         candidates: list[tuple[int | None, int, str]] = []
         seen_idx: set[int | None] = set()
-        for raw_idx, raw_sr, raw_lbl in [(dev_idx, int(dev_sr or 44100), dev_label)] + list(fallback_candidates or []):
+        for raw_idx, raw_sr, raw_lbl in [(dev_idx, _clamp_sample_rate(dev_sr, 44100), dev_label)] + list(fallback_candidates or []):
             if raw_idx in seen_idx:
                 continue
             seen_idx.add(raw_idx)
-            candidates.append((raw_idx, int(raw_sr or 44100), str(raw_lbl)))
+            candidates.append((raw_idx, _clamp_sample_rate(raw_sr, 44100), str(raw_lbl)))
 
         t_cap = threading.Thread(
             target=self._capture_loop,
@@ -448,9 +498,9 @@ class LocalMicSttEngine:
         for cand_idx, cand_sr, cand_lbl in candidates:
             if not self.running:
                 break
-            sr_candidates = list(dict.fromkeys([int(cand_sr or 44100), 44100, 48000, 16000]))
+            sr_candidates = list(dict.fromkeys([_clamp_sample_rate(cand_sr, 44100), 44100, 48000, 16000]))
             for sr_cand in sr_candidates:
-                active_sr = int(sr_cand)
+                active_sr = _clamp_sample_rate(sr_cand, 44100)
                 block_n = max(256, int(active_sr * block_dur))
                 for ch in (1, 2):
                     try:
@@ -476,7 +526,7 @@ class LocalMicSttEngine:
 
         if not opened and self.running:
             self.running = False
-            self._on_error(f"마이크 열기 실패 ({primary_lbl}): {last_exc}")
+            self._on_error(_redact_secrets(f"마이크 열기 실패 ({primary_lbl}): {last_exc}"))
 
     def _stt_worker(self) -> None:
         while self.running:
@@ -499,9 +549,12 @@ class LocalMicSttEngine:
                 continue
 
             try:
-                if src_sr != WHISPER_SR:
-                    g = gcd(src_sr, WHISPER_SR)
-                    audio_16k = _resample_1d(audio, WHISPER_SR // g, src_sr // g)
+                safe_sr = _clamp_sample_rate(src_sr, WHISPER_SR)
+                if audio.size > _MAX_UTTERANCE_SAMPLES:
+                    audio = audio[:_MAX_UTTERANCE_SAMPLES]
+                if safe_sr != WHISPER_SR:
+                    g = gcd(safe_sr, WHISPER_SR)
+                    audio_16k = _resample_1d(audio, WHISPER_SR // g, safe_sr // g)
                 else:
                     audio_16k = audio.astype(np.float32)
 
@@ -634,5 +687,5 @@ class LocalMicSttEngine:
                 self._on_transcribed(text)
             except Exception as exc:
                 self._emit_duck(False)
-                self._log(f"[마이크 STT 오류] {exc}")
+                self._log(_redact_secrets(f"[마이크 STT 오류] {exc}"))
                 self._on_empty()

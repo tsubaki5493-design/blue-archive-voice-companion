@@ -17,7 +17,9 @@ from collections import OrderedDict
 import hashlib
 import json
 import os
+import re
 import struct
+import tempfile
 import threading
 import zlib
 from pathlib import Path
@@ -27,6 +29,49 @@ import numpy as np
 
 from src.extractor.ba_molru_extractor import DEFAULT_GAME_DIR, discover_steam_blue_archive_dir
 from src.utils.app_paths import get_app_root, get_cache_dir
+
+# Hardened binary parser & resource limits (defends against decompression bombs / OOM DoS)
+MAX_PNG_DIMENSION = 4096
+MAX_PNG_PIXELS = 4096 * 4096
+MAX_PNG_COMPRESSED_BYTES = 32 * 1024 * 1024
+MAX_PNG_DECOMPRESSED_BYTES = 4096 * (4096 * 4 + 1)
+MAX_PNG_CHUNKS = 4096
+
+MAX_UNITYFS_HEADER_BYTES = 16 * 1024 * 1024
+MAX_UNITYFS_BLOCK_BYTES = 16 * 1024 * 1024
+MAX_UNITYFS_BLOCKS = 65536
+MAX_UNITYFS_NODES = 4096
+MAX_UNITYFS_TOTAL_STREAM_BYTES = 128 * 1024 * 1024
+MAX_TEXTURE_DIMENSION = 4096
+MAX_RENDER_SIZE = 2048
+
+_SAFE_CACHE_TOKEN_RE = re.compile(r"[^A-Za-z0-9_-]+")
+_ALLOWED_BUNDLED_SUBDIRS = frozenset({"portraits", "schools", "ui"})
+_WIN_RESERVED_TOKENS = frozenset(
+    {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
+)
+
+
+def _sanitize_cache_token(raw: Any, fallback: str = "unknown") -> str:
+    """Strictly sanitize a filename token so `..`, `/`, `\\`, `:`, and control chars can never escape `rendered/`."""
+    cleaned = _SAFE_CACHE_TOKEN_RE.sub("_", str(raw or "").strip()).strip("_")
+    if not cleaned or cleaned.upper() in _WIN_RESERVED_TOKENS:
+        cleaned = f"_{cleaned}" if (cleaned and cleaned.upper() in _WIN_RESERVED_TOKENS) else fallback
+    return cleaned[:64]
+
+
+def _safe_rendered_file(rendered_dir: Path, fname: str) -> Path:
+    """Verify cache filename is strictly flat and resolves inside `rendered_dir` without symlink escape."""
+    if not fname or "/" in fname or "\\" in fname or ".." in fname or "\x00" in fname or Path(fname).name != fname:
+        raise ValueError(f"Unsafe rendered cache filename blocked: {fname!r}")
+    base_res = rendered_dir.resolve()
+    target = rendered_dir / fname
+    if target.is_symlink():
+        raise ValueError(f"Refusing to access symlink in rendered cache: {target}")
+    target_res = target.resolve()
+    if not target_res.is_relative_to(base_res):
+        raise ValueError(f"Cache path traversal blocked: {fname!r}")
+    return target_res
 
 
 def _discover_ba_root(custom_hint: str | Path | None = None) -> Path | None:
@@ -108,10 +153,12 @@ CHARACTER_PORTRAIT_ALIASES: dict[str, tuple[str, ...]] = {
 # Pure-Python UnityFS + SerializedFile v22 + Texture2D Decoder
 # ---------------------------------------------------------------------------
 
-def lz4_decompress(src: bytes, uncompressed_size: int) -> bytes:
-    """Decompress a raw UnityFS LZ4 block without external C extensions."""
+def lz4_decompress(src: bytes, uncompressed_size: int, *, max_size: int = MAX_UNITYFS_BLOCK_BYTES) -> bytes:
+    """Decompress a raw UnityFS LZ4 block without external C extensions, enforcing strict allocation caps."""
     if uncompressed_size <= 0:
         return b""
+    if uncompressed_size > max_size:
+        raise ValueError(f"LZ4 uncompressed_size exceeds safety cap ({uncompressed_size} > {max_size})")
     out = bytearray()
     i = 0
     n = len(src)
@@ -126,9 +173,19 @@ def lz4_decompress(src: bytes, uncompressed_size: int) -> bytes:
                 lit_len += b
                 if b != 255:
                     break
+                if lit_len > uncompressed_size:
+                    raise ValueError("LZ4 literal length exceeds uncompressed_size")
+        remaining = uncompressed_size - len(out)
+        if lit_len > n - i:
+            lit_len = n - i
+        if lit_len > remaining:
+            out.extend(src[i : i + remaining])
+            break
         out.extend(src[i : i + lit_len])
         i += lit_len
         if i >= n or len(out) >= uncompressed_size:
+            break
+        if i + 2 > n:
             break
         offset = src[i] | (src[i + 1] << 8)
         i += 2
@@ -142,6 +199,12 @@ def lz4_decompress(src: bytes, uncompressed_size: int) -> bytes:
                 match_len += b
                 if b != 255:
                     break
+                if match_len > uncompressed_size:
+                    match_len = uncompressed_size
+                    break
+        remaining = uncompressed_size - len(out)
+        if match_len > remaining:
+            match_len = remaining
         start = len(out) - offset
         if offset >= match_len:
             out.extend(out[start : start + match_len])
@@ -159,6 +222,7 @@ def lz4_decompress(src: bytes, uncompressed_size: int) -> bytes:
 
 def parse_unityfs_header(bundle_path: Path) -> dict[str, Any]:
     """Parse ONLY the UnityFS header, block table, and node table without reading/decompressing `.resS` payloads."""
+    file_size = bundle_path.stat().st_size
     with bundle_path.open("rb") as fh:
         head = fh.read(512)
         pos = 0
@@ -171,6 +235,8 @@ def parse_unityfs_header(bundle_path: Path) -> dict[str, Any]:
                     val = head[pos:end].decode("utf-8", errors="replace")
                     pos = end + 1
                     return val
+                if len(head) >= 65536:
+                    raise ValueError(f"Unterminated UnityFS header string in {bundle_path}")
                 more = fh.read(1024)
                 if not more:
                     raise ValueError(f"Truncated UnityFS header in {bundle_path}")
@@ -195,9 +261,15 @@ def parse_unityfs_header(bundle_path: Path) -> dict[str, Any]:
             head += more
         size, c_ib, u_ib, flags = struct.unpack_from(">qIII", head, pos)
         pos += 20
+        if c_ib > MAX_UNITYFS_HEADER_BYTES or u_ib > MAX_UNITYFS_HEADER_BYTES:
+            raise ValueError(f"UnityFS blocksInfo exceeds safety cap (c={c_ib}, u={u_ib})")
+        if size < 0 or size > file_size + 4096:
+            raise ValueError(f"Invalid UnityFS bundle size field: {size}")
         if ver >= 7:
             pos = (pos + 15) & ~15
         if flags & 0x80:
+            if size < c_ib:
+                raise ValueError(f"Invalid UnityFS tail offset (size={size}, c_ib={c_ib})")
             fh.seek(size - c_ib)
             ib_raw = fh.read(c_ib)
             data_pos = pos
@@ -209,17 +281,25 @@ def parse_unityfs_header(bundle_path: Path) -> dict[str, Any]:
             data_pos = (data_pos + 15) & ~15
 
     comp = flags & 0x3F
-    ib = lz4_decompress(ib_raw, u_ib) if comp in (2, 3) else ib_raw
+    ib = lz4_decompress(ib_raw, u_ib, max_size=MAX_UNITYFS_HEADER_BYTES) if comp in (2, 3) else ib_raw
 
     ip = 16
+    if ip + 4 > len(ib):
+        raise ValueError(f"Truncated UnityFS block count in {bundle_path}")
     b_cnt = struct.unpack_from(">I", ib, ip)[0]
     ip += 4
+    if b_cnt > MAX_UNITYFS_BLOCKS or ip + 10 * b_cnt > len(ib):
+        raise ValueError(f"Invalid UnityFS block count: {b_cnt}")
     blocks: list[tuple[int, int, int, int, int]] = []
     block_u_ends: list[int] = []
     u_cursor = 0
     f_cursor = data_pos
     for k in range(b_cnt):
         u_sz, c_sz, b_fl = struct.unpack_from(">IIH", ib, ip + 10 * k)
+        if u_sz > MAX_UNITYFS_BLOCK_BYTES or c_sz > MAX_UNITYFS_BLOCK_BYTES:
+            raise ValueError(f"UnityFS block exceeds safety cap (u={u_sz}, c={c_sz})")
+        if f_cursor + c_sz > file_size:
+            raise ValueError(f"UnityFS block exceeds bundle file size ({f_cursor + c_sz} > {file_size})")
         u_end = u_cursor + u_sz
         blocks.append((u_cursor, u_end, f_cursor, c_sz, b_fl))
         block_u_ends.append(u_end)
@@ -227,15 +307,23 @@ def parse_unityfs_header(bundle_path: Path) -> dict[str, Any]:
         f_cursor += c_sz
     ip += 10 * b_cnt
 
+    if ip + 4 > len(ib):
+        raise ValueError(f"Truncated UnityFS node count in {bundle_path}")
     n_cnt = struct.unpack_from(">I", ib, ip)[0]
     ip += 4
+    if n_cnt > MAX_UNITYFS_NODES:
+        raise ValueError(f"Invalid UnityFS node count: {n_cnt}")
     nodes: list[tuple[int, int, str]] = []
     for _ in range(n_cnt):
+        if ip + 20 > len(ib):
+            raise ValueError(f"Truncated UnityFS node header in {bundle_path}")
         ofs, sz, _st = struct.unpack_from(">qqI", ib, ip)
         ip += 20
         end = ib.index(b"\x00", ip)
         nm = ib[ip:end].decode("utf-8", errors="replace")
         ip = end + 1
+        if ofs < 0 or sz < 0:
+            raise ValueError(f"Invalid UnityFS node bounds: ofs={ofs}, sz={sz}")
         nodes.append((ofs, sz, nm))
 
     return {"blocks": blocks, "block_u_ends": block_u_ends, "nodes": nodes}
@@ -282,6 +370,8 @@ def read_unityfs_node_slice(
     want = avail if max_bytes is None else max(0, min(int(max_bytes), avail))
     if want == 0:
         return b""
+    if want > MAX_UNITYFS_TOTAL_STREAM_BYTES:
+        raise ValueError(f"Requested UnityFS slice exceeds safety cap ({want} > {MAX_UNITYFS_TOTAL_STREAM_BYTES})")
 
     u0 = node_ofs + req_start
     u1 = u0 + want
@@ -340,7 +430,10 @@ def read_unityfs_node_slice(
 
 
 def unpack_unityfs(bundle_path: Path) -> dict[str, bytes]:
-    """Read an unencrypted UnityFS bundle into `{node_name: node_bytes}`."""
+    """Read an unencrypted UnityFS bundle into `{node_name: node_bytes}` with strict bomb/allocation guards."""
+    file_size = bundle_path.stat().st_size
+    if file_size > MAX_UNITYFS_TOTAL_STREAM_BYTES:
+        raise ValueError(f"UnityFS bundle exceeds safety cap ({file_size} > {MAX_UNITYFS_TOTAL_STREAM_BYTES})")
     data = bundle_path.read_bytes()
     pos = 0
 
@@ -360,9 +453,13 @@ def unpack_unityfs(bundle_path: Path) -> dict[str, bytes]:
     _rstr()  # unity_revision
     size, c_ib, u_ib, flags = struct.unpack_from(">qIII", data, pos)
     pos += 20
+    if c_ib > MAX_UNITYFS_HEADER_BYTES or u_ib > MAX_UNITYFS_HEADER_BYTES:
+        raise ValueError(f"UnityFS blocksInfo exceeds safety cap (c={c_ib}, u={u_ib})")
     if ver >= 7:
         pos = (pos + 15) & ~15
     if flags & 0x80:
+        if size < c_ib or size > len(data):
+            raise ValueError(f"Invalid UnityFS tail bounds: size={size}, c_ib={c_ib}")
         ib_raw = data[size - c_ib : size]
     else:
         ib_raw = data[pos : pos + c_ib]
@@ -371,34 +468,50 @@ def unpack_unityfs(bundle_path: Path) -> dict[str, bytes]:
         pos = (pos + 15) & ~15
 
     comp = flags & 0x3F
-    ib = lz4_decompress(ib_raw, u_ib) if comp in (2, 3) else ib_raw
+    ib = lz4_decompress(ib_raw, u_ib, max_size=MAX_UNITYFS_HEADER_BYTES) if comp in (2, 3) else ib_raw
 
     ip = 16
     b_cnt = struct.unpack_from(">I", ib, ip)[0]
     ip += 4
+    if b_cnt > MAX_UNITYFS_BLOCKS or ip + 10 * b_cnt > len(ib):
+        raise ValueError(f"Invalid UnityFS block count: {b_cnt}")
     blocks = [struct.unpack_from(">IIH", ib, ip + 10 * k) for k in range(b_cnt)]
     ip += 10 * b_cnt
 
+    if ip + 4 > len(ib):
+        raise ValueError(f"Truncated UnityFS node count in {bundle_path}")
     n_cnt = struct.unpack_from(">I", ib, ip)[0]
     ip += 4
+    if n_cnt > MAX_UNITYFS_NODES:
+        raise ValueError(f"Invalid UnityFS node count: {n_cnt}")
     nodes: list[tuple[int, int, str]] = []
     for _ in range(n_cnt):
+        if ip + 20 > len(ib):
+            raise ValueError(f"Truncated UnityFS node header in {bundle_path}")
         ofs, sz, _st = struct.unpack_from(">qqI", ib, ip)
         ip += 20
         end = ib.index(b"\x00", ip)
         nm = ib[ip:end].decode("utf-8", errors="replace")
         ip = end + 1
+        if ofs < 0 or sz < 0:
+            raise ValueError(f"Invalid UnityFS node bounds: ofs={ofs}, sz={sz}")
         nodes.append((ofs, sz, nm))
 
     stream = bytearray()
     for u_sz, c_sz, b_fl in blocks:
+        if u_sz > MAX_UNITYFS_BLOCK_BYTES or c_sz > MAX_UNITYFS_BLOCK_BYTES:
+            raise ValueError(f"UnityFS block exceeds safety cap (u={u_sz}, c={c_sz})")
+        if pos + c_sz > len(data):
+            raise ValueError("UnityFS block slice exceeds file length")
+        if len(stream) + u_sz > MAX_UNITYFS_TOTAL_STREAM_BYTES:
+            raise ValueError("UnityFS total decompressed stream exceeds safety cap")
         chunk = data[pos : pos + c_sz]
         pos += c_sz
         bc = b_fl & 0x3F
-        stream.extend(lz4_decompress(chunk, u_sz) if bc in (2, 3) else chunk)
+        stream.extend(lz4_decompress(chunk, u_sz, max_size=MAX_UNITYFS_BLOCK_BYTES) if bc in (2, 3) else chunk)
 
     raw_stream = bytes(stream)
-    return {nm: raw_stream[ofs : ofs + sz] for ofs, sz, nm in nodes}
+    return {nm: raw_stream[ofs : ofs + sz] for ofs, sz, nm in nodes if ofs + sz <= len(raw_stream)}
 
 
 def parse_serialized_texture2d_entries(cab_bytes: bytes) -> list[dict[str, Any]]:
@@ -414,26 +527,48 @@ def parse_serialized_texture2d_entries(cab_bytes: bytes) -> list[dict[str, Any]]
     p += 1
     tcnt = struct.unpack_from(le + "i", cab_bytes, p)[0]
     p += 4
+    if tcnt < 0 or tcnt > 65536:
+        return []
 
     types: list[int] = []
     for _ in range(tcnt):
+        if p + 4 > len(cab_bytes):
+            return []
         cid = struct.unpack_from(le + "i", cab_bytes, p)[0]
         p += 7 + (16 if cid == 114 else 0) + 16
+        if p > len(cab_bytes):
+            return []
         if enable_tt:
+            if p + 8 > len(cab_bytes):
+                return []
             nn, ssz = struct.unpack_from(le + "ii", cab_bytes, p)
+            if nn < 0 or ssz < 0 or nn > 100000 or ssz > 16 * 1024 * 1024:
+                return []
             p += 8 + nn * 32 + ssz
+            if p + 4 > len(cab_bytes):
+                return []
             nd = struct.unpack_from(le + "i", cab_bytes, p)[0]
+            if nd < 0 or nd > 100000:
+                return []
             p += 4 + nd * 4
         types.append(cid)
 
+    if p + 4 > len(cab_bytes):
+        return []
     ocnt = struct.unpack_from(le + "i", cab_bytes, p)[0]
     p += 4
+    if ocnt < 0 or ocnt > 100000:
+        return []
     out: list[dict[str, Any]] = []
     for _ in range(ocnt):
         p = (p + 3) & ~3
+        if p + 24 > len(cab_bytes):
+            break
         _pid, bs, bsz, ti = struct.unpack_from(le + "qqIi", cab_bytes, p)
         p += 24
-        if types[ti] != 28:
+        if ti < 0 or ti >= len(types) or types[ti] != 28:
+            continue
+        if data_ofs < 0 or bs < 0 or data_ofs + bs + bsz > len(cab_bytes):
             continue
         ob = cab_bytes[data_ofs + bs : data_ofs + bs + bsz]
         if len(ob) < 120:
@@ -521,7 +656,7 @@ def _decode_dxt_color_blocks(c0: np.ndarray, c1: np.ndarray, cbits: np.ndarray, 
 
 def decode_texture2d_rgba(raw_bytes: bytes, w: int, h: int, tex_fmt: int) -> np.ndarray | None:
     """Decode Unity Texture2D bytes (`RGBA32=4`, `RGB24=3`, `DXT1=10`, `DXT5=12`) into top-down `(h, w, 4)` uint8."""
-    if w <= 0 or h <= 0 or not raw_bytes:
+    if w <= 0 or h <= 0 or w > MAX_TEXTURE_DIMENSION or h > MAX_TEXTURE_DIMENSION or not raw_bytes:
         return None
     if tex_fmt == 4:  # RGBA32
         need = w * h * 4
@@ -635,37 +770,86 @@ def encode_png_rgba(rgba: np.ndarray, compress_level: int = 1) -> bytes:
 
 
 def decode_png_rgba(png_bytes: bytes) -> np.ndarray | None:
-    """Pure-Python/NumPy decoder for non-interlaced 8-bit RGB/RGBA PNGs -> `(H, W, 4)` uint8 array."""
-    if len(png_bytes) < 33 or png_bytes[:8] != b"\x89PNG\r\n\x1a\n":
+    """Pure-Python/NumPy decoder for non-interlaced 8-bit RGB/RGBA PNGs -> `(H, W, 4)` uint8 array (bomb-safe)."""
+    if (
+        not isinstance(png_bytes, (bytes, bytearray, memoryview))
+        or len(png_bytes) < 33
+        or len(png_bytes) > MAX_PNG_COMPRESSED_BYTES
+        or png_bytes[:8] != b"\x89PNG\r\n\x1a\n"
+    ):
         return None
     pos = 8
     w = h = bit_depth = color_type = interlace = 0
+    seen_ihdr = False
     idat_parts: list[bytes] = []
     n = len(png_bytes)
+    chunk_count = 0
     while pos + 12 <= n:
+        chunk_count += 1
+        if chunk_count > MAX_PNG_CHUNKS:
+            return None
         length = struct.unpack_from(">I", png_bytes, pos)[0]
         tag = png_bytes[pos + 4 : pos + 8]
         data_start = pos + 8
         data_end = data_start + length
-        if data_end + 4 > n:
+        if length > n or data_end + 4 > n:
             return None
-        if tag == b"IHDR" and length >= 13:
+        if tag == b"IHDR":
+            if seen_ihdr or length != 13:
+                return None
             w, h, bit_depth, color_type, _comp, _filt, interlace = struct.unpack_from(">IIBBBBB", png_bytes, data_start)
+            seen_ihdr = True
         elif tag == b"IDAT":
-            idat_parts.append(png_bytes[data_start:data_end])
+            if not seen_ihdr:
+                return None
+            idat_parts.append(bytes(png_bytes[data_start:data_end]))
         elif tag == b"IEND":
             break
         pos = data_end + 4
 
-    if w <= 0 or h <= 0 or bit_depth != 8 or interlace != 0 or color_type not in (2, 6):
+    if (
+        not seen_ihdr
+        or w <= 0
+        or h <= 0
+        or w > MAX_PNG_DIMENSION
+        or h > MAX_PNG_DIMENSION
+        or (w * h) > MAX_PNG_PIXELS
+        or bit_depth != 8
+        or interlace != 0
+        or color_type not in (2, 6)
+        or not idat_parts
+    ):
         return None
     bpp = 4 if color_type == 6 else 3
     stride = w * bpp
+    expected_size = h * (stride + 1)
+    if expected_size <= 0 or expected_size > MAX_PNG_DECOMPRESSED_BYTES:
+        return None
     try:
-        raw = zlib.decompress(b"".join(idat_parts))
+        decomp = zlib.decompressobj()
+        out_chunks: list[bytes] = []
+        total_out = 0
+        for part in idat_parts:
+            if not part:
+                continue
+            rem = expected_size - total_out
+            piece = decomp.decompress(part, rem + 1)
+            total_out += len(piece)
+            if total_out > expected_size or decomp.unconsumed_tail:
+                return None
+            if piece:
+                out_chunks.append(piece)
+        rem = expected_size - total_out
+        tail = decomp.flush(rem + 1)
+        total_out += len(tail)
+        if total_out > expected_size:
+            return None
+        if tail:
+            out_chunks.append(tail)
+        raw = b"".join(out_chunks)
     except Exception:
         return None
-    if len(raw) < h * (stride + 1):
+    if len(raw) != expected_size:
         return None
 
     rows = np.frombuffer(raw[: h * (stride + 1)], dtype=np.uint8).reshape(h, stride + 1)
@@ -1090,7 +1274,10 @@ class MomoTalkAssetManager:
         return get_app_root() / "config" / "momotalk_assets"
 
     def _load_bundled_rgba(self, subdir: str, candidates: tuple[str, ...]) -> np.ndarray | None:
+        if subdir not in _ALLOWED_BUNDLED_SUBDIRS:
+            return None
         base = self._get_bundled_assets_dir() / subdir
+        base_res = base.resolve()
         with self._bundle_cache_lock:
             fmap = self._bundled_file_maps.get(subdir)
             if fmap is None:
@@ -1098,7 +1285,12 @@ class MomoTalkAssetManager:
                 if base.is_dir():
                     try:
                         for p in base.iterdir():
-                            if p.is_file() and p.suffix.lower() == ".png":
+                            if (
+                                p.is_file()
+                                and not p.is_symlink()
+                                and p.suffix.lower() == ".png"
+                                and p.resolve().is_relative_to(base_res)
+                            ):
                                 fmap[p.stem.lower()] = p
                     except Exception:
                         pass
@@ -1118,6 +1310,8 @@ class MomoTalkAssetManager:
                 if cached is not None:
                     return cached
             try:
+                if path.stat().st_size > MAX_PNG_COMPRESSED_BYTES:
+                    continue
                 rgba = decode_png_rgba(path.read_bytes())
             except Exception:
                 rgba = None
@@ -1267,7 +1461,18 @@ class MomoTalkAssetManager:
             "ui_icons": ui_icons,
         }
         try:
-            idx_path.write_text(json.dumps(idx_obj, ensure_ascii=False), encoding="utf-8")
+            if not idx_path.is_symlink():
+                idx_path.parent.mkdir(parents=True, exist_ok=True)
+                fd, tmp_name = tempfile.mkstemp(prefix=".idx_", suffix=".tmp", dir=str(idx_path.parent))
+                try:
+                    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                        fh.write(json.dumps(idx_obj, ensure_ascii=False))
+                    os.replace(tmp_name, idx_path)
+                except Exception:
+                    try:
+                        os.unlink(tmp_name)
+                    except OSError:
+                        pass
         except Exception:
             pass
         with self._lock:
@@ -1312,13 +1517,23 @@ class MomoTalkAssetManager:
         gd = self._game_data_dir()
         bp: Path | None = None
         if res_root is not None and meta.get("bundle_rel"):
-            cand = res_root / str(meta["bundle_rel"])
-            if cand.is_file():
-                bp = cand
+            rel_str = str(meta["bundle_rel"]).replace("\\", "/")
+            if ".." not in rel_str.split("/") and not rel_str.startswith("/"):
+                cand = res_root / rel_str
+                try:
+                    if cand.is_file() and not cand.is_symlink() and cand.resolve().is_relative_to(res_root.resolve()):
+                        bp = cand
+                except OSError:
+                    bp = None
         if bp is None and gd is not None and meta.get("bundle"):
-            cand = gd / str(meta["bundle"])
-            if cand.is_file():
-                bp = cand
+            bname = str(meta["bundle"])
+            if "/" not in bname and "\\" not in bname and ".." not in bname:
+                cand = gd / bname
+                try:
+                    if cand.is_file() and not cand.is_symlink() and cand.resolve().is_relative_to(gd.resolve()):
+                        bp = cand
+                except OSError:
+                    bp = None
         if bp is None:
             return None
 
@@ -1369,22 +1584,27 @@ class MomoTalkAssetManager:
         ring_rgb: tuple[int, int, int] = (218, 226, 236),
     ) -> str:
         raw_cid = str(char_data.get("entry_id") or char_data.get("id") or "unknown")
-        cid = raw_cid.replace("/", "_").replace("\\", "_")
-        ring_tag = f"{ring_rgb[0]:02x}{ring_rgb[1]:02x}{ring_rgb[2]:02x}"
+        cid = _sanitize_cache_token(raw_cid, fallback="unknown")
+        safe_sz = max(8, min(MAX_RENDER_SIZE, int(size)))
+        r0, r1, r2 = (max(0, min(255, int(c))) for c in ring_rgb[:3])
+        ring_tag = f"{r0:02x}{r1:02x}{r2:02x}"
         if bg_rgb is None:
-            return f"pa_{cid}_{size}_alpha_{ring_tag}.png"
-        bg_tag = f"{bg_rgb[0]:02x}{bg_rgb[1]:02x}{bg_rgb[2]:02x}_{ring_tag}"
-        return f"p_{cid}_{size}_{bg_tag}.png"
+            return f"pa_{cid}_{safe_sz}_alpha_{ring_tag}.png"
+        b0, b1, b2 = (max(0, min(255, int(c))) for c in bg_rgb[:3])
+        bg_tag = f"{b0:02x}{b1:02x}{b2:02x}_{ring_tag}"
+        return f"p_{cid}_{safe_sz}_{bg_tag}.png"
 
     @staticmethod
     def _school_cache_name(school_kr: str, size: int = 22) -> str:
-        code = SCHOOL_CODE_MAP.get(school_kr, "ETC").upper()
-        return f"sch_{code}_{size}.png"
+        code = _sanitize_cache_token(SCHOOL_CODE_MAP.get(school_kr, "ETC").upper(), fallback="ETC")
+        safe_sz = max(8, min(MAX_RENDER_SIZE, int(size)))
+        return f"sch_{code}_{safe_sz}.png"
 
     @staticmethod
     def _ui_cache_name(icon_kind: str, size: int = 28) -> str:
-        kind = icon_kind.lower().strip()
-        return f"ui_{kind}_{size}.png"
+        kind = _sanitize_cache_token(str(icon_kind or "").lower().strip(), fallback="ui")
+        safe_sz = max(8, min(MAX_RENDER_SIZE, int(size)))
+        return f"ui_{kind}_{safe_sz}.png"
 
     def _portrait_cache_path(
         self,
@@ -1393,15 +1613,17 @@ class MomoTalkAssetManager:
         bg_rgb: tuple[int, int, int] | None = None,
         ring_rgb: tuple[int, int, int] = (218, 226, 236),
     ) -> Path:
-        return self._ensure_cache_paths()[1] / self._portrait_cache_name(
-            char_data, size=size, bg_rgb=bg_rgb, ring_rgb=ring_rgb
-        )
+        rendered = self._ensure_cache_paths()[1]
+        fname = self._portrait_cache_name(char_data, size=size, bg_rgb=bg_rgb, ring_rgb=ring_rgb)
+        return _safe_rendered_file(rendered, fname)
 
     def _school_cache_path(self, school_kr: str, size: int = 22) -> Path:
-        return self._ensure_cache_paths()[1] / self._school_cache_name(school_kr, size=size)
+        rendered = self._ensure_cache_paths()[1]
+        return _safe_rendered_file(rendered, self._school_cache_name(school_kr, size=size))
 
     def _ui_cache_path(self, icon_kind: str, size: int = 28) -> Path:
-        return self._ensure_cache_paths()[1] / self._ui_cache_name(icon_kind, size=size)
+        rendered = self._ensure_cache_paths()[1]
+        return _safe_rendered_file(rendered, self._ui_cache_name(icon_kind, size=size))
 
     def _mark_rendered_cached(self, fname: str) -> None:
         with self._lock:
@@ -1439,9 +1661,10 @@ class MomoTalkAssetManager:
         When `cached_only=True` and the disk cache misses, returns the fast fallback PNG immediately.
         """
         cid = str(char_data.get("id") or "unknown")
+        size = max(8, min(MAX_RENDER_SIZE, int(size)))
         _, rendered_dir, files = self._ensure_cache_paths()
         fname = self._portrait_cache_name(char_data, size=size, bg_rgb=bg_rgb, ring_rgb=ring_rgb)
-        steam_cache_file = rendered_dir / fname
+        steam_cache_file = _safe_rendered_file(rendered_dir, fname)
         if fname in files:
             try:
                 return steam_cache_file.read_bytes()
@@ -1495,9 +1718,10 @@ class MomoTalkAssetManager:
         cached_only: bool = False,
     ) -> bytes:
         code = SCHOOL_CODE_MAP.get(school_kr, "ETC").upper()
+        size = max(8, min(MAX_RENDER_SIZE, int(size)))
         _, rendered_dir, files = self._ensure_cache_paths()
         fname = self._school_cache_name(school_kr, size=size)
-        cache_file = rendered_dir / fname
+        cache_file = _safe_rendered_file(rendered_dir, fname)
         if fname in files:
             try:
                 return cache_file.read_bytes()
@@ -1544,9 +1768,10 @@ class MomoTalkAssetManager:
         cached_only: bool = False,
     ) -> bytes:
         kind = icon_kind.lower().strip()
+        size = max(8, min(MAX_RENDER_SIZE, int(size)))
         _, rendered_dir, files = self._ensure_cache_paths()
         fname = self._ui_cache_name(kind, size=size)
-        cache_file = rendered_dir / fname
+        cache_file = _safe_rendered_file(rendered_dir, fname)
         if fname in files:
             try:
                 return cache_file.read_bytes()

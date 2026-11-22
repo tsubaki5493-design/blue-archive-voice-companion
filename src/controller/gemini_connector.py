@@ -20,6 +20,7 @@ from __future__ import annotations
 import base64
 import ctypes
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -32,6 +33,7 @@ import time
 from concurrent.futures import Future
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -39,6 +41,7 @@ from src.controller.jp_conversation_coach import (
     build_jp_coach_bilingual_addon,
     build_jp_coach_turn_reminder,
 )
+from src.utils import app_paths as _app_paths
 from src.utils.app_paths import get_browser_profile_dir, get_selectors_path
 
 IDLE_PING_TOKEN = "[IDLE_PING]"
@@ -206,33 +209,213 @@ def strip_voice_persona_tags(raw: str) -> str:
     return _RE_MULTI_SPACE.sub(" ", _RE_VOICE_TAG.sub(" ", raw)).strip()
 
 
-def load_selectors_config(app_root: Path | None = None) -> dict[str, Any]:
-    """Load CSS selectors dynamically from selectors.json (never hardcoded in logic)."""
-    sel_path = get_selectors_path(app_root)
-    if sel_path.exists():
+DEFAULT_GEMINI_URL = "https://gemini.google.com/app"
+_ALLOWED_GEMINI_WEB_HOSTS: tuple[str, ...] = ("gemini.google.com",)
+_ALLOWED_GEMINI_LOGIN_HOSTS: tuple[str, ...] = ("gemini.google.com", "accounts.google.com")
+_ALLOWED_GEMINI_API_HOSTS: tuple[str, ...] = ("generativelanguage.googleapis.com",)
+
+_MAX_SELECTORS_FILE_BYTES = 256 * 1024
+_MAX_SELECTOR_COUNT = 32
+_MAX_SELECTOR_LEN = 512
+
+_MAX_CDP_HANDSHAKE_BYTES = 16 * 1024
+_MAX_CDP_CONTROL_FRAME_BYTES = 125
+_DEFAULT_MAX_CDP_FRAME_BYTES = 4 * 1024 * 1024
+_DEFAULT_MAX_CDP_MESSAGE_BYTES = 8 * 1024 * 1024
+_MAX_CDP_FRAGMENTS = 256
+_MAX_CDP_SEND_BYTES = 4 * 1024 * 1024
+_MAX_CDP_HTTP_JSON_BYTES = 2 * 1024 * 1024
+
+_MAX_GEMINI_API_JSON_BYTES = 4 * 1024 * 1024
+_MAX_GEMINI_API_ERROR_BYTES = 8 * 1024
+_MAX_GEMINI_SSE_LINE_CHARS = 512 * 1024
+_MAX_GEMINI_SSE_TOTAL_CHARS = 2 * 1024 * 1024
+
+_RE_CTRL_OR_WS = re.compile(r"[\x00-\x20\x7f]")
+_RE_CTRL_NON_SPACE = re.compile(r"[\x00-\x1f\x7f]")
+_RE_SAFE_GEMINI_MODEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+_RE_REDACT_DPAPI = re.compile(r"dpapi:[A-Za-z0-9+/=]{16,}")
+_RE_REDACT_AIZA = re.compile(r"AIza[0-9A-Za-z\-_]{20,}")
+_RE_REDACT_SK = re.compile(r"\bsk-[0-9A-Za-z\-_]{16,}\b")
+_RE_REDACT_BEARER = re.compile(r"(?i)(\bBearer\s+)[A-Za-z0-9._\-~+/]+=*")
+_RE_REDACT_HEADER_SECRET = re.compile(r"(?i)((?:x-goog-api-key|authorization)\s*[:=]\s*['\"]?)[^\s'\",;}\]]+")
+_RE_REDACT_QUERY_SECRET = re.compile(r"(?i)([?&](?:key|api_key|apikey|token|access_token)=)[^&\s'\"<>]+")
+_RE_REDACT_JSON_SECRET = re.compile(r'(?i)("(?:fish_api_key|gemini_api_key|api_key)"\s*:\s*")[^"]+(")')
+
+
+def _redact_secrets_fallback(text: str, extra_secrets: tuple[str, ...] = ()) -> str:
+    """Fallback secret scrubber active even before app_paths.redact_secrets is imported."""
+    out = str(text or "")
+    for sec in extra_secrets:
+        s = str(sec or "").strip()
+        if s and len(s) >= 4:
+            out = out.replace(s, "[REDACTED]")
+    out = _RE_REDACT_DPAPI.sub("dpapi:[REDACTED]", out)
+    out = _RE_REDACT_AIZA.sub("[REDACTED_GEMINI_KEY]", out)
+    out = _RE_REDACT_SK.sub("[REDACTED_API_KEY]", out)
+    out = _RE_REDACT_BEARER.sub(r"\1[REDACTED]", out)
+    out = _RE_REDACT_HEADER_SECRET.sub(r"\1[REDACTED]", out)
+    out = _RE_REDACT_QUERY_SECRET.sub(r"\1[REDACTED]", out)
+    out = _RE_REDACT_JSON_SECRET.sub(r"\1[REDACTED]\2", out)
+    return out
+
+
+def _scrub_secrets(text: Any, extra_secrets: tuple[str, ...] = ()) -> str:
+    """Scrub API keys, tokens, and DPAPI blobs using app_paths.redact_secrets with local fallback."""
+    raw = str(text or "")
+    fn = getattr(_app_paths, "redact_secrets", None)
+    if callable(fn):
         try:
-            data = json.loads(sel_path.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                return data
+            raw = str(fn(raw, extra_secrets=extra_secrets))
+        except TypeError:
+            try:
+                raw = str(fn(raw))
+            except Exception:
+                pass
         except Exception:
             pass
-    return {
-        "url": "https://gemini.google.com/app",
-        "input_selectors": [
-            "div.ql-editor[aria-label*='Gemini']",
-            "rich-textarea div[contenteditable='true']",
-            "div[contenteditable='true']",
-        ],
-        "send_button_selectors": [
-            "button[aria-label*='메시지 보내기']:not([disabled]):not([aria-disabled='true'])",
-            "button.send-button:not([disabled])",
-            "button[aria-label*='Send']:not([disabled])",
-        ],
-        "stop_button_selectors": ["button[aria-label*='Stop']", "button[aria-label*='중지']"],
-        "response_selectors": ["model-response message-content .markdown", "model-response message-content"],
-        "new_chat_selectors": ["a[href='/app']"],
-        "login_required_selectors": ["a[href*='accounts.google.com/ServiceLogin']"],
+    return _redact_secrets_fallback(raw, extra_secrets=extra_secrets)
+
+
+def is_valid_gemini_url(url: Any) -> bool:
+    """Return True strictly for safe `https://gemini.google.com/...` URLs."""
+    if not isinstance(url, str):
+        return False
+    raw = url.strip()
+    if not raw or len(raw) > 512 or _RE_CTRL_OR_WS.search(raw) or "\\" in raw:
+        return False
+    parsed = urlsplit(raw)
+    if parsed.scheme.lower() != "https":
+        return False
+    if (parsed.hostname or "").lower() not in _ALLOWED_GEMINI_WEB_HOSTS:
+        return False
+    if parsed.username is not None or parsed.password is not None:
+        return False
+    if parsed.port not in (None, 443):
+        return False
+    if parsed.path and (
+        not parsed.path.startswith("/")
+        or "/../" in parsed.path
+        or parsed.path.endswith("/..")
+        or parsed.path == "/.."
+    ):
+        return False
+    return True
+
+
+def validate_gemini_url(url: Any, fallback: str = DEFAULT_GEMINI_URL) -> str:
+    """Validate a Gemini web URL strictly against `https://gemini.google.com/...`, falling back safely."""
+    if is_valid_gemini_url(url):
+        return str(url).strip()
+    return fallback
+
+
+def _validate_https_url(url: str, allowed_hosts: tuple[str, ...]) -> str:
+    """Enforce strict HTTPS-only URL to an explicitly allowlisted host."""
+    raw = str(url or "").strip()
+    if not raw or len(raw) > 2048 or _RE_CTRL_OR_WS.search(raw):
+        raise ValueError("Invalid HTTPS URL")
+    parsed = urlsplit(raw)
+    if parsed.scheme.lower() != "https":
+        raise ValueError("Refusing non-HTTPS outbound URL")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("Refusing credentials in outbound URL")
+    if (parsed.hostname or "").lower() not in allowed_hosts:
+        raise ValueError(f"Refusing untrusted outbound host: {parsed.hostname!r}")
+    if parsed.port not in (None, 443):
+        raise ValueError(f"Refusing non-standard HTTPS port: {parsed.port!r}")
+    return raw
+
+
+def _validate_gemini_model_id(model: str) -> str:
+    """Validate a Gemini API model identifier before interpolating into REST paths."""
+    clean = (model or "gemini-2.5-flash").strip()
+    if clean.startswith("models/"):
+        clean = clean[7:].strip()
+    if not clean or ".." in clean or not _RE_SAFE_GEMINI_MODEL.fullmatch(clean):
+        raise ValueError("Invalid Gemini API model identifier")
+    return clean
+
+
+def _js_literal(value: Any) -> str:
+    """Safely serialize Python data into an ASCII-escaped JavaScript literal."""
+    return json.dumps(value, ensure_ascii=True).replace("</", "<\\/")
+
+
+def _is_trusted_page_url(url: Any, allowed_hosts: tuple[str, ...]) -> bool:
+    if not isinstance(url, str):
+        return False
+    raw = url.strip()
+    if not raw or _RE_CTRL_OR_WS.search(raw):
+        return False
+    parsed = urlsplit(raw)
+    return parsed.scheme.lower() == "https" and (parsed.hostname or "").lower() in allowed_hosts
+
+
+_DEFAULT_SELECTORS: dict[str, Any] = {
+    "url": DEFAULT_GEMINI_URL,
+    "input_selectors": [
+        "div.ql-editor[aria-label*='Gemini']",
+        "rich-textarea div[contenteditable='true']",
+        "div[contenteditable='true']",
+    ],
+    "send_button_selectors": [
+        "button[aria-label*='메시지 보내기']:not([disabled]):not([aria-disabled='true'])",
+        "button.send-button:not([disabled])",
+        "button[aria-label*='Send']:not([disabled])",
+    ],
+    "stop_button_selectors": ["button[aria-label*='Stop']", "button[aria-label*='중지']"],
+    "response_selectors": ["model-response message-content .markdown", "model-response message-content"],
+    "new_chat_selectors": ["a[href='/app']"],
+    "login_required_selectors": ["a[href*='accounts.google.com/ServiceLogin']"],
+}
+
+_SELECTOR_LIST_KEYS: tuple[str, ...] = (
+    "input_selectors",
+    "send_button_selectors",
+    "stop_button_selectors",
+    "response_selectors",
+    "new_chat_selectors",
+    "login_required_selectors",
+)
+
+
+def _sanitize_selector_list(raw: Any, fallback: list[str]) -> list[str]:
+    if not isinstance(raw, list):
+        return list(fallback)
+    out: list[str] = []
+    for item in raw:
+        if not isinstance(item, str):
+            continue
+        clean = item.strip()
+        if not clean or len(clean) > _MAX_SELECTOR_LEN or _RE_CTRL_NON_SPACE.search(clean):
+            continue
+        out.append(clean)
+        if len(out) >= _MAX_SELECTOR_COUNT:
+            break
+    return out if out else list(fallback)
+
+
+def load_selectors_config(app_root: Path | None = None) -> dict[str, Any]:
+    """Load and strictly validate CSS selectors and Gemini URL from selectors.json."""
+    sel_path = get_selectors_path(app_root)
+    loaded: dict[str, Any] = {}
+    if sel_path.exists() and sel_path.is_file():
+        try:
+            if sel_path.stat().st_size <= _MAX_SELECTORS_FILE_BYTES:
+                data = json.loads(sel_path.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    loaded = data
+        except Exception:
+            loaded = {}
+
+    sanitized: dict[str, Any] = {
+        "url": validate_gemini_url(loaded.get("url"), fallback=DEFAULT_GEMINI_URL),
     }
+    for key in _SELECTOR_LIST_KEYS:
+        sanitized[key] = _sanitize_selector_list(loaded.get(key), _DEFAULT_SELECTORS[key])
+    return sanitized
 
 
 def sanitize_gemini_spoken_text(raw: str) -> str:
@@ -748,18 +931,45 @@ def _build_japanese_repair_prompt(
 class LocalCDPClient:
     """
     Minimal zero-dependency RFC 6455 WebSocket client for localhost Chrome DevTools Protocol (CDP).
+    Connects strictly to loopback without an Origin header and enforces strict frame/message bounds.
     """
 
-    def __init__(self, ws_url: str, timeout: float = 10.0) -> None:
-        if not ws_url.startswith("ws://"):
-            raise ValueError(f"Only local ws:// CDP URLs are supported: {ws_url}")
-        rest = ws_url[5:]
-        host_port, _, path = rest.partition("/")
-        path = "/" + path
-        host, _, port_str = host_port.partition(":")
-        port = int(port_str or 80)
+    MAX_HANDSHAKE_BYTES = _MAX_CDP_HANDSHAKE_BYTES
+    MAX_CONTROL_FRAME_BYTES = _MAX_CDP_CONTROL_FRAME_BYTES
+    DEFAULT_MAX_FRAME_BYTES = _DEFAULT_MAX_CDP_FRAME_BYTES
+    DEFAULT_MAX_MESSAGE_BYTES = _DEFAULT_MAX_CDP_MESSAGE_BYTES
+    MAX_FRAGMENTS = _MAX_CDP_FRAGMENTS
+    MAX_SEND_BYTES = _MAX_CDP_SEND_BYTES
+
+    def __init__(
+        self,
+        ws_url: str,
+        timeout: float = 10.0,
+        max_frame_bytes: int | None = None,
+        max_message_bytes: int | None = None,
+    ) -> None:
+        if not isinstance(ws_url, str) or len(ws_url) > 2048 or _RE_CTRL_OR_WS.search(ws_url):
+            raise ValueError("Invalid CDP WebSocket URL")
+        parsed = urlsplit(ws_url)
+        if parsed.scheme != "ws":
+            raise ValueError(f"Only local ws:// CDP URLs are supported: {parsed.scheme!r}")
+        if parsed.username is not None or parsed.password is not None or parsed.fragment:
+            raise ValueError("Refusing credentials or fragment in CDP WebSocket URL")
+        host = (parsed.hostname or "").lower()
         if host not in ("127.0.0.1", "localhost", "::1"):
             raise ValueError(f"Refusing non-local CDP host: {host}")
+        port = parsed.port if parsed.port is not None else 80
+        if not (1 <= port <= 65535):
+            raise ValueError(f"Invalid CDP port: {port}")
+
+        req_path = parsed.path or "/"
+        if parsed.query:
+            req_path = f"{req_path}?{parsed.query}"
+        if not req_path.startswith("/") or not all(0x21 <= ord(ch) <= 0x7E for ch in req_path):
+            raise ValueError("Invalid CDP WebSocket request path")
+
+        self.max_message_bytes = max(1024, int(max_message_bytes or self.DEFAULT_MAX_MESSAGE_BYTES))
+        self.max_frame_bytes = min(self.max_message_bytes, max(1024, int(max_frame_bytes or self.DEFAULT_MAX_FRAME_BYTES)))
 
         self._sock = socket.create_connection((host, port), timeout=timeout)
         self._sock.settimeout(timeout)
@@ -767,40 +977,68 @@ class LocalCDPClient:
         self._lock = threading.Lock()
         self._next_id = 1
 
-        sec_key = base64.b64encode(os.urandom(16)).decode("ascii")
-        req = (
-            f"GET {path} HTTP/1.1\r\n"
-            f"Host: {host}:{port}\r\n"
-            "Upgrade: websocket\r\n"
-            "Connection: Upgrade\r\n"
-            f"Sec-WebSocket-Key: {sec_key}\r\n"
-            "Sec-WebSocket-Version: 13\r\n\r\n"
-        )
-        self._sock.sendall(req.encode("ascii"))
+        try:
+            sec_key = base64.b64encode(os.urandom(16)).decode("ascii")
+            host_header = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+            # Deliberately omit Origin header so Chromium/Edge CDP accepts local non-browser
+            # clients without enabling wildcard remote-allow-origins.
+            req = (
+                f"GET {req_path} HTTP/1.1\r\n"
+                f"Host: {host_header}\r\n"
+                "Upgrade: websocket\r\n"
+                "Connection: Upgrade\r\n"
+                f"Sec-WebSocket-Key: {sec_key}\r\n"
+                "Sec-WebSocket-Version: 13\r\n\r\n"
+            )
+            self._sock.sendall(req.encode("ascii"))
 
-        while b"\r\n\r\n" not in self._recv_buf:
-            chunk = self._sock.recv(4096)
-            if not chunk:
-                raise ConnectionError("CDP WebSocket handshake closed unexpectedly")
-            self._recv_buf.extend(chunk)
+            while b"\r\n\r\n" not in self._recv_buf:
+                if len(self._recv_buf) >= self.MAX_HANDSHAKE_BYTES:
+                    raise ConnectionError("CDP WebSocket handshake header exceeds safety limit")
+                chunk = self._sock.recv(min(4096, self.MAX_HANDSHAKE_BYTES - len(self._recv_buf)))
+                if not chunk:
+                    raise ConnectionError("CDP WebSocket handshake closed unexpectedly")
+                self._recv_buf.extend(chunk)
 
-        hdr_end = bytes(self._recv_buf).index(b"\r\n\r\n") + 4
-        hdr_bytes = bytes(self._recv_buf[:hdr_end])
-        del self._recv_buf[:hdr_end]
+            hdr_end = bytes(self._recv_buf).index(b"\r\n\r\n") + 4
+            if hdr_end > self.MAX_HANDSHAKE_BYTES:
+                raise ConnectionError("CDP WebSocket handshake header exceeds safety limit")
+            hdr_bytes = bytes(self._recv_buf[:hdr_end])
+            del self._recv_buf[:hdr_end]
 
-        hdr_text = hdr_bytes.decode("latin-1", errors="replace")
-        if "101" not in hdr_text.splitlines()[0]:
-            raise ConnectionError(f"CDP WebSocket handshake rejected: {hdr_text.splitlines()[0]}")
+            hdr_lines = hdr_bytes.decode("latin-1", errors="replace").splitlines()
+            if not hdr_lines:
+                raise ConnectionError("Empty CDP WebSocket handshake response")
+            status_parts = hdr_lines[0].split(" ", 2)
+            if len(status_parts) < 2 or not status_parts[0].upper().startswith("HTTP/1.") or status_parts[1] != "101":
+                raise ConnectionError(f"CDP WebSocket handshake rejected: {hdr_lines[0][:120]}")
 
-        expected_accept = base64.b64encode(
-            hashlib.sha1((sec_key + _WS_GUID).encode("ascii")).digest()
-        ).decode("ascii")
-        if expected_accept not in hdr_text:
-            raise ConnectionError("CDP WebSocket Sec-WebSocket-Accept mismatch")
+            resp_headers: dict[str, str] = {}
+            for line in hdr_lines[1:]:
+                if ":" in line:
+                    hk, hv = line.split(":", 1)
+                    resp_headers[hk.strip().lower()] = hv.strip()
+
+            expected_accept = base64.b64encode(
+                hashlib.sha1((sec_key + _WS_GUID).encode("ascii")).digest()
+            ).decode("ascii")
+            actual_accept = resp_headers.get("sec-websocket-accept", "")
+            if not hmac.compare_digest(actual_accept, expected_accept):
+                raise ConnectionError("CDP WebSocket Sec-WebSocket-Accept mismatch")
+        except Exception:
+            try:
+                self._sock.close()
+            except Exception:
+                pass
+            raise
 
     def _read_exact(self, n: int) -> bytes:
+        if n < 0 or n > self.max_frame_bytes:
+            self.close()
+            raise ValueError(f"CDP WebSocket frame length {n} exceeds limit {self.max_frame_bytes}")
         while len(self._recv_buf) < n:
-            chunk = self._sock.recv(max(4096, n - len(self._recv_buf)))
+            needed = n - len(self._recv_buf)
+            chunk = self._sock.recv(min(65536, max(4096, needed)))
             if not chunk:
                 raise ConnectionError("CDP WebSocket connection closed")
             self._recv_buf.extend(chunk)
@@ -809,8 +1047,12 @@ class LocalCDPClient:
         return out
 
     def _send_frame(self, opcode: int, payload: bytes) -> None:
-        mask_key = os.urandom(4)
         length = len(payload)
+        if opcode >= 0x8 and length > self.MAX_CONTROL_FRAME_BYTES:
+            raise ValueError(f"CDP WebSocket control frame too large: {length}")
+        if length > self.MAX_SEND_BYTES:
+            raise ValueError(f"CDP WebSocket outbound payload exceeds limit: {length}")
+        mask_key = os.urandom(4)
         header = bytearray([0x80 | (opcode & 0x0F)])
         if length < 126:
             header.append(0x80 | length)
@@ -826,6 +1068,7 @@ class LocalCDPClient:
 
     def _recv_message(self) -> tuple[int, bytes]:
         fragments: list[bytes] = []
+        total_bytes = 0
         msg_opcode = 0
         while True:
             b1, b2 = self._read_exact(2)
@@ -837,6 +1080,24 @@ class LocalCDPClient:
                 length = struct.unpack("!H", self._read_exact(2))[0]
             elif length == 127:
                 length = struct.unpack("!Q", self._read_exact(8))[0]
+
+            if opcode >= 0x8:
+                if (not fin) or length > self.MAX_CONTROL_FRAME_BYTES:
+                    self.close()
+                    raise ValueError(f"Invalid CDP WebSocket control frame (fin={fin}, len={length})")
+            else:
+                if length > self.max_frame_bytes:
+                    self.close()
+                    raise ValueError(f"CDP WebSocket frame exceeds max size ({length} > {self.max_frame_bytes})")
+                if total_bytes + length > self.max_message_bytes:
+                    self.close()
+                    raise ValueError(
+                        f"CDP WebSocket message exceeds max size ({total_bytes + length} > {self.max_message_bytes})"
+                    )
+                if len(fragments) >= self.MAX_FRAGMENTS:
+                    self.close()
+                    raise ValueError("CDP WebSocket message exceeds maximum fragment count")
+
             mask_key = self._read_exact(4) if masked else b""
             payload = self._read_exact(length) if length else b""
             if masked:
@@ -850,9 +1111,18 @@ class LocalCDPClient:
             if opcode == 0xA:  # Pong
                 continue
 
-            if opcode != 0x0:
+            if opcode == 0x0:
+                if not fragments:
+                    self.close()
+                    raise ValueError("Unexpected CDP WebSocket continuation frame")
+            else:
+                if fragments:
+                    self.close()
+                    raise ValueError("Interleaved CDP WebSocket data frame during fragmentation")
                 msg_opcode = opcode
+
             fragments.append(payload)
+            total_bytes += length
             if fin:
                 return msg_opcode, b"".join(fragments)
 
@@ -867,7 +1137,9 @@ class LocalCDPClient:
             self._send_frame(0x1, body)
             deadline = time.monotonic() + timeout
             while True:
-                rem = max(0.2, deadline - time.monotonic())
+                rem = deadline - time.monotonic()
+                if rem <= 0:
+                    raise TimeoutError(f"CDP call timed out ({method})")
                 self._sock.settimeout(rem)
                 opcode, raw = self._recv_message()
                 if opcode != 0x1:
@@ -875,7 +1147,7 @@ class LocalCDPClient:
                 data = json.loads(raw.decode("utf-8", errors="replace"))
                 if data.get("id") == msg_id:
                     if "error" in data:
-                        raise RuntimeError(f"CDP error ({method}): {data['error']}")
+                        raise RuntimeError(_scrub_secrets(f"CDP error ({method}): {data['error']}"))
                     return data.get("result") or {}
 
     def evaluate(self, expression: str, timeout: float = 15.0) -> Any:
@@ -890,7 +1162,7 @@ class LocalCDPClient:
         )
         if "exceptionDetails" in res:
             desc = (res["exceptionDetails"].get("exception") or {}).get("description") or str(res["exceptionDetails"])
-            raise RuntimeError(f"JS error: {desc}")
+            raise RuntimeError(_scrub_secrets(f"JS error: {desc}"))
         return (res.get("result") or {}).get("value")
 
     def close(self) -> None:
@@ -905,7 +1177,7 @@ class LocalCDPClient:
 
 
 def find_system_browser_exe() -> Path | None:
-    """Locate system-installed Microsoft Edge or Google Chrome executable."""
+    """Locate system-installed Microsoft Edge or Google Chrome executable (resistant to CWD planting)."""
     local_app = os.environ.get("LOCALAPPDATA", "")
     prog_files = os.environ.get("ProgramFiles", r"C:\Program Files")
     prog_x86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
@@ -917,12 +1189,30 @@ def find_system_browser_exe() -> Path | None:
         Path(local_app) / "Google" / "Chrome" / "Application" / "chrome.exe",
     ]
     for c in candidates:
-        if c.exists():
-            return c
-    for name in ("msedge", "chrome"):
-        found = shutil.which(name)
+        if c.is_file():
+            return c.resolve()
+
+    cwd_resolved = Path.cwd().resolve()
+    safe_path_entries: list[str] = []
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        entry = entry.strip()
+        if not entry or entry in (".", ".."):
+            continue
+        try:
+            if Path(entry).resolve() == cwd_resolved:
+                continue
+        except OSError:
+            continue
+        safe_path_entries.append(entry)
+    sanitized_path = os.pathsep.join(safe_path_entries)
+    if not sanitized_path:
+        return None
+    for name in ("msedge.exe" if os.name == "nt" else "msedge", "chrome.exe" if os.name == "nt" else "chrome"):
+        found = shutil.which(name, path=sanitized_path)
         if found:
-            return Path(found)
+            fp = Path(found).resolve()
+            if fp.is_file() and (os.name != "nt" or fp.suffix.lower() == ".exe"):
+                return fp
     return None
 
 
@@ -1044,7 +1334,7 @@ class BrowserGeminiBackend:
 
     def _log(self, msg: str) -> None:
         try:
-            self.log_cb(msg)
+            self.log_cb(_scrub_secrets(msg))
         except Exception:
             pass
 
@@ -1163,46 +1453,97 @@ class BrowserGeminiBackend:
                 pass
         return True
 
+    @staticmethod
+    def _cdp_http_get_json(port: int, endpoint: str, timeout_sec: float = 3.0) -> Any:
+        """Query local 127.0.0.1 CDP JSON endpoint with proxy bypass, no redirects, and bounded size."""
+        port_i = int(port)
+        if not (1 <= port_i <= 65535):
+            raise ValueError(f"Invalid CDP port: {port_i}")
+        if endpoint not in ("/json", "/json/version"):
+            raise ValueError(f"Unexpected CDP endpoint: {endpoint!r}")
+        url = f"http://127.0.0.1:{port_i}{endpoint}"
+        with httpx.Client(
+            trust_env=False,
+            follow_redirects=False,
+            timeout=httpx.Timeout(timeout_sec, connect=min(timeout_sec, 2.0)),
+        ) as client:
+            with client.stream("GET", url) as resp:
+                if resp.status_code != 200:
+                    raise RuntimeError(f"CDP HTTP {resp.status_code}")
+                cl_raw = resp.headers.get("content-length")
+                if cl_raw is not None:
+                    try:
+                        if int(cl_raw) > _MAX_CDP_HTTP_JSON_BYTES:
+                            raise RuntimeError("CDP HTTP JSON response exceeds safety limit")
+                    except ValueError:
+                        pass
+                buf = bytearray()
+                for chunk in resp.iter_bytes():
+                    if not chunk:
+                        continue
+                    buf.extend(chunk)
+                    if len(buf) > _MAX_CDP_HTTP_JSON_BYTES:
+                        raise RuntimeError("CDP HTTP JSON response exceeds safety limit")
+                return json.loads(buf.decode("utf-8", errors="replace"))
+
+    @staticmethod
+    def _validate_cdp_ws_for_port(ws_url: Any, expected_port: int) -> str:
+        if not isinstance(ws_url, str) or _RE_CTRL_OR_WS.search(ws_url):
+            raise ValueError("Invalid CDP WebSocket URL from browser")
+        parsed = urlsplit(ws_url)
+        if parsed.scheme != "ws" or (parsed.hostname or "").lower() not in ("127.0.0.1", "localhost", "::1"):
+            raise ValueError("Refusing non-local CDP WebSocket target")
+        if parsed.port != int(expected_port):
+            raise ValueError("Refusing CDP WebSocket port mismatch")
+        return ws_url
+
     def _connect_cdp(self, port: int, timeout_sec: float = 10.0) -> LocalCDPClient:
         deadline = time.monotonic() + timeout_sec
         last_err: Exception | None = None
         while time.monotonic() < deadline:
             try:
-                r = httpx.get(f"http://127.0.0.1:{port}/json", timeout=1.5)
-                if r.status_code == 200:
-                    targets = r.json()
+                targets = self._cdp_http_get_json(port, "/json", timeout_sec=1.5)
+                if isinstance(targets, list):
                     page = next(
                         (
                             t
                             for t in targets
-                            if t.get("type") == "page"
-                            and ("gemini.google.com" in t.get("url", "") or "accounts.google.com" in t.get("url", ""))
+                            if isinstance(t, dict)
+                            and t.get("type") == "page"
+                            and _is_trusted_page_url(t.get("url", ""), _ALLOWED_GEMINI_LOGIN_HOSTS)
                         ),
                         None,
-                    ) or next((t for t in targets if t.get("type") == "page"), None)
+                    ) or next((t for t in targets if isinstance(t, dict) and t.get("type") == "page"), None)
                     if page and page.get("webSocketDebuggerUrl"):
-                        return LocalCDPClient(page["webSocketDebuggerUrl"], timeout=12.0)
+                        ws_url = self._validate_cdp_ws_for_port(page["webSocketDebuggerUrl"], port)
+                        return LocalCDPClient(ws_url, timeout=12.0)
             except Exception as exc:
                 last_err = exc
             time.sleep(0.25)
-        raise RuntimeError(f"브라우저 CDP 연결 시간 초과: {last_err}")
+        raise RuntimeError(_scrub_secrets(f"브라우저 CDP 연결 시간 초과: {last_err}"))
 
     def _check_dom_login_state(self, cdp: LocalCDPClient, selectors: dict[str, Any]) -> str:
         """Return 'READY', 'LOGIN_REQUIRED', or 'LOADING'."""
         js = f"""
         (() => {{
-            const href = location.href || "";
-            if (href.includes("accounts.google.com")) return "LOGIN_REQUIRED";
+            const proto = (location.protocol || "").toLowerCase();
+            const host = (location.hostname || "").toLowerCase();
+            if (host === "accounts.google.com") return "LOGIN_REQUIRED";
+            if (proto !== "https:" || host !== "gemini.google.com") return "LOADING";
             const isVisible = (el) => !!(el && (el.offsetWidth > 0 || el.offsetHeight > 0 || el.getClientRects().length > 0));
-            const inputSels = {json.dumps(selectors.get("input_selectors", []))};
-            const loginSels = {json.dumps(selectors.get("login_required_selectors", []))};
+            const inputSels = {_js_literal(selectors.get("input_selectors", []))};
+            const loginSels = {_js_literal(selectors.get("login_required_selectors", []))};
             for (const s of inputSels) {{
-                const el = document.querySelector(s);
-                if (isVisible(el)) return "READY";
+                try {{
+                    const el = document.querySelector(s);
+                    if (isVisible(el)) return "READY";
+                }} catch (e) {{}}
             }}
             for (const s of loginSels) {{
-                const el = document.querySelector(s);
-                if (isVisible(el)) return "LOGIN_REQUIRED";
+                try {{
+                    const el = document.querySelector(s);
+                    if (isVisible(el)) return "LOGIN_REQUIRED";
+                }} catch (e) {{}}
             }}
             return "LOADING";
         }})()
@@ -1233,14 +1574,17 @@ class BrowserGeminiBackend:
         if not code.startswith("web_dyn:") and code not in self._WEB_BASE_MODEL_PATTERNS:
             code = "hydrogen"
         model_pat = self._WEB_BASE_MODEL_PATTERNS.get(code, "")
-        dyn_mode_id = code[8:] if code.startswith("web_dyn:") else ""
+        dyn_mode_id = _RE_CTRL_NON_SPACE.sub("", code[8:]).strip()[:128] if code.startswith("web_dyn:") else ""
+        if code.startswith("web_dyn:") and not dyn_mode_id:
+            code = "hydrogen"
+            model_pat = self._WEB_BASE_MODEL_PATTERNS["hydrogen"]
         think_pat = self._WEB_THINKING_PATTERNS.get(lvl, self._WEB_THINKING_PATTERNS["low"])
         think_fallback_pat = self._WEB_THINKING_PATTERNS["high"] if lvl == "xhigh" else ""
         spec_key = f"{code}:{lvl}"
 
         js = f"""
         (async () => {{
-            const wantedSpec = {json.dumps(spec_key)};
+            const wantedSpec = {_js_literal(spec_key)};
             if (window.__vcModelSpec === wantedSpec) return "ALREADY_CACHED";
             const isVis = (el) => !!(el && (el.offsetWidth > 0 || el.offsetHeight > 0 || el.getClientRects().length > 0));
             const wait = (ms) => new Promise(r => setTimeout(r, ms));
@@ -1259,11 +1603,11 @@ class BrowserGeminiBackend:
             }}
             if (!btn) return "NO_BTN";
 
-            const dynModeId = {json.dumps(dyn_mode_id)};
-            const modelPat = {json.dumps(model_pat)};
+            const dynModeId = {_js_literal(dyn_mode_id)};
+            const modelPat = {_js_literal(model_pat)};
             const modelRe = modelPat ? new RegExp(modelPat, "i") : null;
-            const thinkRe = new RegExp({json.dumps(think_pat)}, "i");
-            const thinkFallbackRe = {json.dumps(think_fallback_pat)} ? new RegExp({json.dumps(think_fallback_pat)}, "i") : null;
+            const thinkRe = new RegExp({_js_literal(think_pat)}, "i");
+            const thinkFallbackRe = {_js_literal(think_fallback_pat)} ? new RegExp({_js_literal(think_fallback_pat)}, "i") : null;
             const menuSel = "[role='menuitem'], [role='menuitemradio'], [role='option'], button.mat-mdc-menu-item";
             const getItems = () => Array.from(document.querySelectorAll(menuSel)).filter(isVis);
 
@@ -1319,7 +1663,7 @@ class BrowserGeminiBackend:
                 await wait(120);
             }}
             if (upsellLocked) {{
-                return "UPSELL_LOCKED:" + {json.dumps(code)};
+                return "UPSELL_LOCKED:" + {_js_literal(code)};
             }}
             window.__vcModelSpec = wantedSpec;
             return "SWITCHED:" + wantedSpec;
@@ -1335,7 +1679,7 @@ class BrowserGeminiBackend:
                 )
             return res
         except Exception as exc:
-            self._log(f"⚠️ 제미니 웹 모델 선택 중 예외 ({code}:{lvl}): {exc}")
+            self._log(f"⚠️ 제미니 웹 모델 선택 중 예외 ({code}:{lvl}): {_scrub_secrets(exc)}")
             return "ERROR"
 
     def _ensure_fast_response_mode(self, cdp: LocalCDPClient) -> None:
@@ -1386,7 +1730,7 @@ class BrowserGeminiBackend:
             try:
                 res = self._cdp.evaluate(js, timeout=10.0) or {}
             except Exception as exc:
-                return [], f"PROBE_ERR:{exc}"
+                return [], f"PROBE_ERR:{_scrub_secrets(exc)}"
 
             if not isinstance(res, dict) or not res.get("ok"):
                 return [], str(res.get("reason", "NO_PICKER") if isinstance(res, dict) else "NO_PICKER")
@@ -1404,8 +1748,8 @@ class BrowserGeminiBackend:
             for row in rows:
                 if not isinstance(row, dict):
                     continue
-                mid = str(row.get("modeId") or "").strip()
-                txt = _RE_MULTI_SPACE.sub(" ", str(row.get("text") or "")).strip()
+                mid = _RE_CTRL_NON_SPACE.sub("", str(row.get("modeId") or "")).strip()[:128]
+                txt = _RE_MULTI_SPACE.sub(" ", str(row.get("text") or "")).strip()[:160]
                 is_disabled = bool(row.get("disabled"))
                 mid_low = mid.lower()
                 is_upsell = mid_low.startswith("upsell")
@@ -1481,12 +1825,12 @@ class BrowserGeminiBackend:
         """
         with self._io_lock:
             selectors = load_selectors_config(self.app_root)
-            target_url = str(selectors.get("url") or "https://gemini.google.com/app")
+            target_url = validate_gemini_url(selectors.get("url"))
             exe = find_system_browser_exe()
             if exe is None:
                 return False, "NO_BROWSER_FOUND"
 
-            profile_dir = get_browser_profile_dir()
+            profile_dir = get_browser_profile_dir().resolve()
 
             if self._cdp is not None and self.is_running() and not self.login_mode_active:
                 try:
@@ -1505,7 +1849,6 @@ class BrowserGeminiBackend:
                 f"--user-data-dir={profile_dir}",
                 "--remote-debugging-address=127.0.0.1",
                 f"--remote-debugging-port={port}",
-                "--remote-allow-origins=*",
                 "--no-first-run",
                 "--no-default-browser-check",
                 "--disable-background-timer-throttling",
@@ -1535,7 +1878,7 @@ class BrowserGeminiBackend:
                     pass
             except Exception as exc:
                 self._terminate_proc()
-                return False, f"CDP_CONNECT_FAILED: {exc}"
+                return False, f"CDP_CONNECT_FAILED: {_scrub_secrets(exc)}"
 
             deadline = time.monotonic() + 14.0
             state = "LOADING"
@@ -1592,7 +1935,7 @@ class BrowserGeminiBackend:
     def start_new_chat(self, force: bool = False) -> None:
         with self._io_lock:
             selectors = load_selectors_config(self.app_root)
-            target_url = str(selectors.get("url") or "https://gemini.google.com/app")
+            target_url = validate_gemini_url(selectors.get("url"))
             if self._cdp is None or not self.is_running() or self.login_mode_active:
                 self._conversation_primed = False
                 return
@@ -1601,14 +1944,16 @@ class BrowserGeminiBackend:
             new_sels = selectors.get("new_chat_selectors", [])
             inspect_js = f"""
             (() => {{
-                const respSels = {json.dumps(resp_sels)};
+                const respSels = {_js_literal(resp_sels)};
                 let respCount = 0;
                 for (const s of respSels) {{
-                    const nodes = document.querySelectorAll(s);
-                    if (nodes.length > 0) {{
-                        respCount = nodes.length;
-                        break;
-                    }}
+                    try {{
+                        const nodes = document.querySelectorAll(s);
+                        if (nodes.length > 0) {{
+                            respCount = nodes.length;
+                            break;
+                        }}
+                    }} catch (e) {{}}
                 }}
                 return {{
                     respCount,
@@ -1634,14 +1979,16 @@ class BrowserGeminiBackend:
             clicked_spa = False
             click_new_js = f"""
             (() => {{
-                const newSels = {json.dumps(new_sels)};
+                const newSels = {_js_literal(new_sels)};
                 const isVisible = (el) => !!(el && (el.offsetWidth > 0 || el.offsetHeight > 0 || el.getClientRects().length > 0));
                 for (const s of newSels) {{
-                    const el = document.querySelector(s);
-                    if (isVisible(el)) {{
-                        el.click();
-                        return "CLICKED";
-                    }}
+                    try {{
+                        const el = document.querySelector(s);
+                        if (isVisible(el)) {{
+                            el.click();
+                            return "CLICKED";
+                        }}
+                    }} catch (e) {{}}
                 }}
                 return "NONE";
             }})()
@@ -1671,7 +2018,7 @@ class BrowserGeminiBackend:
                 nav_js = (
                     "window.__vcStalePage = true; "
                     "window.__vcModelSpec = ''; "
-                    f"window.location.href = {json.dumps(target_url)};"
+                    f"window.location.href = {_js_literal(target_url)};"
                 )
                 try:
                     self._cdp.evaluate(nav_js, timeout=8.0)
@@ -1707,32 +2054,41 @@ class BrowserGeminiBackend:
 
         setup_js = f"""
         (async () => {{
-            const respSels = {json.dumps(resp_sels)};
-            const stopSels = {json.dumps(stop_sels)};
-            const inputSels = {json.dumps(input_sels)};
+            if ((location.protocol || "").toLowerCase() !== "https:" || (location.hostname || "").toLowerCase() !== "gemini.google.com") {{
+                return "UNTRUSTED_ORIGIN";
+            }}
+            const respSels = {_js_literal(resp_sels)};
+            const stopSels = {_js_literal(stop_sels)};
+            const inputSels = {_js_literal(input_sels)};
             const isVisible = (el) => !!(el && (el.offsetWidth > 0 || el.offsetHeight > 0 || el.getClientRects().length > 0));
             const wait = (ms) => new Promise(r => setTimeout(r, ms));
             const getResponses = () => {{
                 for (const s of respSels) {{
-                    const nodes = Array.from(document.querySelectorAll(s));
-                    if (nodes.length > 0) return nodes;
+                    try {{
+                        const nodes = Array.from(document.querySelectorAll(s));
+                        if (nodes.length > 0) return nodes;
+                    }} catch (e) {{}}
                 }}
                 return [];
             }};
             const isGenerating = () => {{
                 for (const s of stopSels) {{
-                    if (isVisible(document.querySelector(s))) return true;
+                    try {{
+                        if (isVisible(document.querySelector(s))) return true;
+                    }} catch (e) {{}}
                 }}
                 return false;
             }};
 
             if (isGenerating()) {{
                 for (const s of stopSels) {{
-                    const sb = document.querySelector(s);
-                    if (isVisible(sb)) {{
-                        try {{ sb.click(); }} catch (e) {{}}
-                        break;
-                    }}
+                    try {{
+                        const sb = document.querySelector(s);
+                        if (isVisible(sb)) {{
+                            try {{ sb.click(); }} catch (e) {{}}
+                            break;
+                        }}
+                    }} catch (e) {{}}
                 }}
                 for (let i = 0; i < 6 && isGenerating(); i++) {{
                     await wait(75);
@@ -1793,8 +2149,10 @@ class BrowserGeminiBackend:
 
             let inputEl = null;
             for (const s of inputSels) {{
-                const el = document.querySelector(s);
-                if (isVisible(el)) {{ inputEl = el; break; }}
+                try {{
+                    const el = document.querySelector(s);
+                    if (isVisible(el)) {{ inputEl = el; break; }}
+                }} catch (e) {{}}
             }}
             if (!inputEl) return "NO_INPUT";
             inputEl.focus();
@@ -1821,14 +2179,16 @@ class BrowserGeminiBackend:
 
         click_js = f"""
         (() => {{
-            const sendSels = {json.dumps(send_sels)};
+            const sendSels = {_js_literal(send_sels)};
             const isVisible = (el) => !!(el && (el.offsetWidth > 0 || el.offsetHeight > 0 || el.getClientRects().length > 0));
             for (const s of sendSels) {{
-                const btn = document.querySelector(s);
-                if (isVisible(btn)) {{
-                    btn.click();
-                    return "CLICKED";
-                }}
+                try {{
+                    const btn = document.querySelector(s);
+                    if (isVisible(btn)) {{
+                        btn.click();
+                        return "CLICKED";
+                    }}
+                }} catch (e) {{}}
             }}
             return "NO_BUTTON";
         }})()
@@ -1870,11 +2230,13 @@ class BrowserGeminiBackend:
                 if cancel_event is not None and cancel_event.is_set():
                     try:
                         stop_js = f"""(() => {{
-                            const sels = {json.dumps(stop_sels)};
+                            const sels = {_js_literal(stop_sels)};
                             const isVis = (el) => !!(el && (el.offsetWidth > 0 || el.offsetHeight > 0 || el.getClientRects().length > 0));
                             for (const s of sels) {{
-                                const b = document.querySelector(s);
-                                if (isVis(b)) {{ try {{ b.click(); }} catch (e) {{}} return "STOPPED"; }}
+                                try {{
+                                    const b = document.querySelector(s);
+                                    if (isVis(b)) {{ try {{ b.click(); }} catch (e) {{}} return "STOPPED"; }}
+                                }} catch (e) {{}}
                             }}
                             return "NONE";
                         }})()"""
@@ -1918,7 +2280,7 @@ class BrowserGeminiBackend:
         """Open/reuse a hidden 2nd CDP tab sharing BrowserProfile for background subtitle translation."""
         with self._trans_lock:
             selectors = load_selectors_config(self.app_root)
-            target_url = str(selectors.get("url") or "https://gemini.google.com/app")
+            target_url = validate_gemini_url(selectors.get("url"))
 
             if self._trans_cdp is not None and self.is_running() and not self.login_mode_active:
                 try:
@@ -1940,10 +2302,11 @@ class BrowserGeminiBackend:
             if os.name == "nt" and self._proc is not None:
                 before_hwnds = set(_get_windows_for_pids(_get_child_pids(self._proc.pid)))
 
-            ver = httpx.get(f"http://127.0.0.1:{port}/json/version", timeout=3.0).json()
-            browser_ws = str(ver.get("webSocketDebuggerUrl") or "")
-            if not browser_ws:
+            ver = self._cdp_http_get_json(port, "/json/version", timeout_sec=3.0)
+            browser_ws_raw = str((ver if isinstance(ver, dict) else {}).get("webSocketDebuggerUrl") or "")
+            if not browser_ws_raw:
                 raise RuntimeError("브라우저 CDP Version WebSocket을 찾지 못했습니다.")
+            browser_ws = self._validate_cdp_ws_for_port(browser_ws_raw, port)
 
             tmp_browser = LocalCDPClient(browser_ws, timeout=8.0)
             try:
@@ -1959,13 +2322,14 @@ class BrowserGeminiBackend:
             if not target_id:
                 raise RuntimeError("번역 백그라운드 탭 생성에 실패했습니다.")
 
-            targets = httpx.get(f"http://127.0.0.1:{port}/json", timeout=3.0).json()
-            page = next((t for t in targets if t.get("id") == target_id), None)
+            targets = self._cdp_http_get_json(port, "/json", timeout_sec=3.0)
+            page = next((t for t in (targets if isinstance(targets, list) else []) if isinstance(t, dict) and t.get("id") == target_id), None)
             if not page or not page.get("webSocketDebuggerUrl"):
                 raise RuntimeError("번역 탭 WebSocket URL을 찾지 못했습니다.")
 
+            trans_ws = self._validate_cdp_ws_for_port(page["webSocketDebuggerUrl"], port)
             self._trans_target_id = target_id
-            self._trans_cdp = LocalCDPClient(page["webSocketDebuggerUrl"], timeout=12.0)
+            self._trans_cdp = LocalCDPClient(trans_ws, timeout=12.0)
             self._trans_turn_count = 0
             try:
                 self._trans_cdp.call("Emulation.setFocusEmulationEnabled", {"enabled": True}, timeout=4.0)
@@ -2020,12 +2384,12 @@ class BrowserGeminiBackend:
 
         with self._trans_lock:
             selectors = load_selectors_config(self.app_root)
-            target_url = str(selectors.get("url") or "https://gemini.google.com/app")
+            target_url = validate_gemini_url(selectors.get("url"))
             for attempt in range(2):
                 try:
                     cdp = self._ensure_translator_cdp()
                     if self._trans_turn_count >= 24:
-                        cdp.evaluate(f"window.location.href = {json.dumps(target_url)};", timeout=8.0)
+                        cdp.evaluate(f"window.location.href = {_js_literal(target_url)};", timeout=8.0)
                         wait_dl = time.monotonic() + 10.0
                         while time.monotonic() < wait_dl:
                             if self._check_dom_login_state(cdp, selectors) == "READY":
@@ -2096,12 +2460,12 @@ class BrowserGeminiBackend:
 
         with self._trans_lock:
             selectors = load_selectors_config(self.app_root)
-            target_url = str(selectors.get("url") or "https://gemini.google.com/app")
+            target_url = validate_gemini_url(selectors.get("url"))
             for attempt in range(2):
                 try:
                     cdp = self._ensure_translator_cdp()
                     if fresh_chat or self._trans_turn_count >= 12:
-                        cdp.evaluate(f"window.location.href = {json.dumps(target_url)};", timeout=8.0)
+                        cdp.evaluate(f"window.location.href = {_js_literal(target_url)};", timeout=8.0)
                         wait_dl = time.monotonic() + 12.0
                         while time.monotonic() < wait_dl:
                             if self._check_dom_login_state(cdp, selectors) == "READY":
@@ -2329,12 +2693,73 @@ class OfficialGeminiApiBackend:
             return self._client_obj
         with self._client_lock:
             if self._client_obj is None:
-                self._client_obj = httpx.Client(timeout=httpx.Timeout(35.0, connect=8.0))
+                self._client_obj = httpx.Client(
+                    verify=True,
+                    follow_redirects=False,
+                    timeout=httpx.Timeout(35.0, connect=8.0, read=30.0, write=10.0, pool=5.0),
+                    limits=httpx.Limits(max_keepalive_connections=6, max_connections=12, keepalive_expiry=60.0),
+                )
             return self._client_obj
 
     @_client.setter
     def _client(self, client: httpx.Client | None) -> None:
         self._client_obj = client
+
+    def _request_json_bounded(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: dict[str, str],
+        params: dict[str, Any] | None = None,
+        json_body: dict[str, Any] | None = None,
+        timeout: float = 15.0,
+        max_bytes: int = _MAX_GEMINI_API_JSON_BYTES,
+        secret_to_scrub: str = "",
+    ) -> tuple[int, Any]:
+        """Execute an HTTPS-only Gemini API JSON request with bounded response size and scrubbed errors."""
+        safe_url = _validate_https_url(url, _ALLOWED_GEMINI_API_HOSTS)
+        client = self._client
+        try:
+            if isinstance(client, httpx.Client):
+                with client.stream(
+                    method,
+                    safe_url,
+                    headers=headers,
+                    params=params,
+                    json=json_body,
+                    timeout=timeout,
+                ) as resp:
+                    if resp.status_code != 200:
+                        return resp.status_code, None
+                    cl_raw = resp.headers.get("content-length")
+                    if cl_raw is not None:
+                        try:
+                            if int(cl_raw) > max_bytes:
+                                raise RuntimeError("Gemini API response exceeds safety size limit")
+                        except ValueError:
+                            pass
+                    buf = bytearray()
+                    for chunk in resp.iter_bytes():
+                        if not chunk:
+                            continue
+                        buf.extend(chunk)
+                        if len(buf) > max_bytes:
+                            raise RuntimeError("Gemini API response exceeds safety size limit")
+                    return 200, json.loads(buf.decode("utf-8", errors="replace"))
+
+            if method.upper() == "GET":
+                resp = client.get(safe_url, params=params, headers=headers, timeout=timeout)
+            else:
+                resp = client.post(safe_url, headers=headers, json=json_body, timeout=timeout)
+            if resp.status_code != 200:
+                return resp.status_code, None
+            raw_content = getattr(resp, "content", None)
+            if isinstance(raw_content, (bytes, bytearray)) and len(raw_content) > max_bytes:
+                raise RuntimeError("Gemini API response exceeds safety size limit")
+            return 200, resp.json()
+        except httpx.HTTPError as exc:
+            raise RuntimeError(_scrub_secrets(f"Gemini API 네트워크 오류: {exc}", extra_secrets=(secret_to_scrub,))) from None
 
     def start_new_chat(self, system_prompt: str = "") -> None:
         with self._lock:
@@ -2383,16 +2808,17 @@ class OfficialGeminiApiBackend:
         if not clean_key:
             return []
         url = "https://generativelanguage.googleapis.com/v1beta/models"
-        resp = self._client.get(
+        status_code, data = self._request_json_bounded(
+            "GET",
             url,
-            params={"pageSize": 200},
             headers={"x-goog-api-key": clean_key},
+            params={"pageSize": 200},
             timeout=timeout_sec,
+            secret_to_scrub=clean_key,
         )
-        if resp.status_code != 200:
-            raise RuntimeError(f"Gemini 모델 목록 조회 실패 HTTP {resp.status_code}")
-        data = resp.json()
-        models = data.get("models") or []
+        if status_code != 200:
+            raise RuntimeError(f"Gemini 모델 목록 조회 실패 HTTP {status_code}")
+        models = (data if isinstance(data, dict) else {}).get("models") or []
         skip_tokens = ("embedding", "aqa", "imagen", "veo", "tts", "robotics", "computer-use", "decision", "lyria")
         out: list[str] = []
         for m in models:
@@ -2408,6 +2834,8 @@ class OfficialGeminiApiBackend:
             if not low.startswith("gemini-"):
                 continue
             if any(tok in low for tok in skip_tokens):
+                continue
+            if not _RE_SAFE_GEMINI_MODEL.fullmatch(name) or ".." in name:
                 continue
             out.append(name)
         return sorted(set(out))
@@ -2427,7 +2855,10 @@ class OfficialGeminiApiBackend:
         clean_jp = (jp_text or "").strip()
         if not clean_key or not clean_jp:
             return ""
-        clean_model = (model or "gemini-2.5-flash").strip()
+        try:
+            clean_model = _validate_gemini_model_id(model)
+        except ValueError:
+            return ""
         eff_timeout = float(timeout_sec) if timeout_sec is not None else {"low": 15.0, "medium": 24.0, "high": 40.0, "xhigh": 55.0}.get(thinking_level, 18.0)
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{clean_model}:generateContent"
         ctx_block = ""
@@ -2448,23 +2879,26 @@ class OfficialGeminiApiBackend:
             "generationConfig": gen_cfg,
         }
         try:
-            resp = self._client.post(
+            status_code, data = self._request_json_bounded(
+                "POST",
                 url,
                 headers={"x-goog-api-key": clean_key, "Content-Type": "application/json"},
-                json=payload,
+                json_body=payload,
                 timeout=eff_timeout,
+                secret_to_scrub=clean_key,
             )
-            if resp.status_code == 400 and "thinkingConfig" in gen_cfg:
+            if status_code == 400 and "thinkingConfig" in gen_cfg:
                 payload["generationConfig"] = base_gen
-                resp = self._client.post(
+                status_code, data = self._request_json_bounded(
+                    "POST",
                     url,
                     headers={"x-goog-api-key": clean_key, "Content-Type": "application/json"},
-                    json=payload,
+                    json_body=payload,
                     timeout=eff_timeout,
+                    secret_to_scrub=clean_key,
                 )
-            if resp.status_code != 200:
+            if status_code != 200 or not isinstance(data, dict):
                 return ""
-            data = resp.json()
             cands = data.get("candidates") or []
             if not cands:
                 return ""
@@ -2488,7 +2922,10 @@ class OfficialGeminiApiBackend:
         clean_prompt = (prompt or "").strip()
         if not clean_key or not clean_prompt:
             return ""
-        clean_model = (model or "gemini-2.5-flash").strip()
+        try:
+            clean_model = _validate_gemini_model_id(model)
+        except ValueError:
+            return ""
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{clean_model}:generateContent"
         base_gen = {"temperature": 0.2, "maxOutputTokens": max(300, int(max_output_tokens))}
         gen_cfg = self._build_gen_config_with_thinking(base_gen, clean_model, thinking_level, extra_level_budget=1024)
@@ -2496,24 +2933,28 @@ class OfficialGeminiApiBackend:
             "contents": [{"role": "user", "parts": [{"text": clean_prompt}]}],
             "generationConfig": gen_cfg,
         }
+        eff_timeout = max(15.0, float(timeout_sec or 40.0))
         try:
-            resp = self._client.post(
+            status_code, data = self._request_json_bounded(
+                "POST",
                 url,
                 headers={"x-goog-api-key": clean_key, "Content-Type": "application/json"},
-                json=payload,
-                timeout=max(15.0, float(timeout_sec or 40.0)),
+                json_body=payload,
+                timeout=eff_timeout,
+                secret_to_scrub=clean_key,
             )
-            if resp.status_code == 400 and "thinkingConfig" in gen_cfg:
+            if status_code == 400 and "thinkingConfig" in gen_cfg:
                 payload["generationConfig"] = base_gen
-                resp = self._client.post(
+                status_code, data = self._request_json_bounded(
+                    "POST",
                     url,
                     headers={"x-goog-api-key": clean_key, "Content-Type": "application/json"},
-                    json=payload,
-                    timeout=max(15.0, float(timeout_sec or 40.0)),
+                    json_body=payload,
+                    timeout=eff_timeout,
+                    secret_to_scrub=clean_key,
                 )
-            if resp.status_code != 200:
+            if status_code != 200 or not isinstance(data, dict):
                 return ""
-            data = resp.json()
             cands = data.get("candidates") or []
             if not cands:
                 return ""
@@ -2539,8 +2980,11 @@ class OfficialGeminiApiBackend:
         clean_key = (api_key or "").strip()
         if not clean_key:
             raise RuntimeError("Gemini API Key가 비어 있습니다. [⚙️ 설정 열기]에서 키를 입력해 주세요.")
-        clean_model = (model or "gemini-2.5-flash").strip()
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{clean_model}:streamGenerateContent?alt=sse"
+        clean_model = _validate_gemini_model_id(model)
+        url = _validate_https_url(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{clean_model}:streamGenerateContent?alt=sse",
+            _ALLOWED_GEMINI_API_HOSTS,
+        )
 
         with self._lock:
             if system_prompt:
@@ -2577,52 +3021,81 @@ class OfficialGeminiApiBackend:
                 req["system_instruction"] = {"parts": [{"text": sys_instr}]}
             return req
 
+        def _read_bounded_err_body(resp: Any) -> str:
+            iter_bytes = getattr(resp, "iter_bytes", None)
+            if callable(iter_bytes):
+                buf = bytearray()
+                for chunk in iter_bytes():
+                    if not chunk:
+                        continue
+                    need = _MAX_GEMINI_API_ERROR_BYTES - len(buf)
+                    if need <= 0:
+                        break
+                    buf.extend(chunk[:need])
+                    if len(buf) >= _MAX_GEMINI_API_ERROR_BYTES:
+                        break
+                raw_bytes = bytes(buf)
+            else:
+                raw_bytes = bytes(resp.read() or b"")[:_MAX_GEMINI_API_ERROR_BYTES]
+            return _scrub_secrets(raw_bytes.decode("utf-8", errors="replace"), extra_secrets=(clean_key,))
+
         def _consume_sse(req_payload: dict[str, Any]) -> tuple[int, str]:
             nonlocal is_first
-            with self._client.stream(
-                "POST",
-                url,
-                headers={"x-goog-api-key": clean_key, "Content-Type": "application/json"},
-                json=req_payload,
-            ) as resp:
-                if resp.status_code != 200:
-                    err_body = resp.read().decode("utf-8", errors="replace")
-                    return resp.status_code, err_body
+            try:
+                with self._client.stream(
+                    "POST",
+                    url,
+                    headers={"x-goog-api-key": clean_key, "Content-Type": "application/json"},
+                    json=req_payload,
+                ) as resp:
+                    if resp.status_code != 200:
+                        err_body = _read_bounded_err_body(resp)
+                        return resp.status_code, err_body
 
-                for line in resp.iter_lines():
-                    if cancel_event is not None and cancel_event.is_set():
-                        break
-                    if not line or not line.startswith("data:"):
-                        continue
-                    data_str = line[5:].strip()
-                    if data_str == "[DONE]":
-                        break
-                    try:
-                        obj = json.loads(data_str)
-                    except Exception:
-                        continue
-                    cands = obj.get("candidates") or []
-                    if not cands:
-                        continue
-                    parts = ((cands[0].get("content") or {}).get("parts")) or []
-                    delta = self._extract_non_thought_text(parts)
-                    if not delta:
-                        continue
-                    raw_full.append(delta)
-                    if bilingual_active:
-                        assert isinstance(splitter, BilingualSentenceStreamParser)
-                        assert on_sentence_pair is not None
-                        for jp_sent, kr_fut in splitter.feed_delta(delta):
-                            on_sentence_pair(jp_sent, kr_fut, is_first)
-                            emitted_parts.append(jp_sent)
-                            is_first = False
-                    else:
-                        assert isinstance(splitter, IncrementalSentenceSplitter)
-                        for sent in splitter.feed_delta(delta):
-                            on_sentence(sent, is_first)
-                            emitted_parts.append(sent)
-                            is_first = False
-                return 200, ""
+                    total_chars = 0
+                    for line in resp.iter_lines():
+                        if cancel_event is not None and cancel_event.is_set():
+                            break
+                        if not line:
+                            continue
+                        if len(line) > _MAX_GEMINI_SSE_LINE_CHARS:
+                            raise RuntimeError("Gemini API SSE line exceeds safety size limit")
+                        total_chars += len(line)
+                        if total_chars > _MAX_GEMINI_SSE_TOTAL_CHARS:
+                            raise RuntimeError("Gemini API SSE response exceeds safety size limit")
+                        if not line.startswith("data:"):
+                            continue
+                        data_str = line[5:].strip()
+                        if data_str == "[DONE]":
+                            break
+                        try:
+                            obj = json.loads(data_str)
+                        except Exception:
+                            continue
+                        cands = obj.get("candidates") or []
+                        if not cands:
+                            continue
+                        parts = ((cands[0].get("content") or {}).get("parts")) or []
+                        delta = self._extract_non_thought_text(parts)
+                        if not delta:
+                            continue
+                        raw_full.append(delta)
+                        if bilingual_active:
+                            assert isinstance(splitter, BilingualSentenceStreamParser)
+                            assert on_sentence_pair is not None
+                            for jp_sent, kr_fut in splitter.feed_delta(delta):
+                                on_sentence_pair(jp_sent, kr_fut, is_first)
+                                emitted_parts.append(jp_sent)
+                                is_first = False
+                        else:
+                            assert isinstance(splitter, IncrementalSentenceSplitter)
+                            for sent in splitter.feed_delta(delta):
+                                on_sentence(sent, is_first)
+                                emitted_parts.append(sent)
+                                is_first = False
+                    return 200, ""
+            except httpx.HTTPError as exc:
+                raise RuntimeError(_scrub_secrets(f"Gemini API 스트리밍 오류: {exc}", extra_secrets=(clean_key,))) from None
 
         def _run_attempt(req_user_text: str) -> tuple[str, str]:
             nonlocal is_first
@@ -2637,7 +3110,8 @@ class OfficialGeminiApiBackend:
                 req_payload["generationConfig"] = base_gen
                 status_code, err_body = _consume_sse(req_payload)
             if status_code != 200:
-                raise RuntimeError(f"Gemini API HTTP {status_code}: {err_body[:240]}")
+                safe_err = _scrub_secrets(err_body[:240], extra_secrets=(clean_key,))
+                raise RuntimeError(f"Gemini API HTTP {status_code}: {safe_err}")
 
             if bilingual_active:
                 assert isinstance(splitter, BilingualSentenceStreamParser)
@@ -2753,7 +3227,7 @@ class GeminiSessionManager:
         use_korean_lock: bool = False,
     ) -> str:
         raw = f"{backend_mode}|{int(bool(use_japanese_lock))}|{int(bool(use_korean_lock))}|{int(bool(jp_beginner_coach))}|{persona_prompt.strip()}|{ko_style_guide.strip()}"
-        return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
     def prime_and_greet(
         self,

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -22,6 +23,8 @@ from typing import Any
 
 import numpy as np
 import soundfile as sf
+
+from src.utils.app_paths import get_trigger_cache_dir
 
 PROACTIVE_PROMPT_MARKER = "【最重要・会話主導（リード）＆逆質問プロトコル】"
 
@@ -81,25 +84,124 @@ def build_proactive_lead_prompt(char_data: dict[str, Any], base_prompt: str) -> 
     return f"{clean_base}{lead_block}".strip()
 
 
-def _synth_sapi_wav_via_powershell(phrase: str, out_wav: Path) -> bool:
-    """Synthesize a clean WAV file using Windows built-in System.Speech (0 API cost)."""
-    out_wav.parent.mkdir(parents=True, exist_ok=True)
-    safe_phrase = phrase.replace("'", "''")
-    safe_path = str(out_wav.resolve()).replace("'", "''")
-    ps_script = (
-        "Add-Type -AssemblyName System.Speech; "
-        "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
-        "$voices = $s.GetInstalledVoices() | ForEach-Object { $_.VoiceInfo.Name }; "
-        "if ($voices -contains 'Microsoft Heami Desktop') { $s.SelectVoice('Microsoft Heami Desktop') } "
-        "elseif ($voices -contains 'Microsoft Haruka Desktop') { $s.SelectVoice('Microsoft Haruka Desktop') } "
-        "$s.Rate = 2; "
-        "$s.Volume = 100; "
-        f"$s.SetOutputToWaveFile('{safe_path}'); "
-        f"$s.Speak('{safe_phrase}'); "
-        "$s.Dispose();"
-    )
+_SAFE_TRIGGER_KEY_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_MAX_TRIGGER_PHRASE_LEN = 500
+_MAX_TRIGGER_WAV_BYTES = 16 * 1024 * 1024  # 16 MiB cap on cached trigger WAV files
+_MAX_TRIGGER_WAV_SAMPLES = 48000 * 60 * 2  # max 60s stereo
+_SENSITIVE_CHILD_ENV_VARS = frozenset(
+    {
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "FISH_API_KEY",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+    }
+)
+
+# Static PowerShell script with ZERO string interpolation (immune to command/quote injection
+# and avoids AV-suspicious -EncodedCommand). Data arrives strictly via UTF-16LE env vars.
+_SAPI_SYNTH_PS_SCRIPT = (
+    "$ErrorActionPreference = 'Stop'; "
+    "Add-Type -AssemblyName System.Speech; "
+    "$outPath = $env:VC_TTS_OUT_WAV; "
+    "$phrase = $env:VC_TTS_PHRASE; "
+    "if ([string]::IsNullOrWhiteSpace($outPath) -or [string]::IsNullOrWhiteSpace($phrase)) { exit 2 }; "
+    "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
+    "try { "
+    "$voices = $s.GetInstalledVoices() | ForEach-Object { $_.VoiceInfo.Name }; "
+    "if ($voices -contains 'Microsoft Heami Desktop') { $s.SelectVoice('Microsoft Heami Desktop') } "
+    "elseif ($voices -contains 'Microsoft Haruka Desktop') { $s.SelectVoice('Microsoft Haruka Desktop') }; "
+    "$s.Rate = 2; "
+    "$s.Volume = 100; "
+    "$s.SetOutputToWaveFile($outPath); "
+    "$s.Speak($phrase); "
+    "} finally { "
+    "$s.Dispose(); "
+    "}"
+)
+
+
+def _resolve_system_powershell_exe() -> str:
+    """Resolve the trusted Windows System32 PowerShell executable without CWD hijacking."""
+    if os.name == "nt":
+        sys_root = Path(os.environ.get("SystemRoot") or r"C:\Windows")
+        candidate = sys_root / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+        if candidate.is_file():
+            return str(candidate)
+        raw_path = os.environ.get("PATH", "")
+        cwd_resolved = Path.cwd().resolve()
+        safe_dirs = []
+        for entry in raw_path.split(os.pathsep):
+            entry = entry.strip()
+            if not entry or entry in (".", ".."):
+                continue
+            try:
+                if Path(entry).resolve() == cwd_resolved:
+                    continue
+            except OSError:
+                continue
+            safe_dirs.append(entry)
+        found = shutil.which("powershell.exe", path=os.pathsep.join(safe_dirs))
+        if found:
+            return str(Path(found).resolve())
+        raise FileNotFoundError("Trusted Windows PowerShell executable not found")
+    found = shutil.which("powershell")
+    if not found:
+        raise FileNotFoundError("PowerShell executable not found")
+    return str(Path(found).resolve())
+
+
+def _validate_trigger_wav_path(out_wav: Path, allowed_root: Path | None = None) -> Path:
+    """Ensure trigger WAV target path stays strictly inside the allowed trigger cache directory."""
+    raw_str = str(out_wav)
+    if not raw_str or "\x00" in raw_str or len(raw_str) > 1024:
+        raise ValueError("Invalid trigger WAV output path")
+
+    root_raw = Path(allowed_root) if allowed_root is not None else get_trigger_cache_dir()
+    if root_raw.is_symlink():
+        raise ValueError("Refusing symlink trigger cache root directory")
+    root = root_raw.resolve()
+
+    target = Path(out_wav)
+    if target.is_symlink() or target.parent.is_symlink():
+        raise ValueError("Refusing symlink trigger WAV target path")
+
+    resolved_out = target.resolve()
+    if resolved_out == root or not resolved_out.is_relative_to(root):
+        raise ValueError(f"Refusing to write trigger WAV outside trigger cache directory: {resolved_out.name}")
+    if resolved_out.suffix.lower() != ".wav":
+        raise ValueError("Trigger WAV output path must have a .wav extension")
+    return resolved_out
+
+
+def _synth_sapi_wav_via_powershell(
+    phrase: str,
+    out_wav: Path,
+    allowed_root: Path | None = None,
+) -> bool:
+    """Synthesize a clean WAV file using Windows built-in System.Speech (0 API cost, zero code interpolation)."""
+    if not isinstance(phrase, str):
+        raise ValueError("TTS phrase must be a string")
+    if "\x00" in phrase:
+        raise ValueError("Invalid NUL byte in TTS phrase")
+    clean_phrase = phrase.strip()
+    if not clean_phrase or len(clean_phrase) > _MAX_TRIGGER_PHRASE_LEN:
+        raise ValueError("TTS phrase is empty or exceeds maximum length")
+
+    resolved_out = _validate_trigger_wav_path(Path(out_wav), allowed_root=allowed_root)
+    resolved_out.parent.mkdir(parents=True, exist_ok=True)
+    if resolved_out.is_symlink() or resolved_out.parent.is_symlink():
+        raise ValueError("Refusing symlink trigger WAV path")
+
+    child_env = {k: v for k, v in os.environ.items() if k.upper() not in _SENSITIVE_CHILD_ENV_VARS}
+    child_env["VC_TTS_PHRASE"] = clean_phrase
+    child_env["VC_TTS_OUT_WAV"] = str(resolved_out)
+
+    ps_exe = _resolve_system_powershell_exe()
     res = subprocess.run(
-        ["powershell", "-NoProfile", "-Command", ps_script],
+        [ps_exe, "-NoProfile", "-NonInteractive", "-Command", _SAPI_SYNTH_PS_SCRIPT],
+        env=child_env,
+        stdin=subprocess.DEVNULL,
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -107,7 +209,12 @@ def _synth_sapi_wav_via_powershell(phrase: str, out_wav: Path) -> bool:
         timeout=15,
         creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
     )
-    return res.returncode == 0 and out_wav.exists() and out_wav.stat().st_size > 1000
+    return (
+        res.returncode == 0
+        and resolved_out.exists()
+        and (not resolved_out.is_symlink())
+        and 1000 < resolved_out.stat().st_size <= _MAX_TRIGGER_WAV_BYTES
+    )
 
 
 def _trim_fade_normalize(audio: np.ndarray, sr: int) -> np.ndarray:
@@ -140,19 +247,34 @@ def ensure_trigger_wavs_cached(cache_dir: Path) -> dict[str, tuple[np.ndarray, i
     Ensure local trigger WAV files exist in `cache_dir` (synthesizing missing ones via SAPI)
     and return trimmed/normalized `(float32_mono_array, sample_rate)` dict in memory.
     """
-    cache_dir.mkdir(parents=True, exist_ok=True)
+    raw_cache = Path(cache_dir)
+    if "\x00" in str(raw_cache) or raw_cache.is_symlink():
+        raise ValueError("Invalid trigger cache directory")
+    resolved_cache_dir = raw_cache.resolve()
+    resolved_cache_dir.mkdir(parents=True, exist_ok=True)
     loaded: dict[str, tuple[np.ndarray, int]] = {}
     for key, phrase in TRIGGER_PHRASES.items():
-        wav_path = cache_dir / f"{key}.wav"
-        if not wav_path.exists() or wav_path.stat().st_size <= 1000:
-            ok = _synth_sapi_wav_via_powershell(phrase, wav_path)
+        if not _SAFE_TRIGGER_KEY_RE.fullmatch(str(key)):
+            raise ValueError(f"Invalid trigger key: {key!r}")
+        wav_path = _validate_trigger_wav_path(resolved_cache_dir / f"{key}.wav", allowed_root=resolved_cache_dir)
+        needs_synth = (
+            not wav_path.exists()
+            or wav_path.stat().st_size <= 1000
+            or wav_path.stat().st_size > _MAX_TRIGGER_WAV_BYTES
+        )
+        if needs_synth:
+            ok = _synth_sapi_wav_via_powershell(phrase, wav_path, allowed_root=resolved_cache_dir)
             if not ok:
                 # Fallback short Japanese wake cue if Korean SAPI fails
                 fallback_phrase = "自動信号、先生に話しかけて"
-                if not _synth_sapi_wav_via_powershell(fallback_phrase, wav_path):
-                    raise RuntimeError(f"SAPI 트리거 음성 합성 실패: {wav_path}")
+                if not _synth_sapi_wav_via_powershell(fallback_phrase, wav_path, allowed_root=resolved_cache_dir):
+                    raise RuntimeError(f"SAPI 트리거 음성 합성 실패: {wav_path.name}")
 
+        if wav_path.is_symlink() or wav_path.stat().st_size > _MAX_TRIGGER_WAV_BYTES:
+            raise RuntimeError(f"유효하지 않은 트리거 WAV 캐시 파일: {wav_path.name}")
         raw_audio, sr = sf.read(str(wav_path), dtype="float32")
+        if getattr(raw_audio, "size", 0) > _MAX_TRIGGER_WAV_SAMPLES:
+            raise RuntimeError(f"트리거 WAV 길이가 허용 한도를 초과했습니다: {wav_path.name}")
         clean_audio = _trim_fade_normalize(raw_audio, int(sr))
         loaded[key] = (clean_audio, int(sr))
     return loaded

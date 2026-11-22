@@ -15,7 +15,9 @@ import os
 import re
 import subprocess
 import tkinter as tk
+import urllib.parse
 import webbrowser
+from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 from typing import Any, Callable
 
@@ -40,6 +42,7 @@ from src.extractor.ba_molru_extractor import (
 from src.utils.app_paths import (
     ensure_user_selectors_copy,
     get_user_data_dir,
+    redact_secrets,
     save_user_config,
 )
 
@@ -122,12 +125,87 @@ VAD_PRESETS: dict[str, float] = {
 }
 
 
-_FISH_URL_RE = re.compile(r"fish\.audio/(?:[a-zA-Z_-]+/)?m/([a-zA-Z0-9_-]+)")
+_FISH_URL_RE = re.compile(r"(?:https://(?:www\.)?)?fish\.audio/(?:[a-zA-Z_-]+/)?m/([a-zA-Z0-9_-]{8,64})")
 _FISH_HEX_RE = re.compile(r"\b([0-9a-fA-F]{32})\b")
+_SAFE_REF_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_SAFE_API_MODEL_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+_MAX_KEY_PASTE_LEN = 512
+
+ALLOWED_EXTERNAL_URLS: frozenset[str] = frozenset(
+    {
+        "https://fish.audio/app/api-keys/",
+        "https://fish.audio/discovery/",
+        "https://aistudio.google.com/apikey",
+    }
+)
+ALLOWED_EXTERNAL_HOSTS: frozenset[str] = frozenset(
+    {
+        "fish.audio",
+        "aistudio.google.com",
+    }
+)
+
+
+def validate_external_https_url(url: str) -> str:
+    """Validate `url` strictly against the allowlisted HTTPS endpoints (blocks non-HTTPS, creds, control chars)."""
+    s = str(url or "").strip()
+    if not s or any(ord(ch) < 32 or ord(ch) == 127 for ch in s):
+        raise ValueError("Invalid external URL")
+    parsed = urllib.parse.urlsplit(s)
+    if parsed.scheme != "https":
+        raise ValueError(f"Only https:// URLs are permitted (got {parsed.scheme!r})")
+    if parsed.username or parsed.password:
+        raise ValueError("Embedded URL credentials are not permitted")
+    host = (parsed.hostname or "").lower()
+    if host not in ALLOWED_EXTERNAL_HOSTS:
+        raise ValueError(f"External URL host is not allowlisted: {host!r}")
+    if s not in ALLOWED_EXTERNAL_URLS:
+        raise ValueError("External URL is not in strict allowlist")
+    return s
+
+
+def open_safe_external_url(url: str) -> bool:
+    """Open only a strictly validated, allowlisted HTTPS URL in the user's browser."""
+    safe_url = validate_external_https_url(url)
+    return bool(webbrowser.open(safe_url, new=2))
+
+
+def _validate_user_selectors_path(candidate: Path | None = None) -> Path:
+    """Ensure selectors.json resolves to a regular non-symlink file inside `%LOCALAPPDATA%\\VoiceCompanionData`."""
+    user_dir = get_user_data_dir().resolve()
+    raw_path = Path(candidate) if candidate is not None else ensure_user_selectors_copy()
+    if "\x00" in str(raw_path):
+        raise ValueError("Invalid selectors.json path")
+    if raw_path.is_symlink():
+        raise ValueError("Refusing to open symlinked selectors.json")
+    resolved = raw_path.resolve()
+    if resolved.parent != user_dir or resolved.name.lower() != "selectors.json":
+        raise ValueError("selectors.json must reside directly inside user data directory")
+    if not resolved.is_file():
+        raise FileNotFoundError("selectors.json file does not exist")
+    return resolved
+
+
+def _sanitize_single_line_secret(raw: str) -> str:
+    """Strip NUL/CRLF/control characters and bound length for pasted API keys."""
+    s = str(raw or "").replace("\x00", "")
+    lines = [ln.strip() for ln in s.splitlines() if ln.strip()]
+    first = lines[0] if lines else ""
+    cleaned = "".join(ch for ch in first if ord(ch) >= 32 and ord(ch) != 127)
+    return cleaned[:_MAX_KEY_PASTE_LEN]
+
+
+def _validate_api_model_name(raw: str) -> str:
+    s = str(raw or "").strip()
+    if not s:
+        return "gemini-3.5-flash-lite"
+    if ".." in s or not _SAFE_API_MODEL_RE.fullmatch(s):
+        raise ValueError("유효하지 않은 Gemini API 모델 이름입니다. 영문/숫자/점/하이픈만 사용해 주세요.")
+    return s
 
 
 def _clean_ref_id(raw: str) -> str:
-    s = (raw or "").strip()
+    s = _sanitize_single_line_secret(raw)
     if not s:
         return ""
     m = _FISH_URL_RE.search(s)
@@ -136,7 +214,10 @@ def _clean_ref_id(raw: str) -> str:
     m_hex = _FISH_HEX_RE.search(s)
     if m_hex:
         return m_hex.group(1).lower()
-    return s.split("?")[0].strip("/")
+    cand = s.split("?")[0].split("#")[0].strip("/")
+    if _SAFE_REF_ID_RE.fullmatch(cand):
+        return cand
+    return ""
 
 
 class SettingsDialog(tk.Toplevel):
@@ -386,6 +467,8 @@ class SettingsDialog(tk.Toplevel):
             except Exception:
                 pass
             self._ref_trace_token = None
+        self._show_fish_key = False
+        self._show_gem_key = False
         super().destroy()
 
     def _build_ui(self) -> None:
@@ -762,14 +845,14 @@ class SettingsDialog(tk.Toplevel):
         tk.Button(
             r_fk,
             text="🔑 키 발급",
-            command=lambda: webbrowser.open("https://fish.audio/app/api-keys/"),
+            command=lambda: self._open_external_url("https://fish.audio/app/api-keys/"),
             bg="#DBEAFE",
             font=("Malgun Gothic", 9, "bold"),
         ).pack(side="left", padx=(0, 4))
         tk.Button(
             r_fk,
             text="🔊 보이스 탐색",
-            command=lambda: webbrowser.open("https://fish.audio/discovery/"),
+            command=lambda: self._open_external_url("https://fish.audio/discovery/"),
             bg="#F1F5F9",
         ).pack(side="left")
 
@@ -872,7 +955,7 @@ class SettingsDialog(tk.Toplevel):
         tk.Button(
             rg,
             text="🔑 무료 발급",
-            command=lambda: webbrowser.open("https://aistudio.google.com/apikey"),
+            command=lambda: self._open_external_url("https://aistudio.google.com/apikey"),
             bg="#DBEAFE",
         ).pack(side="left")
 
@@ -1465,17 +1548,72 @@ class SettingsDialog(tk.Toplevel):
         self._show_gem_key = not self._show_gem_key
         self.ent_gem_key.config(show="" if self._show_gem_key else "*")
 
+    def _current_secrets(self) -> tuple[str, ...]:
+        secrets: list[str] = []
+        for var in (self.fish_key_var, self.gemini_key_var):
+            try:
+                val = var.get().strip()
+                if val:
+                    secrets.append(val)
+            except Exception:
+                pass
+        return tuple(secrets)
+
+    def _open_external_url(self, url: str) -> None:
+        try:
+            open_safe_external_url(url)
+        except Exception as exc:
+            messagebox.showerror(
+                "링크 열기 차단",
+                redact_secrets(str(exc), self._current_secrets()),
+                parent=self,
+            )
+
     def _paste_into(self, var: tk.StringVar, clean_ref: bool = False) -> None:
-        raw = (pyperclip.paste() or "").strip()
+        try:
+            raw_clip = pyperclip.paste() or ""
+        except Exception as exc:
+            messagebox.showwarning(
+                "클립보드 읽기 실패",
+                redact_secrets(str(exc), self._current_secrets()),
+                parent=self,
+            )
+            return
+        raw = _sanitize_single_line_secret(raw_clip)
         if not raw:
             messagebox.showwarning("클립보드 비어 있음", "먼저 복사한 값을 클립보드에 담아 주세요.", parent=self)
             return
-        var.set(_clean_ref_id(raw) if clean_ref else raw)
+        if clean_ref:
+            cleaned = _clean_ref_id(raw)
+            if not cleaned:
+                messagebox.showwarning(
+                    "유효하지 않은 Voice ID",
+                    "올바른 Fish Audio 보이스 URL 또는 32자리 ID를 복사해 주세요.",
+                    parent=self,
+                )
+                return
+            var.set(cleaned)
+        else:
+            var.set(raw)
 
     def _open_user_data_dir(self) -> None:
-        p = get_user_data_dir()
-        if os.name == "nt":
-            os.startfile(str(p))
+        try:
+            p = get_user_data_dir()
+            if "\x00" in str(p) or p.is_symlink():
+                raise ValueError("Refusing to open invalid or symlinked user data directory")
+            resolved = p.resolve()
+            if not resolved.is_dir() or not resolved.is_absolute():
+                raise ValueError("User data directory is not accessible")
+            if os.name == "nt":
+                if str(resolved).startswith(("/", "-")):
+                    raise ValueError("Invalid Windows directory path")
+                os.startfile(str(resolved), "explore")  # type: ignore[attr-defined]
+        except Exception as exc:
+            messagebox.showerror(
+                "폴더 열기 실패",
+                redact_secrets(str(exc), self._current_secrets()),
+                parent=self,
+            )
 
     def _handle_open_logs(self) -> None:
         if self.on_open_logs is None:
@@ -1504,7 +1642,11 @@ class SettingsDialog(tk.Toplevel):
                     return
                 self.btn_sync_web_models.configure(state="normal", text="🔄 웹 모델 동기화")
                 if err and not models:
-                    messagebox.showwarning("웹 모델 동기화 안내", err, parent=self)
+                    messagebox.showwarning(
+                        "웹 모델 동기화 안내",
+                        redact_secrets(str(err), self._current_secrets()),
+                        parent=self,
+                    )
                     return
                 if not models:
                     messagebox.showinfo("동기화 완료", "현재 계정에서 선택 가능한 웹 모델을 찾지 못했습니다.", parent=self)
@@ -1560,14 +1702,18 @@ class SettingsDialog(tk.Toplevel):
                 finally:
                     api.close()
             except Exception as exc:
-                err_msg = str(exc)
+                err_msg = redact_secrets(str(exc), (key,))
 
             def _done() -> None:
                 if not self.winfo_exists():
                     return
                 self.btn_fetch_api_models.configure(state="normal", text="🔄 API 모델 조회")
                 if err_msg:
-                    messagebox.showwarning("모델 조회 실패", err_msg, parent=self)
+                    messagebox.showwarning(
+                        "모델 조회 실패",
+                        redact_secrets(err_msg, self._current_secrets()),
+                        parent=self,
+                    )
                     return
                 if not fetched:
                     messagebox.showinfo("조회 완료", "사용 가능한 Gemini 모델을 찾지 못했습니다.", parent=self)
@@ -1591,9 +1737,20 @@ class SettingsDialog(tk.Toplevel):
         threading.Thread(target=_worker, daemon=True, name="fetch-gem-models").start()
 
     def _edit_selectors_json(self) -> None:
-        p = ensure_user_selectors_copy()
-        if os.name == "nt" and p.exists():
-            subprocess.Popen(["notepad.exe", str(p)])
+        try:
+            p = _validate_user_selectors_path(ensure_user_selectors_copy())
+            if os.name == "nt":
+                sys_root = Path(os.environ.get("SystemRoot") or os.environ.get("WINDIR") or r"C:\Windows")
+                notepad = sys_root / "System32" / "notepad.exe"
+                if not notepad.is_file():
+                    raise FileNotFoundError("Windows notepad.exe를 찾을 수 없습니다.")
+                subprocess.Popen([str(notepad), str(p)], shell=False)
+        except Exception as exc:
+            messagebox.showerror(
+                "selectors.json 열기 실패",
+                redact_secrets(str(exc), self._current_secrets()),
+                parent=self,
+            )
 
     def _get_reply_lang(self) -> str:
         return "ko" if self.reply_language_var.get() == "ko" else "ja"
@@ -1771,10 +1928,10 @@ class SettingsDialog(tk.Toplevel):
             messagebox.showerror("입력 오류", "선톡 무음 대기 시간과 AFK 횟수는 숫자로 입력해 주세요.", parent=self)
             return
 
-        fish_key = self.fish_key_var.get().strip()
+        fish_key = _sanitize_single_line_secret(self.fish_key_var.get())
         ref_id = _clean_ref_id(self.ref_id_var.get())
         gem_backend = self.gemini_backend_var.get().strip() or "browser"
-        gem_key = self.gemini_key_var.get().strip()
+        gem_key = _sanitize_single_line_secret(self.gemini_key_var.get())
 
         if gem_backend == "api" and not gem_key:
             messagebox.showwarning(
@@ -1782,6 +1939,12 @@ class SettingsDialog(tk.Toplevel):
                 "공식 Gemini API 모드를 선택하셨습니다. Gemini API Key를 입력하거나 전용 브라우저 모드를 선택해 주세요.",
                 parent=self,
             )
+            return
+
+        try:
+            gem_api_model = _validate_api_model_name(self.gemini_model_var.get())
+        except ValueError as exc:
+            messagebox.showerror("입력 오류", str(exc), parent=self)
             return
 
         # Tab 0: Prompt interpretation & custom persona
@@ -1834,7 +1997,7 @@ class SettingsDialog(tk.Toplevel):
 
         self.cfg["gemini_backend"] = gem_backend
         self.cfg["gemini_api_key"] = gem_key
-        self.cfg["gemini_api_model"] = self.gemini_model_var.get().strip() or "gemini-3.5-flash-lite"
+        self.cfg["gemini_api_model"] = gem_api_model
         self.cfg["gemini_browser_model"] = bmodel_by_lbl.get(self.gemini_browser_model_var.get().strip(), "hydrogen")
         self.cfg["gemini_thinking_level"] = think_by_lbl.get(self.gemini_thinking_var.get().strip(), "low")
         self.cfg["subtitle_engine"] = sub_eng_by_lbl.get(self.subtitle_engine_var.get().strip(), "auto_inline")
@@ -1872,6 +2035,14 @@ class SettingsDialog(tk.Toplevel):
             PROACTIVE_VOL_VALS.get(self.proactive_vol_var.get().strip(), 1.0)
         )
 
-        save_user_config(self.cfg)
+        try:
+            save_user_config(self.cfg)
+        except Exception as exc:
+            messagebox.showerror(
+                "설정 저장 실패",
+                redact_secrets(str(exc), self._current_secrets()),
+                parent=self,
+            )
+            return
         self.on_saved(self.cfg)
         self.destroy()

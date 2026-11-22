@@ -30,10 +30,16 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable
+from urllib.parse import unquote, urlparse
 
 import requests
 
-from src.extractor.ba_molru_extractor import DEFAULT_GAME_DIR, is_valid_ba_game_dir, resolve_ba_game_dir
+from src.extractor.ba_molru_extractor import (
+    DEFAULT_GAME_DIR,
+    is_safe_entity_id,
+    is_valid_ba_game_dir,
+    resolve_ba_game_dir,
+)
 from src.extractor.ba_momotalk_assets import MomoTalkAssetManager
 from src.extractor.build_fish_reference import (
     DEFAULT_QUALITY_PROFILE,
@@ -62,10 +68,122 @@ _TITLE_IDENTITY_RE = re.compile(
     r"^Blue\s+Archive\s*-\s*([A-Za-z0-9_]+)\s*\(.*?/\s*(JP|KR)\b",
     re.IGNORECASE,
 )
-_FISH_URL_RE = re.compile(r"fish\.audio/(?:[a-zA-Z_-]+/)?m/([a-zA-Z0-9_-]+)")
-_FISH_HEX_RE = re.compile(r"\b([0-9a-fA-F]{32})\b")
+_FISH_HEX_STRICT_RE = re.compile(r"\A[0-9a-fA-F]{32}\Z")
+_FISH_MODEL_PATH_RE = re.compile(r"\A/(?:[a-zA-Z_-]{2,10}/)?m/([0-9a-fA-F]{32})/?\Z")
+_ALLOWED_FISH_HOSTS = frozenset({"fish.audio", "www.fish.audio", "api.fish.audio"})
 _MIN_FREE_DISK_BYTES = 500 * 1024 * 1024  # 500 MB hard floor
 _WARN_FREE_DISK_BYTES = 5 * 1024 * 1024 * 1024  # 5 GB warning threshold for full 305-char pro85 run
+MAX_FISH_JSON_RESPONSE_BYTES = 8 * 1024 * 1024  # 8 MB cap on Fish Audio JSON responses
+MAX_CHAR_CONFIG_BYTES = 5 * 1024 * 1024         # 5 MB cap per character JSON
+
+_FALLBACK_REDACT_PATS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"AIza[0-9A-Za-z\-_]{20,}"), "[REDACTED_GOOGLE_KEY]"),
+    (re.compile(r"\bsk-[0-9A-Za-z_\-]{16,}"), "[REDACTED_API_KEY]"),
+    (re.compile(r"(?i)(Bearer\s+)[^\s\"',;}\]]+"), r"\1[REDACTED]"),
+    (re.compile(r"(?i)(x-goog-api-key[\"']?\s*[:=]\s*[\"']?)[^\s\"',;}\]]+"), r"\1[REDACTED]"),
+    (re.compile(r"(?i)([?&](?:api_)?key=)[^&\s\"']+"), r"\1[REDACTED]"),
+    (re.compile(r'("(?:fish_api_key|gemini_api_key)"\s*:\s*")[^"]*(")'), r"\1[REDACTED]\2"),
+    (re.compile(r"dpapi:[A-Za-z0-9+/=]{16,}"), "dpapi:[REDACTED]"),
+)
+
+
+def _redact_secrets(text: str, extra_secrets: tuple[str, ...] = ()) -> str:
+    """Scrub API keys, Bearer tokens, and DPAPI blobs using `app_paths.redact_secrets` with inline fallback."""
+    s = str(text or "")
+    if not s:
+        return s
+    try:
+        from src.utils import app_paths as _ap
+
+        fn = getattr(_ap, "redact_secrets", None)
+        if callable(fn):
+            return str(fn(s, extra_secrets=extra_secrets))
+    except Exception:
+        pass
+    out = s
+    for sec in extra_secrets:
+        tok = str(sec or "").strip()
+        if len(tok) >= 8:
+            out = out.replace(tok, "[REDACTED]")
+    for pat, repl in _FALLBACK_REDACT_PATS:
+        out = pat.sub(repl, out)
+    return out
+
+
+def _validate_fish_api_url(url: str) -> str:
+    """Strictly enforce HTTPS-only requests to `api.fish.audio` (prevents SSRF / scheme downgrade / traversal)."""
+    raw = str(url or "").strip()
+    if not raw or "\\" in raw or any(ord(ch) < 32 or ord(ch) == 127 for ch in raw):
+        raise ValueError(f"Blocked malformed or control-char URL: {url!r}")
+    parsed = urlparse(raw)
+    host = (parsed.hostname or "").lower()
+    decoded_path = unquote(parsed.path)
+    if (
+        parsed.scheme != "https"
+        or host != "api.fish.audio"
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.port not in (None, 443)
+        or parsed.fragment
+        or "\\" in decoded_path
+        or ".." in decoded_path.split("/")
+    ):
+        raise ValueError(f"Blocked non-Fish-Audio or insecure URL: {url!r}")
+    return raw
+
+
+def is_valid_fish_model_id(raw: str) -> bool:
+    """Return True iff `raw` is a strictly valid 32-char hexadecimal Fish Audio model ID."""
+    return bool(_FISH_HEX_STRICT_RE.match(str(raw or "").strip()))
+
+
+def build_fish_model_item_url(model_id: str) -> str:
+    """Build a strictly validated `https://api.fish.audio/model/<32-hex>` URL (prevents SSRF/path injection)."""
+    clean_id = _clean_model_id(model_id)
+    if not clean_id:
+        raise ValueError(f"Invalid Fish Audio model ID: {model_id!r}")
+    return _validate_fish_api_url(f"{FISH_MODEL_URL}/{clean_id}")
+
+
+def _is_real_requests(sess: Any) -> bool:
+    return sess is requests or isinstance(sess, requests.Session)
+
+
+def _read_bounded_response(resp: Any, max_bytes: int = MAX_FISH_JSON_RESPONSE_BYTES) -> tuple[int, str, Any, Any]:
+    """Read a requests or mock HTTP response safely with strict OOM-DoS byte cap."""
+    code = int(getattr(resp, "status_code", 0) or 0)
+    resp_headers = getattr(resp, "headers", None) or {}
+    if hasattr(resp, "iter_content"):
+        try:
+            cl = resp_headers.get("Content-Length") or resp_headers.get("content-length")
+            if cl is not None and str(cl).strip().isdigit() and int(str(cl).strip()) > max_bytes:
+                raise ValueError(f"Fish Audio response Content-Length exceeds limit ({cl} > {max_bytes})")
+            buf = bytearray()
+            for chunk in resp.iter_content(chunk_size=65536):
+                if not chunk:
+                    continue
+                buf.extend(chunk)
+                if len(buf) > max_bytes:
+                    raise ValueError(f"Fish Audio response body exceeds limit ({max_bytes} bytes)")
+            text = buf.decode("utf-8", errors="replace")
+            try:
+                body = json.loads(text) if text else {}
+            except Exception:
+                body = None
+            return code, text, body, resp_headers
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
+    raw_text = str(getattr(resp, "text", "") or "")
+    if len(raw_text.encode("utf-8", errors="ignore")) > max_bytes:
+        raise ValueError(f"Fish Audio response text exceeds limit ({max_bytes} bytes)")
+    try:
+        body = resp.json()
+    except Exception:
+        body = None
+    return code, raw_text, body, resp_headers
 
 
 def build_fish_model_title(char_id: str, name_tag: str, lang: str, cv_name: str = "") -> str:
@@ -81,19 +199,37 @@ def build_fish_model_title(char_id: str, name_tag: str, lang: str, cv_name: str 
 
 
 def _clean_model_id(raw: str) -> str:
-    s = (raw or "").strip()
+    """
+    Strictly extract and validate a Fish Audio 32-char hex model ID from either a raw ID
+    or an official `https://fish.audio/.../m/<32-hex>` URL. Rejects traversal/SSRF inputs with `""`.
+    """
+    s = str(raw or "").strip()
     if not s:
         return ""
-    m = _FISH_URL_RE.search(s)
-    if m:
-        return m.group(1)
-    m_hex = _FISH_HEX_RE.search(s)
-    if m_hex:
-        return m_hex.group(1).lower()
-    return s.split("?")[0].strip("/")
+    if _FISH_HEX_STRICT_RE.match(s):
+        return s.lower()
+    candidate = s
+    if "://" not in candidate and candidate.lower().startswith(("fish.audio/", "www.fish.audio/", "api.fish.audio/")):
+        candidate = "https://" + candidate
+    if "://" in candidate:
+        parsed = urlparse(candidate)
+        host = (parsed.hostname or "").lower()
+        if (
+            parsed.scheme == "https"
+            and host in _ALLOWED_FISH_HOSTS
+            and parsed.username is None
+            and parsed.password is None
+            and parsed.port in (None, 443)
+        ):
+            m = _FISH_MODEL_PATH_RE.match(parsed.path)
+            if m:
+                return m.group(1).lower()
+    return ""
 
 
 def _atomic_write_json(target: Path, data: Any) -> Path:
+    if target.is_symlink():
+        raise ValueError(f"Refusing to overwrite symlink file: {target}")
     target.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(data, ensure_ascii=False, indent=2)
     fd, tmp_name = tempfile.mkstemp(prefix=".fbatch_", suffix=".tmp", dir=str(target.parent))
@@ -221,11 +357,18 @@ def load_all_character_configs(config_dir: Path | None = None) -> dict[str, dict
     chars: dict[str, dict[str, Any]] = {}
     if not cdir.is_dir():
         return chars
+    cdir_res = cdir.resolve()
     for fp in sorted(cdir.glob("*.json")):
         try:
+            if fp.is_symlink() or not fp.resolve().is_relative_to(cdir_res):
+                continue
+            if fp.stat().st_size > MAX_CHAR_CONFIG_BYTES:
+                continue
             data = json.loads(fp.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                continue
             cid = str(data.get("id") or "").strip()
-            if cid:
+            if cid and is_safe_entity_id(cid):
                 chars[cid] = data
         except Exception:
             continue
@@ -264,10 +407,18 @@ class BatchProgress:
 
 
 def _char_ref_dir(char_id: str, lang: str) -> tuple[Path, Path]:
-    lang_up = lang.upper()
-    out_dir = get_user_models_dir() / char_id / lang_up
-    samples_dir = out_dir / "fish_samples"
-    return out_dir / f"{char_id}_{lang_up}_FishAudio_Reference.wav", samples_dir
+    cid = str(char_id or "").strip()
+    if not is_safe_entity_id(cid):
+        raise ValueError(f"Invalid or unsafe character_id: {char_id!r}")
+    lang_up = str(lang or "JP").strip().upper()
+    if lang_up not in ("JP", "KR"):
+        raise ValueError(f"Invalid voice language code: {lang!r}")
+    models_root = get_user_models_dir().resolve()
+    out_dir = (models_root / cid / lang_up).resolve()
+    if not out_dir.is_relative_to(models_root):
+        raise ValueError(f"Path traversal blocked for character_id={cid!r}")
+    samples_dir = (out_dir / "fish_samples").resolve()
+    return out_dir / f"{cid}_{lang_up}_FishAudio_Reference.wav", samples_dir
 
 
 def is_studio_v2_extracted(
@@ -497,13 +648,15 @@ def parse_fish_model_identity(model_obj: dict[str, Any]) -> tuple[str, str] | No
                 lv = ts[len("ba_lang:") :].strip().upper()
                 if lv in ("JP", "KR"):
                     tag_lang = lv
-    if tag_cid and tag_lang:
+    if tag_cid and tag_lang and is_safe_entity_id(tag_cid):
         return tag_cid, tag_lang
 
     title = str(model_obj.get("title") or "").strip()
     m = _TITLE_IDENTITY_RE.match(title)
     if m:
-        return m.group(1).strip(), m.group(2).strip().upper()
+        parsed_cid = m.group(1).strip()
+        if is_safe_entity_id(parsed_cid):
+            return parsed_cid, m.group(2).strip().upper()
     return None
 
 
@@ -550,24 +703,37 @@ def sync_existing_fish_models(
 
     while page <= 50:
         try:
-            resp = sess.get(
-                FISH_MODEL_URL,
-                headers=headers,
-                params={"self": "true", "page_size": page_size, "page_number": page},
-                timeout=30,
-            )
+            url = _validate_fish_api_url(FISH_MODEL_URL)
+            if _is_real_requests(sess):
+                resp = sess.get(
+                    url,
+                    headers=headers,
+                    params={"self": "true", "page_size": page_size, "page_number": page},
+                    timeout=30,
+                    verify=True,
+                    allow_redirects=False,
+                    stream=True,
+                )
+            else:
+                resp = sess.get(
+                    url,
+                    headers=headers,
+                    params={"self": "true", "page_size": page_size, "page_number": page},
+                    timeout=30,
+                )
+            resp_code, resp_text, body, _ = _read_bounded_response(resp, MAX_FISH_JSON_RESPONSE_BYTES)
         except Exception as exc:
             return {
                 "ok": False,
                 "fatal_code": "",
-                "error": f"계정 모델 조회 네트워크 오류: {exc}",
+                "error": _redact_secrets(f"계정 모델 조회 네트워크 오류: {exc}", extra_secrets=(clean_key,)),
                 "synced": synced,
                 "total_remote": total_remote,
                 "matched_keys": list(matched_models.keys()),
                 "self_owned_ids": sorted(seen_remote_ids),
             }
 
-        if resp.status_code == 401:
+        if resp_code == 401:
             return {
                 "ok": False,
                 "fatal_code": "AUTH_ERROR",
@@ -577,20 +743,19 @@ def sync_existing_fish_models(
                 "matched_keys": [],
                 "self_owned_ids": [],
             }
-        if resp.status_code != 200:
+        if resp_code != 200:
+            safe_txt = _redact_secrets(resp_text[:200], extra_secrets=(clean_key,))
             return {
                 "ok": False,
                 "fatal_code": "",
-                "error": f"계정 모델 목록 조회 실패 (HTTP {resp.status_code}): {(resp.text or '')[:200]}",
+                "error": f"계정 모델 목록 조회 실패 (HTTP {resp_code}): {safe_txt}",
                 "synced": synced,
                 "total_remote": total_remote,
                 "matched_keys": list(matched_models.keys()),
                 "self_owned_ids": sorted(seen_remote_ids),
             }
 
-        try:
-            body = resp.json()
-        except Exception:
+        if body is None:
             break
 
         items = body.get("items") if isinstance(body, dict) else (body if isinstance(body, list) else [])
@@ -968,15 +1133,29 @@ def upload_job_to_fish_audio(
                 if use_cover and cover_bytes:
                     files.append(("cover_image", (f"{job.char_id}.png", cover_bytes, "image/png")))
 
-                resp = sess.post(
-                    FISH_MODEL_URL,
-                    headers={"Authorization": f"Bearer {clean_key}"},
-                    data=data_fields,
-                    files=files,
-                    timeout=120,
-                )
+                post_url = _validate_fish_api_url(FISH_MODEL_URL)
+                if _is_real_requests(sess):
+                    resp = sess.post(
+                        post_url,
+                        headers={"Authorization": f"Bearer {clean_key}"},
+                        data=data_fields,
+                        files=files,
+                        timeout=120,
+                        verify=True,
+                        allow_redirects=False,
+                        stream=True,
+                    )
+                else:
+                    resp = sess.post(
+                        post_url,
+                        headers={"Authorization": f"Bearer {clean_key}"},
+                        data=data_fields,
+                        files=files,
+                        timeout=120,
+                    )
+                code, resp_text, resp_body, resp_headers = _read_bounded_response(resp, MAX_FISH_JSON_RESPONSE_BYTES)
             except Exception as exc:
-                last_err = f"네트워크 오류: {exc}"
+                last_err = _redact_secrets(f"네트워크 오류: {exc}", extra_secrets=(clean_key,))
                 if attempt < max_retries:
                     wait_s = min(60.0, 4.0 * (2**attempt))
                     if callable(log_cb):
@@ -992,15 +1171,12 @@ def upload_job_to_fish_audio(
                     except Exception:
                         pass
 
-            code = int(resp.status_code)
             if code in (200, 201):
-                try:
-                    body = resp.json()
-                except Exception:
-                    body = {}
+                body = resp_body if isinstance(resp_body, dict) else {}
                 mid = _clean_model_id(str(body.get("_id") or body.get("id") or ""))
                 if not mid:
-                    return {"ok": False, "fatal_code": "", "error": f"응답에 모델 ID가 없습니다: {str(body)[:180]}"}
+                    safe_body = _redact_secrets(str(body)[:180], extra_secrets=(clean_key,))
+                    return {"ok": False, "fatal_code": "", "error": f"응답에 모델 ID가 없습니다: {safe_body}"}
                 actual_vis = str(body.get("visibility") or vis).strip().lower()
                 if actual_vis != vis and callable(log_cb):
                     log_cb(
@@ -1018,7 +1194,7 @@ def upload_job_to_fish_audio(
                     "upload_plan": plan["name"],
                 }
 
-            err_txt = (resp.text or "").strip()
+            err_txt = _redact_secrets(resp_text.strip(), extra_secrets=(clean_key,))
             if code == 401:
                 return {"ok": False, "fatal_code": "AUTH_ERROR", "error": "Fish Audio API Key 인증 실패 (HTTP 401). 키를 확인해 주세요."}
 
@@ -1034,7 +1210,7 @@ def upload_job_to_fish_audio(
                 return {"ok": False, "fatal_code": "QUOTA_LIMIT", "error": f"Fish Audio 권한/한도 오류 (HTTP {code}): {err_txt[:180]}"}
 
             if code == 429:
-                wait_s = _parse_retry_after(resp.headers, default_sec=min(90.0, 5.0 * (2**attempt)))
+                wait_s = _parse_retry_after(resp_headers, default_sec=min(90.0, 5.0 * (2**attempt)))
                 last_err = f"요청 속도 제한 (HTTP 429): {err_txt[:140]}"
                 if attempt < max_retries:
                     if callable(log_cb):
@@ -1136,8 +1312,9 @@ def run_fish_batch_pipeline(
         status: str = "",
         msg: str = "",
     ) -> None:
-        if callable(log_cb) and msg:
-            log_cb(msg)
+        safe_msg = _redact_secrets(msg, extra_secrets=(eff_key,)) if msg else ""
+        if callable(log_cb) and safe_msg:
+            log_cb(safe_msg)
         if callable(on_progress):
             on_progress(
                 BatchProgress(
@@ -1148,7 +1325,7 @@ def run_fish_batch_pipeline(
                     name_kr=job.name_kr if job else "",
                     lang=job.lang if job else "",
                     status=status,
-                    message=msg,
+                    message=safe_msg,
                     counts=dict(counts),
                 )
             )
@@ -1156,12 +1333,17 @@ def run_fish_batch_pipeline(
     # Preflight environment validation (API key, Steam dirs, disk space)
     pre = run_preflight_checks(mode=mode, langs=langs, api_key=eff_key, game_dir=game_dir, log_cb=log_cb)
     if not pre.get("ok"):
-        err = str(pre.get("error") or "사전 점검 실패")
+        err = _redact_secrets(str(pre.get("error") or "사전 점검 실패"), extra_secrets=(eff_key,))
         _emit("error", 0, 1, status="error", msg=f"❌ {err}")
         return {"ok": False, "fatal_code": pre.get("fatal_code", ""), "error": err, "counts": counts}
 
     owns_session = http_session is None and mode in ("sync_only", "upload")
-    sess = requests.Session() if owns_session else http_session
+    if owns_session:
+        sess = requests.Session()
+        sess.verify = True
+        sess.max_redirects = 0
+    else:
+        sess = http_session
     self_owned_keys: set[tuple[str, str]] = set()
 
     try:
@@ -1310,16 +1492,17 @@ def run_fish_batch_pipeline(
                         )
                 except Exception as exc:
                     counts["failed"] += 1
+                    safe_exc = _redact_secrets(str(exc), extra_secrets=(eff_key,))
                     entries[job.key] = {
                         **(entries.get(job.key) or {}),
                         "char_id": job.char_id,
                         "name_kr": job.name_kr,
                         "lang": job.lang,
-                        "error": str(exc),
+                        "error": safe_exc,
                         "updated_at": time.time(),
                     }
                     save_batch_manifest(manifest)
-                    _emit("extract", idx, len(jobs), job=job, status="failed", msg=f"[{idx}/{len(jobs)}] ⚠️ {job.name_kr} ({job.lang}) 추출 실패: {exc}")
+                    _emit("extract", idx, len(jobs), job=job, status="failed", msg=f"[{idx}/{len(jobs)}] ⚠️ {job.name_kr} ({job.lang}) 추출 실패: {safe_exc}")
                 continue
 
             # mode == "upload"
@@ -1409,7 +1592,7 @@ def run_fish_batch_pipeline(
                         break
             else:
                 fcode = str(up_res.get("fatal_code") or "")
-                err_msg = str(up_res.get("error") or "업로드 실패")
+                err_msg = _redact_secrets(str(up_res.get("error") or "업로드 실패"), extra_secrets=(eff_key,))
                 if fcode == "STOPPED":
                     fatal_code = "STOPPED"
                     fatal_err = err_msg
@@ -1490,7 +1673,7 @@ def get_student_voice_availability(
     lang_up = "KR" if str(lang or "JP").strip().upper() == "KR" else "JP"
     other_lang = "JP" if lang_up == "KR" else "KR"
 
-    if cid and _has_any_local_wavs(cid, lang_up):
+    if cid and is_safe_entity_id(cid) and _has_any_local_wavs(cid, lang_up):
         return "steam_ready"
 
     eff_game_dir = resolve_ba_game_dir(game_dir, cfg)
@@ -1568,15 +1751,16 @@ def auto_generate_and_link_student_voice(
     prof_key, _ = resolve_quality_profile(quality_profile or str(user_cfg.get("auto_voice_quality_profile") or DEFAULT_QUALITY_PROFILE))
 
     def _stage(stage: str, msg: str) -> None:
-        if callable(log_cb) and msg:
-            log_cb(msg)
+        safe_msg = _redact_secrets(msg, extra_secrets=(eff_key,)) if msg else ""
+        if callable(log_cb) and safe_msg:
+            log_cb(safe_msg)
         if callable(on_stage):
             try:
-                on_stage(stage, msg)
+                on_stage(stage, safe_msg)
             except Exception:
                 pass
 
-    if not cid:
+    if not cid or not is_safe_entity_id(cid):
         return {"ok": False, "fatal_code": "INVALID_CHAR", "error": "유효한 캐릭터 정보가 없습니다."}
 
     if not eff_key:
@@ -1591,7 +1775,12 @@ def auto_generate_and_link_student_voice(
     manifest = load_batch_manifest()
     eff_game_dir = resolve_ba_game_dir(game_dir, user_cfg)
     owns_session = http_session is None
-    sess = requests.Session() if owns_session else http_session
+    if owns_session:
+        sess = requests.Session()
+        sess.verify = True
+        sess.max_redirects = 0
+    else:
+        sess = http_session
 
     def _persist_link(target_cid: str, target_name_kr: str, model_id: str, actual_vis: str) -> None:
         prev_id = _clean_model_id(str((user_cfg.get(bucket_name) or {}).get(target_cid) or ""))
@@ -1676,7 +1865,7 @@ def auto_generate_and_link_student_voice(
                     log_cb=log_cb,
                 )
             except Exception as exc:
-                alt_up = {"ok": False, "fatal_code": "", "error": str(exc)}
+                alt_up = {"ok": False, "fatal_code": "", "error": _redact_secrets(str(exc), extra_secrets=(eff_key,))}
 
             if alt_up.get("ok"):
                 alt_mid = str(alt_up["model_id"])
@@ -1824,7 +2013,7 @@ def auto_generate_and_link_student_voice(
                 extract_job_reference(job, force=False, game_dir=eff_game_dir, quality_profile=prof_key)
             except Exception as exc:
                 if not _has_any_local_wavs(cid, lang_up):
-                    err = f"스팀 원음 추출 실패: {exc}"
+                    err = _redact_secrets(f"스팀 원음 추출 실패: {exc}", extra_secrets=(eff_key,))
                     _stage("error", f"❌ {err}")
                     return {"ok": False, "fatal_code": "", "error": err, "char_id": cid, "lang": lang_up}
 

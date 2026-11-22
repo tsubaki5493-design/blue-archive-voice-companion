@@ -17,6 +17,7 @@ from typing import Any, Callable
 
 from src.controller.fish_batch_builder import (
     BatchProgress,
+    _redact_secrets,
     run_fish_batch_pipeline,
     scan_voiced_roster,
 )
@@ -312,12 +313,13 @@ class FishBatchDialog(tk.Toplevel):
     def _append_log(self, text: str) -> None:
         if self._closing:
             return
+        safe_text = _redact_secrets(str(text or ""), extra_secrets=(self._current_api_key(),))
 
         def _do() -> None:
             if self._closing or not self.winfo_exists():
                 return
             self.log_box.configure(state="normal")
-            self.log_box.insert(tk.END, text + "\n")
+            self.log_box.insert(tk.END, safe_text + "\n")
             self.log_box.see(tk.END)
             self.log_box.configure(state="disabled")
 
@@ -357,7 +359,8 @@ class FishBatchDialog(tk.Toplevel):
                 )
             )
         except Exception as exc:
-            self.lbl_inventory.configure(text=f"스팀 음성 현황 확인 실패: {exc}")
+            safe_exc = _redact_secrets(str(exc), extra_secrets=(self._current_api_key(),))
+            self.lbl_inventory.configure(text=f"스팀 음성 현황 확인 실패: {safe_exc}")
 
     def _set_running_ui(self, running: bool) -> None:
         self._running = running
@@ -464,9 +467,9 @@ class FishBatchDialog(tk.Toplevel):
                     log_cb=self._append_log,
                 )
                 if not res.get("ok") and res.get("error"):
-                    fatal_err_text = str(res["error"])
+                    fatal_err_text = _redact_secrets(str(res["error"]), extra_secrets=(api_key,))
             except Exception as exc:
-                fatal_err_text = f"예기치 못한 오류: {exc}"
+                fatal_err_text = _redact_secrets(f"예기치 못한 오류: {exc}", extra_secrets=(api_key,))
                 self._append_log(f"❌ {fatal_err_text}")
             finally:
                 def _done_ui() -> None:
