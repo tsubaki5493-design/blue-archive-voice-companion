@@ -1,0 +1,5 @@
+# Optional NVIDIA CUDA 12 runtime DLLs for ultra-fast GPU Whisper STT (~0.13s)
+# Installed automatically by Start_VoiceCompanion.bat only when an NVIDIA GPU is detected.
+nvidia-cublas-cu12>=12.4
+nvidia-cudnn-cu12>=9.0
+nvidia-cuda-nvrtc-cu12>=12.4

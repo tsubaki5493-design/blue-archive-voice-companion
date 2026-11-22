@@ -1,0 +1,46 @@
+{
+  "url": "https://gemini.google.com/app",
+  "input_selectors": [
+    "div.ql-editor[aria-label*='Gemini']",
+    "rich-textarea div.ql-editor[contenteditable='true']",
+    "rich-textarea div[contenteditable='true']",
+    "div[role='textbox'][contenteditable='true']",
+    "div[contenteditable='true']",
+    "textarea"
+  ],
+  "send_button_selectors": [
+    "button[aria-label*='메시지 보내기']:not([disabled]):not([aria-disabled='true'])",
+    "button.send-button:not([disabled]):not([aria-disabled='true'])",
+    "button[aria-label*='전송']:not([disabled]):not([aria-disabled='true'])",
+    "button[aria-label*='보내기']:not([disabled]):not([aria-disabled='true'])",
+    "button[aria-label*='Send']:not([disabled]):not([aria-disabled='true'])",
+    "button[aria-label*='送信']:not([disabled]):not([aria-disabled='true'])",
+    "send-button button:not([disabled])"
+  ],
+  "stop_button_selectors": [
+    "button[aria-label*='대답 생성 중지']",
+    "button[aria-label*='중지']",
+    "button[aria-label*='Stop']",
+    "button[aria-label*='停止']"
+  ],
+  "response_selectors": [
+    "model-response message-content .markdown",
+    "model-response .model-response-text",
+    "model-response message-content",
+    "message-content .markdown"
+  ],
+  "new_chat_selectors": [
+    "a[aria-label*='새 채팅']",
+    "button[aria-label*='새 채팅']",
+    "a[aria-label*='New chat']",
+    "button[aria-label*='New chat']",
+    "a[href='/app']"
+  ],
+  "login_required_selectors": [
+    "a[href*='accounts.google.com/ServiceLogin']",
+    "a[aria-label*='로그인']",
+    "a[aria-label*='Sign in']",
+    "button[aria-label*='로그인']",
+    "button[aria-label*='Sign in']"
+  ]
+}

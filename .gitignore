@@ -1,0 +1,34 @@
+# Python & Virtual Environment
+.venv/
+.venv_rvc/
+__pycache__/
+*.py[cod]
+*$py.class
+build/
+dist/
+*.spec
+.tmp.*/
+
+# Personal Credentials, API Keys & Local Settings (NEVER ship or commit)
+config/fish_bridge_config.json
+config/selectors.local.json
+config/characters/_backup_*/
+.env
+.env.*
+*.key
+*.pem
+
+# Browser Profiles, Caches & Runtime Data (Stored in %LOCALAPPDATA%\VoiceCompanionData)
+EBWebView/
+User Data/
+BrowserProfile/
+VoiceCompanionData/
+data/
+models/
+models_rvc/
+rvc_engine/rvc/models/
+*.log
+
+# Local Shortcuts & Staged Skill Drop-in Payloads
+*.lnk
+fanon_dropin/

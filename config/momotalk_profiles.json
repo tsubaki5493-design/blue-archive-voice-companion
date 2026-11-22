@@ -1,0 +1,532 @@
+{
+  "version": 1,
+  "entries": [
+    {
+      "entry_id": "Aru",
+      "base_cid": "Aru",
+      "ba_character_id": 10000,
+      "is_costume_variant": false,
+      "costume_label_kr": "",
+      "name_kr": "아루",
+      "full_name_kr": "리쿠하치마 아루",
+      "status_message_kr": "무엇이든 해결해 드립니다",
+      "status_message_jp": "なんでも解決するわよ！",
+      "portrait_tokens": [
+        "Aru",
+        "aru"
+      ],
+      "default_order": 0
+    },
+    {
+      "entry_id": "Haruna",
+      "base_cid": "Haruna",
+      "ba_character_id": 10002,
+      "is_costume_variant": false,
+      "costume_label_kr": "",
+      "name_kr": "하루나",
+      "full_name_kr": "쿠로다테 하루나",
+      "status_message_kr": "EAT OR DIE",
+      "status_message_jp": "EAT OR DIE",
+      "portrait_tokens": [
+        "Haruna",
+        "haruna"
+      ],
+      "default_order": 2
+    },
+    {
+      "entry_id": "Hina",
+      "base_cid": "Hina",
+      "ba_character_id": 10004,
+      "is_costume_variant": false,
+      "costume_label_kr": "",
+      "name_kr": "히나",
+      "full_name_kr": "소라사키 히나",
+      "status_message_kr": "",
+      "status_message_jp": "",
+      "portrait_tokens": [
+        "Hina",
+        "hina"
+      ],
+      "default_order": 4
+    },
+    {
+      "entry_id": "Hoshino",
+      "base_cid": "Hoshino",
+      "ba_character_id": 10005,
+      "is_costume_variant": false,
+      "costume_label_kr": "",
+      "name_kr": "호시노",
+      "full_name_kr": "타카나시 호시노",
+      "status_message_kr": "낮잠 중 방해금지",
+      "status_message_jp": "昼寝中　起こさないで",
+      "portrait_tokens": [
+        "Hoshino",
+        "hoshino"
+      ],
+      "default_order": 5
+    },
+    {
+      "entry_id": "Maki",
+      "base_cid": "Maki",
+      "ba_character_id": 10007,
+      "is_costume_variant": false,
+      "costume_label_kr": "",
+      "name_kr": "마키",
+      "full_name_kr": "코누리 마키",
+      "status_message_kr": "그래피티, 너무 좋아!",
+      "status_message_jp": "グラフィティ大好き！",
+      "portrait_tokens": [
+        "Maki",
+        "maki"
+      ],
+      "default_order": 7
+    },
+    {
+      "entry_id": "Shiroko",
+      "base_cid": "Shiroko",
+      "ba_character_id": 10010,
+      "is_costume_variant": false,
+      "costume_label_kr": "",
+      "name_kr": "시로코",
+      "full_name_kr": "스나오오카미 시로코",
+      "status_message_kr": "사이클링 파티 모집 중… (1/5)",
+      "status_message_jp": "ライディング仲間募集中……（まだ１/５）",
+      "portrait_tokens": [
+        "Shiroko",
+        "shiroko"
+      ],
+      "default_order": 10
+    },
+    {
+      "entry_id": "Nonomi",
+      "base_cid": "Nonomi",
+      "ba_character_id": 13004,
+      "is_costume_variant": false,
+      "costume_label_kr": "",
+      "name_kr": "노노미",
+      "full_name_kr": "이자요이 노노미",
+      "status_message_kr": "즐거운 하루 되세요!",
+      "status_message_jp": "楽しい一日になりますように",
+      "portrait_tokens": [
+        "Nonomi",
+        "nonomi"
+      ],
+      "default_order": 18
+    },
+    {
+      "entry_id": "Kayoko",
+      "base_cid": "Kayoko",
+      "ba_character_id": 13005,
+      "is_costume_variant": false,
+      "costume_label_kr": "",
+      "name_kr": "카요코",
+      "full_name_kr": "오니카타 카요코",
+      "status_message_kr": "모모톡 잘 안 씁니다",
+      "status_message_jp": "モモトークはあんまり使わない",
+      "portrait_tokens": [
+        "Kayoko",
+        "kayoko"
+      ],
+      "default_order": 19
+    },
+    {
+      "entry_id": "Mutsuki",
+      "base_cid": "Mutsuki",
+      "ba_character_id": 13006,
+      "is_costume_variant": false,
+      "costume_label_kr": "",
+      "name_kr": "무츠키",
+      "full_name_kr": "아사기 무츠키",
+      "status_message_kr": "심심해~",
+      "status_message_jp": "何か面白いことないかな～",
+      "portrait_tokens": [
+        "Mutsuki",
+        "mutsuki"
+      ],
+      "default_order": 20
+    },
+    {
+      "entry_id": "Aris",
+      "base_cid": "Aris",
+      "ba_character_id": 10015,
+      "is_costume_variant": false,
+      "costume_label_kr": "",
+      "name_kr": "아리스",
+      "full_name_kr": "텐도 아리스",
+      "status_message_kr": "밀레니엄 게임개발부 아리스입니다",
+      "status_message_jp": "ミレニアムのゲーム開発部、アリスです",
+      "portrait_tokens": [
+        "Aris",
+        "aris"
+      ],
+      "default_order": 48
+    },
+    {
+      "entry_id": "Nodoka",
+      "base_cid": "Nodoka",
+      "ba_character_id": 26006,
+      "is_costume_variant": false,
+      "costume_label_kr": "",
+      "name_kr": "노도카",
+      "full_name_kr": "아마미 노도카",
+      "status_message_kr": "같이 별 보러 가요! ——★",
+      "status_message_jp": "一緒に星を見に行きましょう！★彡",
+      "portrait_tokens": [
+        "Nodoka",
+        "nodoka"
+      ],
+      "default_order": 52
+    },
+    {
+      "entry_id": "Azusa",
+      "base_cid": "Azusa",
+      "ba_character_id": 10019,
+      "is_costume_variant": false,
+      "costume_label_kr": "",
+      "name_kr": "아즈사",
+      "full_name_kr": "시라스 아즈사",
+      "status_message_kr": "et omnia vanitas",
+      "status_message_jp": "et omnia vanitas",
+      "portrait_tokens": [
+        "CH0056",
+        "azusa"
+      ],
+      "default_order": 54
+    },
+    {
+      "entry_id": "Ako",
+      "base_cid": "Ako",
+      "ba_character_id": 20008,
+      "is_costume_variant": false,
+      "costume_label_kr": "",
+      "name_kr": "아코",
+      "full_name_kr": "아마우 아코",
+      "status_message_kr": "업무 이외의 연락 사절",
+      "status_message_jp": "業務以外の連絡はお断りです",
+      "portrait_tokens": [
+        "CH0083",
+        "ako"
+      ],
+      "default_order": 74
+    },
+    {
+      "entry_id": "Fubuki",
+      "base_cid": "Fubuki",
+      "ba_character_id": 16008,
+      "is_costume_variant": false,
+      "costume_label_kr": "",
+      "name_kr": "후부키",
+      "full_name_kr": "네무가키 후부키",
+      "status_message_kr": "커피 with 도넛!",
+      "status_message_jp": "コーヒーにはドーナッツ！",
+      "portrait_tokens": [
+        "CH0141",
+        "fubuki"
+      ],
+      "default_order": 83
+    },
+    {
+      "entry_id": "Miyako",
+      "base_cid": "Miyako",
+      "ba_character_id": 10038,
+      "is_costume_variant": false,
+      "costume_label_kr": "",
+      "name_kr": "미야코",
+      "full_name_kr": "츠키유키 미야코",
+      "status_message_kr": "키보토스의 평화를 위해",
+      "status_message_jp": "キヴォトスの平和のために",
+      "portrait_tokens": [
+        "CH0142",
+        "miyako"
+      ],
+      "default_order": 90
+    },
+    {
+      "entry_id": "Miyu",
+      "base_cid": "Miyu",
+      "ba_character_id": 10039,
+      "is_costume_variant": false,
+      "costume_label_kr": "",
+      "name_kr": "미유",
+      "full_name_kr": "카스미자와 미유",
+      "status_message_kr": "좋은 날은 이제 다 끝이에요……",
+      "status_message_jp": "一寸先は闇……",
+      "portrait_tokens": [
+        "CH0145",
+        "miyu"
+      ],
+      "default_order": 92
+    },
+    {
+      "entry_id": "Misaki",
+      "base_cid": "Misaki",
+      "ba_character_id": 10041,
+      "is_costume_variant": false,
+      "costume_label_kr": "",
+      "name_kr": "미사키",
+      "full_name_kr": "이마시노 미사키",
+      "status_message_kr": "비라도 내리면 좋겠지만",
+      "status_message_jp": "雨でも降らないかな……",
+      "portrait_tokens": [
+        "CH0105",
+        "misaki"
+      ],
+      "default_order": 97
+    },
+    {
+      "entry_id": "Saori",
+      "base_cid": "Saori",
+      "ba_character_id": 10048,
+      "is_costume_variant": false,
+      "costume_label_kr": "",
+      "name_kr": "사오리",
+      "full_name_kr": "조마에 사오리",
+      "status_message_kr": "노력을 멈추지 않을게",
+      "status_message_jp": "努力あるのみ",
+      "portrait_tokens": [
+        "CH0103",
+        "saori"
+      ],
+      "default_order": 107
+    },
+    {
+      "entry_id": "Noa",
+      "base_cid": "Noa",
+      "ba_character_id": 10052,
+      "is_costume_variant": false,
+      "costume_label_kr": "",
+      "name_kr": "노아",
+      "full_name_kr": "우시오 노아",
+      "status_message_kr": "키보토스의 우울",
+      "status_message_jp": "キヴォトスの憂鬱",
+      "portrait_tokens": [
+        "CH0095",
+        "noa"
+      ],
+      "default_order": 112
+    },
+    {
+      "entry_id": "Shigure",
+      "base_cid": "Shigure",
+      "ba_character_id": 10055,
+      "is_costume_variant": false,
+      "costume_label_kr": "",
+      "name_kr": "시구레",
+      "full_name_kr": "마요이 시구레",
+      "status_message_kr": "음료를 섞고 인생을 바꿔 줄 시간이네.",
+      "status_message_jp": "飲み物を混ぜて人生を変える時間だね",
+      "portrait_tokens": [
+        "CH0122",
+        "shigure"
+      ],
+      "default_order": 119
+    },
+    {
+      "entry_id": "Mika",
+      "base_cid": "Mika",
+      "ba_character_id": 10059,
+      "is_costume_variant": false,
+      "costume_label_kr": "",
+      "name_kr": "미카",
+      "full_name_kr": "미소노 미카",
+      "status_message_kr": "같이 수다 떨 사람 모집 중!",
+      "status_message_jp": "一緒にお話してくれる人募集中！",
+      "portrait_tokens": [
+        "CH0069",
+        "mika"
+      ],
+      "default_order": 126
+    },
+    {
+      "entry_id": "Nagisa",
+      "base_cid": "Nagisa",
+      "ba_character_id": 20024,
+      "is_costume_variant": false,
+      "costume_label_kr": "",
+      "name_kr": "나기사",
+      "full_name_kr": "키리후지 나기사",
+      "status_message_kr": "언제나 품위있고 고상하게",
+      "status_message_jp": "いつでも余裕をもって、優雅に",
+      "portrait_tokens": [
+        "CH0068",
+        "nagisa"
+      ],
+      "default_order": 131
+    },
+    {
+      "entry_id": "Kikyou",
+      "base_cid": "Kikyou",
+      "ba_character_id": 10083,
+      "is_costume_variant": false,
+      "costume_label_kr": "",
+      "name_kr": "키쿄",
+      "full_name_kr": "키류 키쿄",
+      "status_message_kr": "교학상장",
+      "status_message_jp": "教学相長ず",
+      "portrait_tokens": [
+        "CH0225",
+        "kikyou"
+      ],
+      "default_order": 164
+    },
+    {
+      "entry_id": "Shiroko_Terror",
+      "base_cid": "Shiroko_Terror",
+      "ba_character_id": 10100,
+      "is_costume_variant": false,
+      "costume_label_kr": "",
+      "name_kr": "시로코*테러",
+      "full_name_kr": "스나오오카미 시로코 (시로코*테러)",
+      "status_message_kr": "사이클링 파티 모집 중… (2/5)",
+      "status_message_jp": "ライディング仲間募集中……（２/５）",
+      "portrait_tokens": [
+        "CH0263",
+        "shiroko_terror"
+      ],
+      "default_order": 190
+    },
+    {
+      "entry_id": "Kisaki",
+      "base_cid": "Kisaki",
+      "ba_character_id": 20039,
+      "is_costume_variant": false,
+      "costume_label_kr": "",
+      "name_kr": "키사키",
+      "full_name_kr": "류우게 키사키",
+      "status_message_kr": "성의정심",
+      "status_message_jp": "正心誠意",
+      "portrait_tokens": [
+        "CH0139",
+        "kisaki"
+      ],
+      "default_order": 197
+    },
+    {
+      "entry_id": "Seia",
+      "base_cid": "Seia",
+      "ba_character_id": 10110,
+      "is_costume_variant": false,
+      "costume_label_kr": "",
+      "name_kr": "세이아",
+      "full_name_kr": "유리조노 세이아",
+      "status_message_kr": "하고 싶었던 말을 서로에게",
+      "status_message_jp": "言の葉を紡ぐのは難しいものだね",
+      "portrait_tokens": [
+        "CH0070",
+        "seia"
+      ],
+      "default_order": 205
+    },
+    {
+      "entry_id": "Hikari",
+      "base_cid": "Hikari",
+      "ba_character_id": 10117,
+      "is_costume_variant": false,
+      "costume_label_kr": "",
+      "name_kr": "히카리",
+      "full_name_kr": "타치바나 히카리",
+      "status_message_kr": "↑↑↓↓←→←→",
+      "status_message_jp": "↑↑↓↓←→←→",
+      "portrait_tokens": [
+        "CH0242",
+        "hikari"
+      ],
+      "default_order": 217
+    },
+    {
+      "entry_id": "Nozomi",
+      "base_cid": "Nozomi",
+      "ba_character_id": 10118,
+      "is_costume_variant": false,
+      "costume_label_kr": "",
+      "name_kr": "노조미",
+      "full_name_kr": "타치바나 노조미",
+      "status_message_kr": "급속쾌속폭주질주~!!",
+      "status_message_jp": "急行快速、爆走特急～！！",
+      "portrait_tokens": [
+        "CH0243",
+        "nozomi"
+      ],
+      "default_order": 218
+    },
+    {
+      "entry_id": "Kanoe",
+      "base_cid": "Kanoe",
+      "ba_character_id": 10126,
+      "is_costume_variant": false,
+      "costume_label_kr": "",
+      "name_kr": "카노에",
+      "full_name_kr": "이타가키 카노에",
+      "status_message_kr": "내 목소리…… 들어볼래?",
+      "status_message_jp": "私の声……聴いてみるぅ？",
+      "portrait_tokens": [
+        "CH0306",
+        "kanoe"
+      ],
+      "default_order": 233
+    },
+    {
+      "entry_id": "Niko",
+      "base_cid": "Niko",
+      "ba_character_id": 10139,
+      "is_costume_variant": false,
+      "costume_label_kr": "",
+      "name_kr": "니코",
+      "full_name_kr": "요시노 니코",
+      "status_message_kr": "<FOX EATS> 주문은 앱을 이용해 주세요",
+      "status_message_jp": "＜FOX EATS＞ご利用の場合はアプリから",
+      "portrait_tokens": [
+        "CH0172",
+        "niko"
+      ],
+      "default_order": 257
+    },
+    {
+      "entry_id": "Otogi",
+      "base_cid": "Otogi",
+      "ba_character_id": 16020,
+      "is_costume_variant": false,
+      "costume_label_kr": "",
+      "name_kr": "오토기",
+      "full_name_kr": "텐진야마 오토기",
+      "status_message_kr": "군중 속의 고독",
+      "status_message_jp": "群衆の中の孤独",
+      "portrait_tokens": [
+        "CH0174",
+        "otogi"
+      ],
+      "default_order": 259
+    },
+    {
+      "entry_id": "Kei",
+      "base_cid": "Kei",
+      "ba_character_id": 10135,
+      "is_costume_variant": false,
+      "costume_label_kr": "",
+      "name_kr": "케이",
+      "full_name_kr": "텐도 케이 (Key)",
+      "status_message_kr": "밀레니엄 사이언스 스쿨, 케이입니다.",
+      "status_message_jp": "ケイです。よろしくお願いします",
+      "portrait_tokens": [
+        "CH0335",
+        "kei"
+      ],
+      "default_order": 250
+    },
+    {
+      "entry_id": "GSC_President",
+      "base_cid": "GSC_President",
+      "ba_character_id": 0,
+      "is_costume_variant": false,
+      "costume_label_kr": "",
+      "name_kr": "총학생회장",
+      "full_name_kr": "총학생회장",
+      "status_message_kr": "당신의 선택을 믿어요.",
+      "status_message_jp": "",
+      "portrait_tokens": [
+        "GSC_President"
+      ],
+      "default_order": 5000
+    }
+  ]
+}
