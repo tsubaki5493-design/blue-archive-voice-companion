@@ -26,7 +26,7 @@ from typing import Any, Callable
 import numpy as np
 
 from src.extractor.ba_molru_extractor import DEFAULT_GAME_DIR, discover_steam_blue_archive_dir
-from src.utils.app_paths import get_cache_dir
+from src.utils.app_paths import get_app_root, get_cache_dir
 
 
 def _discover_ba_root(custom_hint: str | Path | None = None) -> Path | None:
@@ -634,6 +634,90 @@ def encode_png_rgba(rgba: np.ndarray, compress_level: int = 1) -> bytes:
     return b"\x89PNG\r\n\x1a\n" + _png_chunk(b"IHDR", ihdr) + _png_chunk(b"IDAT", idat) + _png_chunk(b"IEND", b"")
 
 
+def decode_png_rgba(png_bytes: bytes) -> np.ndarray | None:
+    """Pure-Python/NumPy decoder for non-interlaced 8-bit RGB/RGBA PNGs -> `(H, W, 4)` uint8 array."""
+    if len(png_bytes) < 33 or png_bytes[:8] != b"\x89PNG\r\n\x1a\n":
+        return None
+    pos = 8
+    w = h = bit_depth = color_type = interlace = 0
+    idat_parts: list[bytes] = []
+    n = len(png_bytes)
+    while pos + 12 <= n:
+        length = struct.unpack_from(">I", png_bytes, pos)[0]
+        tag = png_bytes[pos + 4 : pos + 8]
+        data_start = pos + 8
+        data_end = data_start + length
+        if data_end + 4 > n:
+            return None
+        if tag == b"IHDR" and length >= 13:
+            w, h, bit_depth, color_type, _comp, _filt, interlace = struct.unpack_from(">IIBBBBB", png_bytes, data_start)
+        elif tag == b"IDAT":
+            idat_parts.append(png_bytes[data_start:data_end])
+        elif tag == b"IEND":
+            break
+        pos = data_end + 4
+
+    if w <= 0 or h <= 0 or bit_depth != 8 or interlace != 0 or color_type not in (2, 6):
+        return None
+    bpp = 4 if color_type == 6 else 3
+    stride = w * bpp
+    try:
+        raw = zlib.decompress(b"".join(idat_parts))
+    except Exception:
+        return None
+    if len(raw) < h * (stride + 1):
+        return None
+
+    rows = np.frombuffer(raw[: h * (stride + 1)], dtype=np.uint8).reshape(h, stride + 1)
+    filters = rows[:, 0]
+    payload = rows[:, 1:]
+    if np.all(filters == 0):
+        img = payload.reshape(h, w, bpp).copy()
+    else:
+        out = np.empty((h, stride), dtype=np.uint8)
+        prev = np.zeros(stride, dtype=np.uint8)
+        for y in range(h):
+            f = int(filters[y])
+            cur = payload[y].astype(np.int32)
+            if f == 0:
+                recon = cur
+            elif f == 1:
+                recon = cur.copy()
+                for i in range(bpp, stride):
+                    recon[i] = (recon[i] + recon[i - bpp]) & 0xFF
+            elif f == 2:
+                recon = (cur + prev.astype(np.int32)) & 0xFF
+            elif f == 3:
+                recon = cur.copy()
+                p_int = prev.astype(np.int32)
+                for i in range(stride):
+                    left = recon[i - bpp] if i >= bpp else 0
+                    recon[i] = (recon[i] + ((left + p_int[i]) >> 1)) & 0xFF
+            elif f == 4:
+                recon = cur.copy()
+                p_int = prev.astype(np.int32)
+                for i in range(stride):
+                    a = recon[i - bpp] if i >= bpp else 0
+                    b = p_int[i]
+                    c = p_int[i - bpp] if i >= bpp else 0
+                    p_val = a + b - c
+                    pa, pb, pc = abs(p_val - a), abs(p_val - b), abs(p_val - c)
+                    pr = a if (pa <= pb and pa <= pc) else (b if pb <= pc else c)
+                    recon[i] = (recon[i] + pr) & 0xFF
+            else:
+                return None
+            out[y] = recon.astype(np.uint8)
+            prev = out[y]
+        img = out.reshape(h, w, bpp)
+
+    if bpp == 4:
+        return img
+    rgba = np.empty((h, w, 4), dtype=np.uint8)
+    rgba[..., :3] = img
+    rgba[..., 3] = 255
+    return rgba
+
+
 def resize_rgba(rgba: np.ndarray, out_w: int, out_h: int) -> np.ndarray:
     """Anti-aliased box/bilinear RGBA resizer using float32 numpy interpolation."""
     src = rgba.astype(np.float32)
@@ -980,8 +1064,14 @@ class MomoTalkAssetManager:
 
     INDEX_VERSION = 3
 
-    def __init__(self, ba_root_hint: str | Path | None = None) -> None:
+    def __init__(
+        self,
+        ba_root_hint: str | Path | None = None,
+        bundled_assets_dir: str | Path | None = None,
+    ) -> None:
         self._ba_root_hint = ba_root_hint
+        self._bundled_assets_dir: Path | None = Path(bundled_assets_dir) if bundled_assets_dir is not None else None
+        self._bundled_file_maps: dict[str, dict[str, Path]] = {}
         self._lock = threading.Lock()
         self._bundle_cache_lock = threading.Lock()
         self._index: dict[str, Any] | None = None
@@ -993,6 +1083,51 @@ class MomoTalkAssetManager:
         self._rendered_dir_path: Path | None = None
         self._rendered_files: set[str] | None = None
         self._indexing_thread: threading.Thread | None = None
+
+    def _get_bundled_assets_dir(self) -> Path:
+        if self._bundled_assets_dir is not None:
+            return self._bundled_assets_dir
+        return get_app_root() / "config" / "momotalk_assets"
+
+    def _load_bundled_rgba(self, subdir: str, candidates: tuple[str, ...]) -> np.ndarray | None:
+        base = self._get_bundled_assets_dir() / subdir
+        with self._bundle_cache_lock:
+            fmap = self._bundled_file_maps.get(subdir)
+            if fmap is None:
+                fmap = {}
+                if base.is_dir():
+                    try:
+                        for p in base.iterdir():
+                            if p.is_file() and p.suffix.lower() == ".png":
+                                fmap[p.stem.lower()] = p
+                    except Exception:
+                        pass
+                self._bundled_file_maps[subdir] = fmap
+        if not fmap:
+            return None
+        for cand in candidates:
+            key = str(cand or "").strip().lower()
+            if not key:
+                continue
+            path = fmap.get(key)
+            if path is None:
+                continue
+            cache_key = f"bundled|{subdir}|{key}"
+            with self._bundle_cache_lock:
+                cached = self._raw_rgba_cache.get(cache_key)
+                if cached is not None:
+                    return cached
+            try:
+                rgba = decode_png_rgba(path.read_bytes())
+            except Exception:
+                rgba = None
+            if rgba is not None:
+                with self._bundle_cache_lock:
+                    if len(self._raw_rgba_cache) > 160:
+                        self._raw_rgba_cache.clear()
+                    self._raw_rgba_cache[cache_key] = rgba
+                return rgba
+        return None
 
     def set_ba_root_hint(self, ba_root_hint: str | Path | None) -> None:
         """Update Steam Blue Archive root hint at runtime and clear stale empty bundle index."""
@@ -1316,6 +1451,19 @@ class MomoTalkAssetManager:
                         self._rendered_files.discard(fname)
 
         if not cached_only:
+            # 1. Bundled portraits (works cleanly even when Steam Blue Archive is NOT installed)
+            entry_id = str(char_data.get("entry_id") or "").strip()
+            bundled_rgba = self._load_bundled_rgba("portraits", (entry_id, cid))
+            if bundled_rgba is not None:
+                png_bytes = render_circular_avatar_png(bundled_rgba, size=size, bg_rgb=bg_rgb, ring_rgb=ring_rgb)
+                try:
+                    steam_cache_file.write_bytes(png_bytes)
+                    self._mark_rendered_cached(fname)
+                except Exception:
+                    pass
+                return png_bytes
+
+            # 2. Local Steam Blue Archive UnityFS extraction fallback
             idx = self._index if (self._index is not None or not use_steam_if_unindexed) else self.ensure_index()
             if idx is not None:
                 portraits = idx.get("portraits") or {}
@@ -1359,6 +1507,18 @@ class MomoTalkAssetManager:
                         self._rendered_files.discard(fname)
 
         if not cached_only:
+            # 1. Bundled school crests (works without Steam)
+            bundled_rgba = self._load_bundled_rgba("schools", (code, "ETC"))
+            if bundled_rgba is not None:
+                png_bytes = encode_png_rgba(resize_rgba(bundled_rgba, size, size))
+                try:
+                    cache_file.write_bytes(png_bytes)
+                    self._mark_rendered_cached(fname)
+                except Exception:
+                    pass
+                return png_bytes
+
+            # 2. Local Steam UnityFS fallback
             idx = self._index if (self._index is not None or not use_steam_if_unindexed) else self.ensure_index()
             if idx is not None:
                 schools = idx.get("schools") or {}
@@ -1403,6 +1563,18 @@ class MomoTalkAssetManager:
         }.get(kind, (kind,))
 
         if not cached_only:
+            # 1. Bundled MomoTalk UI icons (works without Steam)
+            bundled_rgba = self._load_bundled_rgba("ui", (kind,))
+            if bundled_rgba is not None:
+                png_bytes = encode_png_rgba(resize_rgba(bundled_rgba, size, size))
+                try:
+                    cache_file.write_bytes(png_bytes)
+                    self._mark_rendered_cached(fname)
+                except Exception:
+                    pass
+                return png_bytes
+
+            # 2. Local Steam UnityFS fallback
             idx = self._index if (self._index is not None or not use_steam_if_unindexed) else self.ensure_index()
             if idx is not None:
                 ui_icons = idx.get("ui_icons") or {}

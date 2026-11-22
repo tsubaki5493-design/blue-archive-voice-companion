@@ -3,7 +3,7 @@
 블루 아카이브 학생들과 **실시간 마이크 음성 통화**를 나눌 수 있는 PC 프로그램입니다.
 공개 보이스 링크가 등록된 **33명의 학생(의상 변형 페르소나 통합)**이 미리 연결되어 있어, 복잡한 설정 없이 바로 통화를 시작할 수 있습니다.
 
-> ### 📥 바로 다운로드 (Windows 10 / 11 · 약 1.15 MB)
+> ### 📥 바로 다운로드 (Windows 10 / 11 · 약 2.5 MB · 프로필 초상화/아이콘 내장)
 > - **[▶ 최신 버전 ZIP 바로 다운로드 (`BlueArchive_VoiceCompanion_Release.zip`)](https://github.com/tsubaki5493-design/blue-archive-voice-companion/releases/latest/download/BlueArchive_VoiceCompanion_Release.zip)**
 > - [릴리스 페이지 및 SHA-256 무결성 해시 보기](https://github.com/tsubaki5493-design/blue-archive-voice-companion/releases/latest)
 >
@@ -72,8 +72,8 @@
 ---
 
 ## 💡 자주 묻는 질문 (FAQ)
-- **Steam 블루 아카이브가 꼭 있어야 하나요?**
-  - 아니요! 없어도 기본 아이콘으로 바로 대화할 수 있습니다. 스팀판이 설치되어 있으면 학생 초상화와 모모톡 아이콘을 읽기 전용으로 자동 불러옵니다.
+- **Steam 블루 아카이브가 없어도 프로필 이미지가 정상적으로 나오나요?**
+  - **네! Steam이 전혀 없어도 됩니다.** 33명 학생의 프로필 초상화, 학원 마크, 모모톡 아이콘과 공개 보이스가 프로그램에 모두 내장되어 있어 Steam 없이도 화면과 목소리가 100% 정상적으로 표시됩니다.
 - **내 API 키나 구글 로그인 정보가 안전할까요?**
   - 모든 개인 설정·API 키·로그인 세션·대화 기억은 사용자 PC의 `%LOCALAPPDATA%\VoiceCompanionData\`에만 저장되며 외부 개발자 서버로 절대 전송되지 않습니다. (상세 검증: [`SECURITY.md`](./SECURITY.md))
 - **보조 모드(모드 2 · VB-Cable)를 쓰고 싶어요.**
