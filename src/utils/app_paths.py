@@ -31,30 +31,51 @@ if os.name == "nt":
 USER_DATA_FOLDER_NAME = "VoiceCompanionData"
 DPAPI_PREFIX = "dpapi:"
 CRYPTPROTECT_UI_FORBIDDEN = 0x1
-SECRET_CONFIG_KEYS: tuple[str, ...] = ("fish_api_key", "gemini_api_key")
+SECRET_CONFIG_KEYS: tuple[str, ...] = (
+    "fish_api_key",
+    "gemini_api_key",
+    "claude_api_key",
+    "openai_api_key",
+    "fish_mcp_oauth_data",
+    "colab_s2pro_api_key",
+)
 MAX_CONFIG_FILE_BYTES = 4 * 1024 * 1024
 MAX_DEFAULT_VOICES_BYTES = 2 * 1024 * 1024
 
 _SID_RE = re.compile(r"^S-1-[0-9-]+$")
 _ACL_LOCK = threading.Lock()
+_CONFIG_IO_LOCK = threading.RLock()
 _HARDENED_ACL_PATHS: set[str] = set()
 _CACHED_USER_SID: str | None = None
+_SID_INIT_LOCK = threading.Lock()
 _DPAPI_INIT_LOCK = threading.Lock()
-_DPAPI_CONFIGURED = False
+_DPAPI_CRYPT32: Any = None
+_DPAPI_KERNEL32: Any = None
+_SID_ADVAPI32: Any = None
+_SID_KERNEL32: Any = None
 
 # Secret redaction patterns (kept idempotent via negative lookahead on [REDACTED...])
 _SECRET_JSON_KV_RE = re.compile(
-    r"""(?i)(['"]?(?:fish_api_key|gemini_api_key)['"]?\s*[:=]\s*['"]?)(?!\[REDACTED\b)([^'"\s,}\]]+)"""
+    r"""(?i)((?:\\?['"])?(?:fish_api_key|gemini_api_key|claude_api_key|openai_api_key|fish_mcp_oauth_data|colab_s2pro_api_key|access_token|refresh_token|client_secret|id_token)(?:\\?['"])?\s*[:=]\s*(?:\\?['"])?)(?!\[REDACTED\b)([^'"\\\s,}\]]+)"""
 )
 _DPAPI_BLOB_RE = re.compile(r"dpapi:[A-Za-z0-9+/=_\-]{4,}")
 _AIZA_KEY_RE = re.compile(r"AIza[0-9A-Za-z\-_]{12,}")
 _SK_KEY_RE = re.compile(r"\bsk-[0-9A-Za-z_\-]{10,}\b")
 _BEARER_RE = re.compile(r"(?i)\b(Bearer\s+)(?!\[REDACTED\b)([^\s'\"`,;}\]]{6,})")
 _GOOG_HDR_RE = re.compile(
-    r"""(?i)(['"]?x-goog-api-key['"]?\s*[:=]\s*['"]?)(?!\[REDACTED\b)([^'"\s,;&}\]]+)"""
+    r"""(?i)(['"]?(?:x-goog-api-key|x-api-key)['"]?\s*[:=]\s*['"]?)(?!\[REDACTED\b)([^'"\s,;&}\]]+)"""
 )
 _QUERY_KEY_RE = re.compile(r"(?i)([?&](?:api_?)?(?:key)=)(?!\[REDACTED\b)([^&\s'\"<>}\]]+)")
 _BARE_KEY_KV_RE = re.compile(r"(?i)((?:^|[\s,(])(?:api[_-]?)?(?:key)=)(?!\[REDACTED\b)([^&\s'\"<>}\],)]{6,})")
+
+# Zero-circular-import API model ID sanitization patterns (mirrors gemini_connector.py)
+_SAFE_API_MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_UNSAFE_API_MODEL_CHARS_RE = re.compile(r"(?:\.\.|[/\\?#&=;<>\x00-\x1f\x7f])")
+_PROVIDER_API_MODEL_TOKEN_RES: dict[str, re.Pattern[str]] = {
+    "gemini": re.compile(r"\b(gemini-[A-Za-z0-9][A-Za-z0-9._-]{1,120})\b"),
+    "claude": re.compile(r"\b(claude-[A-Za-z0-9][A-Za-z0-9._-]{1,120})\b"),
+    "chatgpt": re.compile(r"\b((?:gpt-[A-Za-z0-9]|o[1-9])[A-Za-z0-9._-]{1,120})\b"),
+}
 
 
 if os.name == "nt":
@@ -77,39 +98,41 @@ if os.name == "nt":
 
 
 def _configure_dpapi() -> tuple[Any, Any]:
-    """Configure ctypes signatures for Windows crypt32 DPAPI & kernel32.LocalFree."""
-    global _DPAPI_CONFIGURED
-    crypt32 = ctypes.windll.crypt32
-    kernel32 = ctypes.windll.kernel32
-    if not _DPAPI_CONFIGURED:
-        with _DPAPI_INIT_LOCK:
-            if not _DPAPI_CONFIGURED:
-                crypt32.CryptProtectData.argtypes = [
-                    ctypes.POINTER(_DATA_BLOB),
-                    ctypes.c_wchar_p,
-                    ctypes.POINTER(_DATA_BLOB),
-                    ctypes.c_void_p,
-                    ctypes.c_void_p,
-                    ctypes.wintypes.DWORD,
-                    ctypes.POINTER(_DATA_BLOB),
-                ]
-                crypt32.CryptProtectData.restype = ctypes.wintypes.BOOL
+    """Configure private ctypes WinDLL handles for Windows crypt32 DPAPI & kernel32.LocalFree."""
+    global _DPAPI_CRYPT32, _DPAPI_KERNEL32
+    if _DPAPI_CRYPT32 is not None and _DPAPI_KERNEL32 is not None:
+        return _DPAPI_CRYPT32, _DPAPI_KERNEL32
+    with _DPAPI_INIT_LOCK:
+        if _DPAPI_CRYPT32 is None or _DPAPI_KERNEL32 is None:
+            crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            crypt32.CryptProtectData.argtypes = [
+                ctypes.POINTER(_DATA_BLOB),
+                ctypes.c_wchar_p,
+                ctypes.POINTER(_DATA_BLOB),
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.wintypes.DWORD,
+                ctypes.POINTER(_DATA_BLOB),
+            ]
+            crypt32.CryptProtectData.restype = ctypes.wintypes.BOOL
 
-                crypt32.CryptUnprotectData.argtypes = [
-                    ctypes.POINTER(_DATA_BLOB),
-                    ctypes.POINTER(ctypes.c_wchar_p),
-                    ctypes.POINTER(_DATA_BLOB),
-                    ctypes.c_void_p,
-                    ctypes.c_void_p,
-                    ctypes.wintypes.DWORD,
-                    ctypes.POINTER(_DATA_BLOB),
-                ]
-                crypt32.CryptUnprotectData.restype = ctypes.wintypes.BOOL
+            crypt32.CryptUnprotectData.argtypes = [
+                ctypes.POINTER(_DATA_BLOB),
+                ctypes.POINTER(ctypes.c_wchar_p),
+                ctypes.POINTER(_DATA_BLOB),
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.wintypes.DWORD,
+                ctypes.POINTER(_DATA_BLOB),
+            ]
+            crypt32.CryptUnprotectData.restype = ctypes.wintypes.BOOL
 
-                kernel32.LocalFree.argtypes = [ctypes.c_void_p]
-                kernel32.LocalFree.restype = ctypes.c_void_p
-                _DPAPI_CONFIGURED = True
-    return crypt32, kernel32
+            kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+            kernel32.LocalFree.restype = ctypes.c_void_p
+            _DPAPI_CRYPT32 = crypt32
+            _DPAPI_KERNEL32 = kernel32
+    return _DPAPI_CRYPT32, _DPAPI_KERNEL32
 
 
 def protect_secret(plaintext: str) -> str:
@@ -245,75 +268,85 @@ def redact_secrets(text: str, extra_secrets: tuple[str, ...] | Iterable[str] = (
 
 def _get_current_user_sid() -> str:
     """Return the current Windows user's SID string (e.g. `S-1-5-21-...`), or `""` on failure."""
-    global _CACHED_USER_SID
+    global _CACHED_USER_SID, _SID_ADVAPI32, _SID_KERNEL32
     if _CACHED_USER_SID is not None:
         return _CACHED_USER_SID
-    if os.name != "nt":
-        _CACHED_USER_SID = ""
-        return ""
-    try:
-        advapi32 = ctypes.windll.advapi32
-        kernel32 = ctypes.windll.kernel32
-        TOKEN_QUERY = 0x0008
-        TokenUser = 1
-
-        kernel32.GetCurrentProcess.restype = ctypes.wintypes.HANDLE
-        advapi32.OpenProcessToken.argtypes = [
-            ctypes.wintypes.HANDLE,
-            ctypes.wintypes.DWORD,
-            ctypes.POINTER(ctypes.wintypes.HANDLE),
-        ]
-        advapi32.OpenProcessToken.restype = ctypes.wintypes.BOOL
-        advapi32.GetTokenInformation.argtypes = [
-            ctypes.wintypes.HANDLE,
-            ctypes.c_int,
-            ctypes.c_void_p,
-            ctypes.wintypes.DWORD,
-            ctypes.POINTER(ctypes.wintypes.DWORD),
-        ]
-        advapi32.GetTokenInformation.restype = ctypes.wintypes.BOOL
-        advapi32.ConvertSidToStringSidW.argtypes = [
-            ctypes.c_void_p,
-            ctypes.POINTER(ctypes.c_void_p),
-        ]
-        advapi32.ConvertSidToStringSidW.restype = ctypes.wintypes.BOOL
-        kernel32.CloseHandle.argtypes = [ctypes.wintypes.HANDLE]
-        kernel32.CloseHandle.restype = ctypes.wintypes.BOOL
-        kernel32.LocalFree.argtypes = [ctypes.c_void_p]
-        kernel32.LocalFree.restype = ctypes.c_void_p
-
-        h_tok = ctypes.wintypes.HANDLE()
-        if not advapi32.OpenProcessToken(kernel32.GetCurrentProcess(), TOKEN_QUERY, ctypes.byref(h_tok)):
+    with _SID_INIT_LOCK:
+        if _CACHED_USER_SID is not None:
+            return _CACHED_USER_SID
+        if os.name != "nt":
             _CACHED_USER_SID = ""
             return ""
         try:
-            needed = ctypes.wintypes.DWORD(0)
-            advapi32.GetTokenInformation(h_tok, TokenUser, None, 0, ctypes.byref(needed))
-            if needed.value == 0:
-                _CACHED_USER_SID = ""
-                return ""
-            buf = ctypes.create_string_buffer(needed.value)
-            if not advapi32.GetTokenInformation(h_tok, TokenUser, buf, needed.value, ctypes.byref(needed)):
-                _CACHED_USER_SID = ""
-                return ""
-            tu = ctypes.cast(buf, ctypes.POINTER(_TOKEN_USER)).contents
-            p_str = ctypes.c_void_p()
-            if not advapi32.ConvertSidToStringSidW(tu.User.Sid, ctypes.byref(p_str)):
+            if _SID_ADVAPI32 is None or _SID_KERNEL32 is None:
+                advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+                kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+                kernel32.GetCurrentProcess.argtypes = []
+                kernel32.GetCurrentProcess.restype = ctypes.wintypes.HANDLE
+                advapi32.OpenProcessToken.argtypes = [
+                    ctypes.wintypes.HANDLE,
+                    ctypes.wintypes.DWORD,
+                    ctypes.POINTER(ctypes.wintypes.HANDLE),
+                ]
+                advapi32.OpenProcessToken.restype = ctypes.wintypes.BOOL
+                advapi32.GetTokenInformation.argtypes = [
+                    ctypes.wintypes.HANDLE,
+                    ctypes.c_int,
+                    ctypes.c_void_p,
+                    ctypes.wintypes.DWORD,
+                    ctypes.POINTER(ctypes.wintypes.DWORD),
+                ]
+                advapi32.GetTokenInformation.restype = ctypes.wintypes.BOOL
+                advapi32.ConvertSidToStringSidW.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.POINTER(ctypes.c_void_p),
+                ]
+                advapi32.ConvertSidToStringSidW.restype = ctypes.wintypes.BOOL
+                kernel32.CloseHandle.argtypes = [ctypes.wintypes.HANDLE]
+                kernel32.CloseHandle.restype = ctypes.wintypes.BOOL
+                kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+                kernel32.LocalFree.restype = ctypes.c_void_p
+                _SID_ADVAPI32 = advapi32
+                _SID_KERNEL32 = kernel32
+            else:
+                advapi32 = _SID_ADVAPI32
+                kernel32 = _SID_KERNEL32
+
+            TOKEN_QUERY = 0x0008
+            TokenUser = 1
+
+            h_tok = ctypes.wintypes.HANDLE()
+            if not advapi32.OpenProcessToken(kernel32.GetCurrentProcess(), TOKEN_QUERY, ctypes.byref(h_tok)):
                 _CACHED_USER_SID = ""
                 return ""
             try:
-                sid_str = ctypes.wstring_at(p_str.value)
+                needed = ctypes.wintypes.DWORD(0)
+                advapi32.GetTokenInformation(h_tok, TokenUser, None, 0, ctypes.byref(needed))
+                if needed.value == 0:
+                    _CACHED_USER_SID = ""
+                    return ""
+                buf = ctypes.create_string_buffer(needed.value)
+                if not advapi32.GetTokenInformation(h_tok, TokenUser, buf, needed.value, ctypes.byref(needed)):
+                    _CACHED_USER_SID = ""
+                    return ""
+                tu = ctypes.cast(buf, ctypes.POINTER(_TOKEN_USER)).contents
+                p_str = ctypes.c_void_p()
+                if not advapi32.ConvertSidToStringSidW(tu.User.Sid, ctypes.byref(p_str)):
+                    _CACHED_USER_SID = ""
+                    return ""
+                try:
+                    sid_str = ctypes.wstring_at(p_str.value)
+                finally:
+                    if p_str.value:
+                        kernel32.LocalFree(p_str.value)
             finally:
-                if p_str.value:
-                    kernel32.LocalFree(p_str.value)
-        finally:
-            kernel32.CloseHandle(h_tok)
+                kernel32.CloseHandle(h_tok)
 
-        _CACHED_USER_SID = sid_str if _SID_RE.match(sid_str or "") else ""
-        return _CACHED_USER_SID
-    except Exception:
-        _CACHED_USER_SID = ""
-        return ""
+            _CACHED_USER_SID = sid_str if _SID_RE.match(sid_str or "") else ""
+            return _CACHED_USER_SID
+        except Exception:
+            _CACHED_USER_SID = ""
+            return ""
 
 
 def harden_user_data_acl(path: Path) -> None:
@@ -372,7 +405,7 @@ def harden_user_data_acl(path: Path) -> None:
 
 
 def _read_bounded_text(path: Path, max_bytes: int) -> str:
-    """Read UTF-8 text from a regular non-symlink file with a strict byte-size ceiling."""
+    """Read UTF-8 (with optional BOM) text from a regular non-symlink file with a strict byte-size ceiling."""
     if path.is_symlink() or not path.is_file():
         raise ValueError(f"Refusing to read non-regular or symlinked file: {path.name}")
     if path.stat().st_size > max_bytes:
@@ -381,14 +414,20 @@ def _read_bounded_text(path: Path, max_bytes: int) -> str:
         raw = fh.read(max_bytes + 1)
     if len(raw) > max_bytes:
         raise ValueError(f"File exceeds size limit ({max_bytes} bytes): {path.name}")
-    return raw.decode("utf-8")
+    return raw.decode("utf-8-sig")
 
 
 def _prepare_config_for_disk(cfg: dict[str, Any]) -> dict[str, Any]:
-    """Return a shallow copy of `cfg` with secret fields DPAPI-encrypted (never mutating caller's dict)."""
-    disk_cfg = dict(cfg)
+    """Return a deep snapshot of `cfg` with secret fields DPAPI-encrypted (never mutating caller's dict)."""
+    disk_cfg = deepcopy(dict(cfg))
     for key in SECRET_CONFIG_KEYS:
-        val = str(disk_cfg.get(key) or "").strip()
+        raw_val = disk_cfg.get(key)
+        if raw_val is None or isinstance(raw_val, bool):
+            val = ""
+        elif isinstance(raw_val, (dict, list)):
+            val = json.dumps(raw_val, ensure_ascii=False, separators=(",", ":"))
+        else:
+            val = str(raw_val).strip()
         disk_cfg[key] = protect_secret(val) if val else ""
     return disk_cfg
 
@@ -453,16 +492,28 @@ DEFAULT_USER_CONFIG: dict[str, Any] = {
     "selected_character_id": "Aru",
     "persona_prompt_variant": "official",
     "fish_api_key": "",
+    "fish_mcp_oauth_data": "",
+    "fish_mcp_fallback_enabled": True,
+    "fish_mcp_primary_mode": False,
+    "fish_credit_saver_mode": True,
+    "fish_tts_cache_enabled": True,
+    "colab_s2pro_enabled": False,
+    "colab_s2pro_url": "",
+    "colab_s2pro_api_key": "",
+    "colab_s2pro_drive_folder_id": "",
+    "colab_s2pro_notebook_id": "",
+    "colab_s2pro_endpoint_file": "",
     "fish_reference_id": "",
     "fish_voice_title": "직접 입력 / 선택됨",
     "saved_voices": {},
     "saved_voices_kr": {},
     "steam_game_dir": "",
     "auto_voice_visibility": "private",  # "private" | "unlist" | "public"
-    "auto_voice_quality_profile": "pro85",  # "pro85" | "standard45"
+    "auto_voice_quality_profile": "plus200",  # "plus200" | "pro85" | "standard45"
     "reply_language": "ja",  # "ja" (일본어 답변 · 기본) or "ko" (한국어 답변)
     "fish_model_header": "s2.1-pro-free",
     "stt_language": "auto",
+    "whisper_model": "auto",
     "streaming_speed_mode": "expressive",
     "auto_emotion_directing": True,
     "expression_boost_offset": 0.0,
@@ -477,8 +528,9 @@ DEFAULT_USER_CONFIG: dict[str, Any] = {
     "primary_output_device": "",
     # --- Mode C & Distributable PC Mic Companion Settings ---
     "bridge_mode": "pc_mic",  # "pc_mic" (Mode 1) or "gemini_live_audio" (Mode 2)
-    "call_bridge_mode": "mode1",  # "mode1" (PC Mic+Gemini) or "mode2" (VB-Cable)
-    "gemini_backend": "browser",  # "browser" (Mode B) or "api" (Mode A)
+    "call_bridge_mode": "mode1",  # "mode1" (PC Mic+AI) or "mode2" (VB-Cable)
+    "ai_provider": "gemini",  # "gemini" | "claude" | "chatgpt"
+    "gemini_backend": "browser",  # "browser" (웹 로그인) or "api" (공식 API)
     "gemini_browser_model": "hydrogen",  # auto / hydrogen / neon_4 / carbon_4 / web_dyn:*
     "gemini_thinking_level": "low",  # "low" (낮음) / "medium" (보통) / "high" (높음) / "xhigh" (최고)
     "gemini_api_key": "",
@@ -487,6 +539,20 @@ DEFAULT_USER_CONFIG: dict[str, Any] = {
     "web_models": [],  # Account-synced Gemini web [code, label] list
     "web_models_schema_version": 2,  # v2: Gemini 4 Neon / Auto / Hydrogen / Carbon lineup
     "web_account_tier": "",  # "Free" | "Pro" | "Ultra" | ""
+    # Claude (Anthropic) settings
+    "claude_api_key": "",
+    "claude_api_model": "claude-sonnet-5-5",
+    "claude_browser_model": "default",
+    "claude_api_models": [],
+    "claude_web_models": [],
+    "claude_web_account_tier": "",
+    # ChatGPT (OpenAI) settings
+    "openai_api_key": "",
+    "openai_api_model": "gpt-5.4-mini",
+    "chatgpt_browser_model": "default",
+    "openai_api_models": [],
+    "chatgpt_web_models": [],
+    "chatgpt_web_account_tier": "",
     "use_custom_persona": False,
     "custom_persona_prompt": (
         "너는 다정하고 재치 있는 AI 보이스 메이트야. "
@@ -501,6 +567,7 @@ DEFAULT_USER_CONFIG: dict[str, Any] = {
     "idle_ping_max_sec": 75.0,
     "afk_max_consecutive_pings": 2,
     "subtitle_mode": "jp_kr",
+    "subtitle_font_size": 11,
     "subtitle_engine": "auto_inline",  # "auto_inline", "web:<model>", "api:<model>", "fast_nmt"
     "subtitle_thinking_level": "low",  # "low" (낮음) / "medium" (보통) / "high" (높음) / "xhigh" (최고)
     "jp_beginner_lover_mode": False,
@@ -570,8 +637,35 @@ def get_trigger_cache_dir() -> Path:
     return p
 
 
+def get_tts_cache_dir() -> Path:
+    p = get_cache_dir() / "tts_audio"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
 def get_user_models_dir() -> Path:
-    p = get_user_data_dir() / "models"
+    """
+    Return the directory storing extracted studio voice WAVs/transcripts.
+    Precedence:
+      1. Explicit `VOICE_COMPANION_MODELS_DIR` env override
+      2. Isolated test override (`VOICE_COMPANION_DATA_DIR/models`)
+      3. Local workspace `data/models` when present (keeps large audio packs off C: drive)
+      4. Standard per-user `%LOCALAPPDATA%\\VoiceCompanionData\\models`
+    """
+    models_override = os.environ.get("VOICE_COMPANION_MODELS_DIR", "").strip()
+    if models_override:
+        p = Path(models_override).expanduser().resolve()
+    elif os.environ.get("VOICE_COMPANION_DATA_DIR", "").strip():
+        p = get_user_data_dir() / "models"
+    else:
+        exe_models = get_exe_dir() / "data" / "models"
+        local_models = get_app_root() / "data" / "models"
+        if exe_models.is_dir() and not exe_models.is_symlink():
+            p = exe_models
+        elif local_models != exe_models and local_models.is_dir() and not local_models.is_symlink():
+            p = local_models
+        else:
+            p = get_user_data_dir() / "models"
     p.mkdir(parents=True, exist_ok=True)
     return p
 
@@ -650,174 +744,86 @@ def load_bundled_default_voices(app_root: Path | None = None) -> tuple[dict[str,
         return {}, {}
 
 
+def _normalize_provider_key(provider: Any) -> str:
+    raw = str(provider or "gemini").strip().lower()
+    if raw in ("claude", "anthropic"):
+        return "claude"
+    if raw in ("chatgpt", "openai", "gpt"):
+        return "chatgpt"
+    return "gemini"
+
+
+def _sanitize_stored_api_model(raw: Any, provider: str, default: str) -> str:
+    """
+    Validate or self-heal a persisted API model identifier without importing `gemini_connector`.
+    Accepts clean IDs, strips a safe `models/` prefix, or extracts a clean provider-prefixed ID
+    from old/new UI display labels only when free of dangerous URL/path characters.
+    """
+    if not isinstance(raw, str):
+        return default
+    s = raw.strip()
+    if not s:
+        return default
+    if s.lower().startswith("models/"):
+        tail = s[7:].strip()
+        if tail and ".." not in tail and _SAFE_API_MODEL_ID_RE.fullmatch(tail):
+            return tail
+        return default
+    if ".." not in s and _SAFE_API_MODEL_ID_RE.fullmatch(s):
+        return s
+    if _UNSAFE_API_MODEL_CHARS_RE.search(s):
+        return default
+    p = _normalize_provider_key(provider)
+    pat = _PROVIDER_API_MODEL_TOKEN_RES.get(p)
+    if pat is not None:
+        m = pat.search(s)
+        if m:
+            cand = m.group(1).strip()
+            if cand and ".." not in cand and _SAFE_API_MODEL_ID_RE.fullmatch(cand):
+                return cand
+    return default
+
+
+def _sanitize_stored_api_model_list(raw_list: Any, provider: str) -> list[str]:
+    """Sanitize and deduplicate a stored list of API model IDs while preserving order."""
+    if not isinstance(raw_list, list):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in raw_list:
+        clean = _sanitize_stored_api_model(item, provider, default="")
+        if clean and clean not in seen:
+            seen.add(clean)
+            out.append(clean)
+    return out
+
+
 def _normalize_loaded_config(raw_cfg: dict[str, Any]) -> dict[str, Any]:
-    cfg = deepcopy(DEFAULT_USER_CONFIG)
-    prev_ver = int(raw_cfg.get("emotion_engine_version", 0) or 0)
-    cfg.update(raw_cfg)
-    for secret_key in SECRET_CONFIG_KEYS:
-        raw_secret = str(cfg.get(secret_key, "") or "").strip()
-        if raw_secret.startswith(DPAPI_PREFIX):
-            cfg[secret_key] = unprotect_secret(raw_secret)
-        else:
-            cfg[secret_key] = raw_secret
-    if not isinstance(cfg.get("saved_voices"), dict):
-        cfg["saved_voices"] = {}
-    if not isinstance(cfg.get("saved_voices_kr"), dict):
-        cfg["saved_voices_kr"] = {}
-    rlang = str(cfg.get("reply_language", "ja") or "ja").strip().lower()
-    cfg["reply_language"] = "ko" if rlang == "ko" else "ja"
-    cfg["steam_game_dir"] = str(cfg.get("steam_game_dir", "") or "").strip()
-    auto_vis = str(cfg.get("auto_voice_visibility", "private") or "private").strip().lower()
-    cfg["auto_voice_visibility"] = auto_vis if auto_vis in ("private", "unlist", "public") else "private"
-    auto_prof = str(cfg.get("auto_voice_quality_profile", "pro85") or "pro85").strip().lower()
-    cfg["auto_voice_quality_profile"] = auto_prof if auto_prof in ("pro85", "standard45") else "pro85"
-    if prev_ver < 4:
-        cfg["streaming_speed_mode"] = "expressive"
-        cfg["emotion_engine_version"] = 4
-    elif cfg.get("streaming_speed_mode") == "balanced":
-        cfg["streaming_speed_mode"] = "expressive"
-    if cfg.get("fish_reference_id") and "Aru" not in cfg["saved_voices"]:
-        cfg["saved_voices"]["Aru"] = cfg["fish_reference_id"]
+    """Validate, coerce, clamp, decrypt, and migrate loaded config via `settings_recovery.sanitize_user_config`."""
+    from src.utils.settings_recovery import sanitize_user_config
 
-    # Clamp proactive range safely
-    min_s = max(5.0, float(cfg.get("idle_ping_min_sec", 45.0) or 45.0))
-    max_s = max(min_s, float(cfg.get("idle_ping_max_sec", 75.0) or 75.0))
-    cfg["idle_ping_min_sec"] = min_s
-    cfg["idle_ping_max_sec"] = max_s
-    cfg["afk_max_consecutive_pings"] = max(1, int(cfg.get("afk_max_consecutive_pings", 2) or 2))
-
-    # Migrate legacy combined or retired browser model / subtitle engine keys seamlessly
-    valid_think_levels = ("low", "medium", "high", "xhigh")
-    legacy_bmodel_map: dict[str, tuple[str, str | None]] = {
-        "hydrogen_low": ("hydrogen", "low"),
-        "hydrogen_medium": ("hydrogen", "medium"),
-        "hydrogen_high": ("hydrogen", "high"),
-        "flash_lite": ("auto", None),
-        "pro_31": ("neon_4", None),
-        "argon_4": ("neon_4", None),
-    }
-    raw_bmodel = str(cfg.get("gemini_browser_model", "hydrogen") or "hydrogen")
-    if raw_bmodel in legacy_bmodel_map:
-        base_m, inf_lvl = legacy_bmodel_map[raw_bmodel]
-        cfg["gemini_browser_model"] = base_m
-        if inf_lvl and "gemini_thinking_level" not in raw_cfg:
-            cfg["gemini_thinking_level"] = inf_lvl
-    if str(cfg.get("gemini_thinking_level", "low")) not in valid_think_levels:
-        cfg["gemini_thinking_level"] = "low"
-
-    legacy_sub_map: dict[str, tuple[str, str | None]] = {
-        "auto_llm": ("auto_inline", None),
-        "browser_hydrogen_low": ("web:hydrogen", "low"),
-        "browser_hydrogen_high": ("web:hydrogen", "high"),
-        "browser_flash_lite": ("web:auto", "low"),
-        "web:flash_lite": ("web:auto", None),
-        "web:pro_31": ("web:neon_4", None),
-        "web:argon_4": ("web:neon_4", None),
-    }
-    raw_sub = str(cfg.get("subtitle_engine", "auto_inline") or "auto_inline")
-    if raw_sub in legacy_sub_map:
-        new_sub, inf_lvl = legacy_sub_map[raw_sub]
-        cfg["subtitle_engine"] = new_sub
-        if inf_lvl and "subtitle_thinking_level" not in raw_cfg:
-            cfg["subtitle_thinking_level"] = inf_lvl
-    if str(cfg.get("subtitle_thinking_level", "low")) not in valid_think_levels:
-        cfg["subtitle_thinking_level"] = "low"
-
-    raw_api_models = cfg.get("api_models", [])
-    if isinstance(raw_api_models, list):
-        cfg["api_models"] = [str(m).strip() for m in raw_api_models if str(m).strip()]
-    else:
-        cfg["api_models"] = []
-
-    raw_web_schema = int(raw_cfg.get("web_models_schema_version", 1) or 1)
-    raw_web_models = cfg.get("web_models", [])
-    clean_web_models: list[list[str]] = []
-    if isinstance(raw_web_models, list):
-        seen_wm: set[str] = set()
-        for entry in raw_web_models:
-            if isinstance(entry, (list, tuple)) and len(entry) >= 2:
-                code = str(entry[0] or "").strip()
-                label = str(entry[1] or "").strip()
-                if code and label and code not in seen_wm:
-                    seen_wm.add(code)
-                    clean_web_models.append([code, label])
-    retired_web_codes = {"flash_lite", "pro_31", "argon_4"}
-    if raw_web_schema < 2 and any(code in retired_web_codes for code, _ in clean_web_models):
-        # Clear stale pre-Nov-2026 cached web picker so updated Gemini 4 Neon defaults + auto-sync take over
-        clean_web_models = []
-    cfg["web_models"] = clean_web_models
-    cfg["web_models_schema_version"] = 2
-    tier_val = str(cfg.get("web_account_tier", "") or "").strip()
-    cfg["web_account_tier"] = tier_val if tier_val in ("Free", "Pro", "Ultra") else ""
-
-    raw_bm = raw_cfg.get("bridge_mode")
-    raw_cbm = raw_cfg.get("call_bridge_mode")
-    if raw_bm is None and raw_cbm is not None:
-        cbm = "mode2" if str(raw_cbm).strip() == "mode2" else "mode1"
-        cfg["call_bridge_mode"] = cbm
-        cfg["bridge_mode"] = "gemini_live_audio" if cbm == "mode2" else "pc_mic"
-    else:
-        bm = (
-            "gemini_live_audio"
-            if str(cfg.get("bridge_mode", "pc_mic")).strip() == "gemini_live_audio"
-            else "pc_mic"
-        )
-        cfg["bridge_mode"] = bm
-        cfg["call_bridge_mode"] = "mode2" if bm == "gemini_live_audio" else "mode1"
-    cfg["jp_beginner_lover_mode"] = bool(cfg.get("jp_beginner_lover_mode", False))
-    cfg["temporary_call_mode"] = bool(cfg.get("temporary_call_mode", False))
+    cfg, _repaired = sanitize_user_config(raw_cfg)
     return cfg
 
 
 def save_user_config(cfg: dict[str, Any]) -> Path:
     """
     Atomically persist user config inside %LOCALAPPDATA%\\VoiceCompanionData\\config.json.
-    Encrypts API keys at rest with Windows DPAPI without mutating the caller's in-memory dict.
+    Thread-safe via `_CONFIG_IO_LOCK`; encrypts API keys at rest with Windows DPAPI
+    on a deep snapshot without mutating the caller's in-memory dict.
     """
-    target = get_config_path()
-    disk_cfg = _prepare_config_for_disk(cfg)
-    payload = json.dumps(disk_cfg, ensure_ascii=False, indent=2)
-    return _atomic_write_restricted_text(target, payload, prefix=".cfg_")
+    with _CONFIG_IO_LOCK:
+        target = get_config_path()
+        disk_cfg = _prepare_config_for_disk(cfg)
+        payload = json.dumps(disk_cfg, ensure_ascii=False, indent=2, allow_nan=False)
+        return _atomic_write_restricted_text(target, payload, prefix=".cfg_")
 
 
 def load_user_config(app_root: Path | None = None) -> dict[str, Any]:
     """Load config from %LOCALAPPDATA%\\VoiceCompanionData\\config.json with defaults, DPAPI decrypt & presets."""
-    cfg_path = get_config_path()
-    loaded: dict[str, Any] = {}
-    if cfg_path.exists() and not cfg_path.is_symlink():
-        try:
-            saved = json.loads(_read_bounded_text(cfg_path, MAX_CONFIG_FILE_BYTES))
-            if isinstance(saved, dict):
-                loaded = saved
-        except Exception:
-            loaded = {}
+    from src.utils.settings_recovery import load_user_config_with_report
 
-    # Best-effort transparent upgrade: encrypt any legacy plaintext API keys found on disk
-    if loaded and os.name == "nt":
-        has_legacy_plaintext_secret = any(
-            bool(str(loaded.get(k) or "").strip()) and not str(loaded.get(k) or "").strip().startswith(DPAPI_PREFIX)
-            for k in SECRET_CONFIG_KEYS
-        )
-        if has_legacy_plaintext_secret:
-            try:
-                migrated_disk = _prepare_config_for_disk(loaded)
-                _atomic_write_restricted_text(
-                    cfg_path,
-                    json.dumps(migrated_disk, ensure_ascii=False, indent=2),
-                    prefix=".cfg_",
-                )
-            except Exception:
-                pass
-
-    cfg = _normalize_loaded_config(loaded)
-    bundled_jp, bundled_kr = load_bundled_default_voices(app_root)
-    for cid, vid in bundled_jp.items():
-        if not str(cfg["saved_voices"].get(cid) or "").strip():
-            cfg["saved_voices"][cid] = vid
-    for cid, vid in bundled_kr.items():
-        if not str(cfg["saved_voices_kr"].get(cid) or "").strip():
-            cfg["saved_voices_kr"][cid] = vid
-    return cfg
+    return load_user_config_with_report(app_root=app_root).config
 
 
 def migrate_legacy_workspace_data(app_root: Path | None = None) -> dict[str, Any]:
@@ -887,7 +893,7 @@ def scan_forbidden_personal_artifacts(root: Path) -> list[str]:
     that must NEVER be packaged or shipped to third parties.
     """
     findings: list[str] = []
-    skip_dirs = {".venv", ".git", "__pycache__", "build", "dist", "vcclient"}
+    skip_dirs = {".venv", ".venv_rvc", ".git", "__pycache__", "build", "dist", "vcclient"}
     forbidden_dir_names = {"EBWebView", "User Data", "BrowserProfile", "VoiceCompanionData"}
 
     legacy_cfg = root / "config" / "fish_bridge_config.json"

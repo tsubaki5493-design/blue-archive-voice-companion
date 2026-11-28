@@ -32,22 +32,33 @@ def build_jp_beginner_lover_coach_prompt(
     while strictly preserving the character's persona & register.
     Idempotent when `JP_COACH_PROMPT_MARKER` is already present.
     """
-    clean_base = (base_prompt or "").strip()
+    clean_base = str(base_prompt or "").strip()
     if JP_COACH_PROMPT_MARKER in clean_base:
         return clean_base
 
     if isinstance(char_data, dict) and char_data:
-        persona = char_data.get("persona") or {}
-        sm = persona.get("speech_mechanics_jp") or {}
-        vap = persona.get("voice_acting_profile") or {}
+        raw_persona = char_data.get("persona")
+        persona = raw_persona if isinstance(raw_persona, dict) else {}
+        raw_sm = persona.get("speech_mechanics_jp")
+        if not isinstance(raw_sm, dict):
+            raw_sm = char_data.get("speech_mechanics_jp")
+        sm = raw_sm if isinstance(raw_sm, dict) else {}
+        raw_vap = persona.get("voice_acting_profile")
+        if not isinstance(raw_vap, dict):
+            raw_vap = char_data.get("voice_acting_profile")
+        vap = raw_vap if isinstance(raw_vap, dict) else {}
 
         name_jp = str(char_data.get("name_jp") or char_data.get("name_kr") or "キャラクター").strip()
         first_person = str(sm.get("first_person") or "私").strip()
         sensei_addr = str(sm.get("sensei_address") or char_data.get("user_title_jp") or "先生").strip()
         base_register = str(sm.get("base_register") or "キャラクター本来の自然な話し言葉").strip()
-        endings_list = [str(e).strip() for e in (sm.get("signature_endings") or []) if str(e).strip()]
+        raw_endings = sm.get("signature_endings")
+        endings_seq = raw_endings if isinstance(raw_endings, (list, tuple)) else ([raw_endings] if isinstance(raw_endings, str) else [])
+        endings_list = [str(e).strip() for e in endings_seq if str(e).strip()]
         endings_str = " / ".join(endings_list[:6]) if endings_list else "キャラクター固有の語尾"
-        forb_list = [str(f).strip() for f in (sm.get("forbidden_expressions") or []) if str(f).strip()]
+        raw_forb = sm.get("forbidden_expressions")
+        forb_seq = raw_forb if isinstance(raw_forb, (list, tuple)) else ([raw_forb] if isinstance(raw_forb, str) else [])
+        forb_list = [str(f).strip() for f in forb_seq if str(f).strip()]
         forbidden_str = " / ".join(forb_list) if forb_list else "なし（キャラクター崩壊表現は禁止）"
         archetype = str(vap.get("archetype") or "").strip()
     else:

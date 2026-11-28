@@ -4,19 +4,44 @@
 Strictly separates the 5 lifecycle states to prevent race conditions or audio feedback loops:
   - IDLE      : 대기 중 (the ONLY state where the bidirectional silence timer advances)
   - LISTENING : 사용자 말하기 (mic VAD detected speech; immediately resets silence timer)
-  - THINKING  : 제미니 응답 중 (waiting for / streaming Gemini response)
+  - THINKING  : AI 응답 중 (waiting for / streaming AI response)
   - SPEAKING  : Fish Audio 재생 중 (playing character TTS PCM audio)
   - AFK       : 자리 비움 (entered after consecutive unanswered proactive pings; paused until user speaks)
 """
 
 from __future__ import annotations
 
+import math
 import random
 import threading
 import time
 from dataclasses import dataclass
 from enum import Enum
-from typing import Callable
+from typing import Any, Callable
+
+
+def _safe_float(val: Any, default: float, min_val: float, max_val: float = 3600.0) -> float:
+    try:
+        if isinstance(val, bool) or val is None:
+            return default
+        f = float(val)
+        if not math.isfinite(f):
+            return default
+        return max(min_val, min(max_val, f))
+    except Exception:
+        return default
+
+
+def _safe_int(val: Any, default: int, min_val: int, max_val: int = 20) -> int:
+    try:
+        if isinstance(val, bool) or val is None:
+            return default
+        f = float(val)
+        if not math.isfinite(f):
+            return default
+        return max(min_val, min(max_val, int(round(f))))
+    except Exception:
+        return default
 
 
 class CompanionState(str, Enum):
@@ -30,7 +55,7 @@ class CompanionState(str, Enum):
 STATE_KR_LABELS: dict[CompanionState, str] = {
     CompanionState.IDLE: "대기 중 (IDLE)",
     CompanionState.LISTENING: "사용자 말하기 (LISTENING)",
-    CompanionState.THINKING: "제미니 응답 중 (THINKING)",
+    CompanionState.THINKING: "AI 응답 중 (THINKING)",
     CompanionState.SPEAKING: "Fish Audio 재생 중 (SPEAKING)",
     CompanionState.AFK: "자리 비움 (AFK)",
 }
@@ -66,9 +91,9 @@ class CompanionStateMachine:
         self._rng = rng
 
         self.proactive_enabled = bool(proactive_enabled)
-        self.min_idle_sec = max(5.0, float(min_idle_sec))
-        self.max_idle_sec = max(self.min_idle_sec, float(max_idle_sec))
-        self.max_pings = max(1, int(max_consecutive_pings))
+        self.min_idle_sec = _safe_float(min_idle_sec, 45.0, 5.0)
+        self.max_idle_sec = max(self.min_idle_sec, _safe_float(max_idle_sec, 75.0, 5.0))
+        self.max_pings = _safe_int(max_consecutive_pings, 2, 1)
 
         self.active = False
         self.state = CompanionState.IDLE
@@ -111,13 +136,13 @@ class CompanionStateMachine:
             if proactive_enabled is not None:
                 self.proactive_enabled = bool(proactive_enabled)
             if min_idle_sec is not None:
-                self.min_idle_sec = max(5.0, float(min_idle_sec))
+                self.min_idle_sec = _safe_float(min_idle_sec, self.min_idle_sec, 5.0)
             if max_idle_sec is not None:
-                self.max_idle_sec = max(self.min_idle_sec, float(max_idle_sec))
+                self.max_idle_sec = max(self.min_idle_sec, _safe_float(max_idle_sec, self.max_idle_sec, 5.0))
             else:
                 self.max_idle_sec = max(self.min_idle_sec, self.max_idle_sec)
             if max_consecutive_pings is not None:
-                self.max_pings = max(1, int(max_consecutive_pings))
+                self.max_pings = _safe_int(max_consecutive_pings, self.max_pings, 1)
             if self.state == CompanionState.IDLE:
                 self.target_idle_sec = self._sample_target_locked()
                 if ts > self.idle_started_ts:
@@ -127,6 +152,7 @@ class CompanionStateMachine:
     def start_session(self, now: float | None = None) -> None:
         ts = time.monotonic() if now is None else float(now)
         with self._lock:
+            self._turn_seq += 1
             self.active = True
             self.consecutive_pings = 0
             self._pre_listen_state = CompanionState.IDLE
@@ -135,6 +161,7 @@ class CompanionStateMachine:
     def stop_session(self, now: float | None = None) -> None:
         ts = time.monotonic() if now is None else float(now)
         with self._lock:
+            self._turn_seq += 1
             self.active = False
             self.consecutive_pings = 0
             self._pre_listen_state = CompanionState.IDLE
@@ -147,6 +174,7 @@ class CompanionStateMachine:
             self._turn_seq += 1
             self._current_turn_is_ping = False
             self.consecutive_pings = 0
+            self._pre_listen_state = CompanionState.IDLE
             self.state = CompanionState.THINKING
 
     def on_mic_voice_start(self, now: float | None = None) -> bool:

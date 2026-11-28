@@ -19,15 +19,24 @@
   ],
   "stop_button_selectors": [
     "button[aria-label*='대답 생성 중지']",
-    "button[aria-label*='중지']",
-    "button[aria-label*='Stop']",
-    "button[aria-label*='停止']"
+    "button[aria-label*='Stop response']",
+    "button[aria-label*='Stop generating']",
+    "input-area-v2 button[aria-label*='중지']",
+    "input-area-v2 button[aria-label*='Stop']",
+    "input-area-v2 button[aria-label*='停止']",
+    "form button[aria-label*='중지']",
+    "form button[aria-label*='Stop']",
+    "form button[aria-label*='停止']",
+    ".input-area button[aria-label*='중지']",
+    ".input-area button[aria-label*='Stop']"
   ],
   "response_selectors": [
     "model-response message-content .markdown",
     "model-response .model-response-text",
     "model-response message-content",
-    "message-content .markdown"
+    "message-content .markdown",
+    "model-response structured-content-container",
+    "model-response .response-content"
   ],
   "new_chat_selectors": [
     "a[aria-label*='새 채팅']",
@@ -42,5 +51,153 @@
     "a[aria-label*='Sign in']",
     "button[aria-label*='로그인']",
     "button[aria-label*='Sign in']"
-  ]
+  ],
+  "providers": {
+    "claude": {
+      "url": "https://claude.ai/new",
+      "input_selectors": [
+        "div[data-testid='chat-input'][contenteditable='true']",
+        "div.ProseMirror[contenteditable='true'][role='textbox']",
+        "div.ProseMirror[contenteditable='true']",
+        "fieldset div[contenteditable='true']",
+        "div[role='textbox'][contenteditable='true']",
+        "textarea"
+      ],
+      "send_button_selectors": [
+        "button[aria-label='Send message']:not([disabled]):not([aria-disabled='true'])",
+        "button[aria-label='메시지 보내기']:not([disabled]):not([aria-disabled='true'])",
+        "button[data-testid='send-button']:not([disabled]):not([aria-disabled='true'])",
+        "fieldset button[aria-label*='Send']:not([aria-label*='feedback' i]):not([disabled]):not([aria-disabled='true'])",
+        "form button[aria-label*='Send']:not([aria-label*='feedback' i]):not([disabled]):not([aria-disabled='true'])",
+        "fieldset button[aria-label*='보내기']:not([aria-label*='피드백']):not([disabled]):not([aria-disabled='true'])",
+        "fieldset button[aria-label*='전송']:not([aria-label*='피드백']):not([disabled]):not([aria-disabled='true'])",
+        "button[aria-label*='메시지 보내기']:not([disabled]):not([aria-disabled='true'])",
+        "button[aria-label*='送信']:not([disabled]):not([aria-disabled='true'])"
+      ],
+      "stop_button_selectors": [
+        "button[data-testid='stop-button']",
+        "button[aria-label='Stop response']",
+        "button[aria-label='Stop generating']",
+        "button[aria-label='응답 중지']",
+        "button[aria-label='생성 중지']",
+        "fieldset button[aria-label*='Stop']",
+        "form button[aria-label*='Stop']",
+        "div[role='button'][aria-label*='Stop response']",
+        "fieldset button[aria-label*='중지']",
+        "fieldset button[aria-label*='停止']"
+      ],
+      "response_selectors": [
+        ".font-claude-response",
+        ".font-claude-message",
+        "[data-testid='assistant-message']",
+        "div[data-test-render-count] .font-claude-response"
+      ],
+      "new_chat_selectors": [
+        "a[href='/new']",
+        "a[aria-label*='New chat']",
+        "button[aria-label*='New chat']",
+        "a[aria-label*='새 채팅']",
+        "button[aria-label*='새 채팅']"
+      ],
+      "login_required_selectors": [
+        "input[type='email']",
+        "input[name='email']",
+        "button[data-testid='login-button']",
+        "button[data-testid*='login']",
+        "a[href*='/login']",
+        "a[href*='/signup']",
+        "button[aria-label*='Continue with Google']",
+        "button[aria-label*='Log in']",
+        "button[aria-label*='Sign in']"
+      ]
+    },
+    "chatgpt": {
+      "url": "https://chatgpt.com/",
+      "input_selectors": [
+        "div.ProseMirror[data-composer-markdown][contenteditable='true']",
+        "div[data-composer-markdown][contenteditable='true']",
+        "#prompt-textarea",
+        "div#prompt-textarea[contenteditable='true']",
+        "div.ProseMirror#prompt-textarea",
+        "#mobile-composer-prompt",
+        "textarea[name='prompt']",
+        "div[role='textbox'][contenteditable='true']",
+        "textarea[data-id='root']",
+        "textarea"
+      ],
+      "send_button_selectors": [
+        "button[data-testid='send-button']:not([disabled]):not([aria-disabled='true']):not([data-stop-generating]):not([data-visually-disabled]):not([data-composer-voice-start])",
+        "#composer-submit-button:not([disabled]):not([aria-disabled='true']):not([data-testid='stop-button']):not([data-testid='composer-speech-button']):not([data-stop-generating]):not([data-visually-disabled]):not([data-composer-voice-start])",
+        "button[data-testid='composer-submit-button']:not([disabled]):not([aria-disabled='true']):not([data-testid='stop-button']):not([data-testid='composer-speech-button']):not([data-stop-generating]):not([data-visually-disabled]):not([data-composer-voice-start])",
+        "button[data-composer-submit]:not([disabled]):not([aria-disabled='true']):not([data-stop-generating]):not([data-visually-disabled]):not([data-composer-voice-start])",
+        "button[aria-label*='Send prompt']:not([disabled]):not([aria-disabled='true']):not([data-testid='stop-button']):not([data-testid='composer-speech-button']):not([data-stop-generating]):not([data-visually-disabled]):not([data-composer-voice-start])",
+        "button[aria-label*='프롬프트 보내기']:not([disabled]):not([aria-disabled='true']):not([data-testid='stop-button']):not([data-testid='composer-speech-button']):not([data-stop-generating]):not([data-visually-disabled]):not([data-composer-voice-start])",
+        "button[aria-label*='메시지 보내기']:not([disabled]):not([aria-disabled='true']):not([data-testid='stop-button']):not([data-testid='composer-speech-button']):not([data-stop-generating]):not([data-visually-disabled]):not([data-composer-voice-start])",
+        "button[aria-label*='보내기']:not([disabled]):not([aria-disabled='true']):not([data-testid='stop-button']):not([data-testid='composer-speech-button']):not([data-stop-generating]):not([data-visually-disabled]):not([data-composer-voice-start])",
+        "button[aria-label*='Send']:not([disabled]):not([aria-disabled='true']):not([data-testid='stop-button']):not([data-testid='composer-speech-button']):not([data-stop-generating]):not([data-visually-disabled]):not([data-composer-voice-start])",
+        "button[aria-label*='送信']:not([disabled]):not([aria-disabled='true']):not([data-testid='stop-button']):not([data-testid='composer-speech-button']):not([data-stop-generating]):not([data-visually-disabled]):not([data-composer-voice-start])",
+        "form button[type='submit'][aria-label]:not([disabled]):not([aria-disabled='true']):not([data-testid='stop-button']):not([data-testid='composer-speech-button']):not([data-stop-generating]):not([data-visually-disabled]):not([data-composer-voice-start])"
+      ],
+      "stop_button_selectors": [
+        "button[data-testid='stop-button']",
+        "button[data-stop-generating]",
+        "button[aria-label*='Stop streaming']",
+        "button[aria-label*='Stop generating']",
+        "button[aria-label*='스트리밍 중지']",
+        "button[aria-label*='생성 중단']",
+        "button[aria-label*='생성 중지']",
+        "form button[aria-label*='중단']",
+        "form button[aria-label*='중지']",
+        "form button[aria-label*='Stop']",
+        "form button[aria-label*='停止']",
+        "[data-composer-footer-responsive] button[aria-label*='중단']",
+        "[data-composer-footer-responsive] button[aria-label*='중지']",
+        "[data-composer-footer-responsive] button[aria-label*='Stop']",
+        "[data-composer-footer-responsive] button[aria-label*='停止']",
+        "[data-testid='composer-background'] button[aria-label*='중단']",
+        "[data-testid='composer-background'] button[aria-label*='중지']",
+        "[data-testid='composer-background'] button[aria-label*='Stop']"
+      ],
+      "response_selectors": [
+        "[data-content-search-unit-key$=':assistant'] [data-markdown-text-style='assistant-message']",
+        "[data-chatgpt-search-unit-key$=':assistant'] [data-markdown-text-style='assistant-message']",
+        "[data-markdown-text-style='assistant-message']",
+        "[data-response-body] [data-dil-response]",
+        "[data-dil-response]",
+        "[data-message-author-role='assistant'] .markdown",
+        "[data-message-role='assistant'] [data-assistant-markdown]",
+        "[data-message-author-role='assistant'] .prose",
+        "article[data-turn='assistant'] .markdown",
+        "[data-message-role='assistant'] [data-assistant-markdown-root]",
+        "[data-content-search-unit-key$=':assistant']",
+        "[data-chatgpt-search-unit-key$=':assistant']",
+        "[data-response-body]",
+        "[data-message-author-role='assistant']",
+        "[data-message-role='assistant']",
+        "article[data-turn='assistant']"
+      ],
+      "new_chat_selectors": [
+        "a[data-testid='create-new-chat-button']",
+        "button[data-testid='create-new-chat-button']",
+        "button[aria-label='새 채팅']",
+        "button[aria-label='New chat']",
+        "a[aria-label*='New chat']:not([href*='/c/']):not([data-interactive-row-link])",
+        "button[aria-label*='New chat']:not([aria-label*=' in ' i])",
+        "a[aria-label*='새 채팅']:not([href*='/c/']):not([data-interactive-row-link])",
+        "button[aria-label*='새 채팅']:not([aria-label*='에서 새 채팅'])"
+      ],
+      "login_required_selectors": [
+        "form[data-logged-out]",
+        "form[action*='/unauth-']",
+        "[data-header-auth-actions]",
+        "button[data-mobile-auth-entry-action='login']",
+        "form[action*='/auth/login']",
+        "a[href*='/auth/login']",
+        "button[data-testid*='login']",
+        "a[data-testid*='login']",
+        "button[data-testid='signup-button']",
+        "a[href*='auth.openai.com']"
+      ]
+    }
+  }
 }

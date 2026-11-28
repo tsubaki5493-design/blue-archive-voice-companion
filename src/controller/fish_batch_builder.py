@@ -20,7 +20,11 @@ UI-independent core module (zero tkinter dependencies) powering both the CLI
 
 from __future__ import annotations
 
+import copy
+import datetime
+from email.utils import parsedate_to_datetime
 import json
+import math
 import os
 import re
 import shutil
@@ -32,7 +36,9 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 from urllib.parse import unquote, urlparse
 
+import numpy as np
 import requests
+import soundfile as sf
 
 from src.extractor.ba_molru_extractor import (
     DEFAULT_GAME_DIR,
@@ -43,12 +49,19 @@ from src.extractor.ba_molru_extractor import (
 from src.extractor.ba_momotalk_assets import MomoTalkAssetManager
 from src.extractor.build_fish_reference import (
     DEFAULT_QUALITY_PROFILE,
+    INTER_CLIP_PAUSE_SEC,
     REFERENCE_QUALITY_PROFILES,
+    STUDIO_PIPELINE_VERSION,
+    TARGET_SR,
+    apply_cosine_fade,
     build_alt_voice_char_data,
     build_character_fish_reference,
     character_has_steam_voice_pack,
     compute_clip_filter_hash,
+    compute_extraction_config_hash,
     find_character_voice_molru_files,
+    get_gamedata_signature,
+    resample_audio,
     resolve_quality_profile,
     select_upload_samples_with_transcript_lock,
 )
@@ -61,6 +74,7 @@ from src.utils.app_paths import (
 )
 
 FISH_MODEL_URL = "https://api.fish.audio/model"
+FISH_MAX_UPLOAD_FILES = 20
 VALID_VISIBILITIES: tuple[str, ...] = ("private", "unlist", "public")
 
 # Allow nested parentheses inside Korean/JP character names (e.g. "텐도 케이 (Key) / KR ...")
@@ -75,14 +89,49 @@ _MIN_FREE_DISK_BYTES = 500 * 1024 * 1024  # 500 MB hard floor
 _WARN_FREE_DISK_BYTES = 5 * 1024 * 1024 * 1024  # 5 GB warning threshold for full 305-char pro85 run
 MAX_FISH_JSON_RESPONSE_BYTES = 8 * 1024 * 1024  # 8 MB cap on Fish Audio JSON responses
 MAX_CHAR_CONFIG_BYTES = 5 * 1024 * 1024         # 5 MB cap per character JSON
+MAX_MANIFEST_JSON_BYTES = 8 * 1024 * 1024       # 8 MB cap on fish_batch_manifest.json
+
+_BATCH_PERSIST_LOCK = threading.RLock()
+
+
+def _as_dict(val: Any) -> dict[str, Any]:
+    return val if isinstance(val, dict) else {}
+
+
+def _ensure_dict(parent: dict[str, Any], key: str) -> dict[str, Any]:
+    val = parent.get(key)
+    if isinstance(val, dict):
+        return val
+    d: dict[str, Any] = {}
+    parent[key] = d
+    return d
+
+
+def _safe_int(val: Any, default: int = 0) -> int:
+    if isinstance(val, bool) or val is None:
+        return default
+    try:
+        return int(val)
+    except (ValueError, TypeError):
+        return default
+
+
+def _safe_float(val: Any, default: float = 0.0) -> float:
+    if isinstance(val, bool) or val is None:
+        return default
+    try:
+        v = float(val)
+        return v if math.isfinite(v) else default
+    except (ValueError, TypeError):
+        return default
 
 _FALLBACK_REDACT_PATS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"AIza[0-9A-Za-z\-_]{20,}"), "[REDACTED_GOOGLE_KEY]"),
     (re.compile(r"\bsk-[0-9A-Za-z_\-]{16,}"), "[REDACTED_API_KEY]"),
     (re.compile(r"(?i)(Bearer\s+)[^\s\"',;}\]]+"), r"\1[REDACTED]"),
-    (re.compile(r"(?i)(x-goog-api-key[\"']?\s*[:=]\s*[\"']?)[^\s\"',;}\]]+"), r"\1[REDACTED]"),
+    (re.compile(r"(?i)((?:x-goog-api-key|x-api-key)[\"']?\s*[:=]\s*[\"']?)[^\s\"',;}\]]+"), r"\1[REDACTED]"),
     (re.compile(r"(?i)([?&](?:api_)?key=)[^&\s\"']+"), r"\1[REDACTED]"),
-    (re.compile(r'("(?:fish_api_key|gemini_api_key)"\s*:\s*")[^"]*(")'), r"\1[REDACTED]\2"),
+    (re.compile(r'("(?:fish_api_key|gemini_api_key|claude_api_key|openai_api_key)"\s*:\s*")[^"]*(")'), r"\1[REDACTED]\2"),
     (re.compile(r"dpapi:[A-Za-z0-9+/=]{16,}"), "dpapi:[REDACTED]"),
 )
 
@@ -233,9 +282,16 @@ def _atomic_write_json(target: Path, data: Any) -> Path:
     target.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(data, ensure_ascii=False, indent=2)
     fd, tmp_name = tempfile.mkstemp(prefix=".fbatch_", suffix=".tmp", dir=str(target.parent))
+    fd_closed = False
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+            fd_closed = True
             fh.write(payload)
+            fh.flush()
+            try:
+                os.fsync(fh.fileno())
+            except OSError:
+                pass
         last_perm_err: Exception | None = None
         for attempt in range(6):
             try:
@@ -248,11 +304,23 @@ def _atomic_write_json(target: Path, data: Any) -> Path:
         if last_perm_err is not None:
             raise last_perm_err
     except Exception:
+        if not fd_closed:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
         try:
-            os.unlink(tmp_name)
+            if os.path.exists(tmp_name):
+                os.unlink(tmp_name)
         except OSError:
             pass
         raise
+    finally:
+        if os.path.exists(tmp_name):
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
     return target
 
 
@@ -267,19 +335,20 @@ def backup_saved_voices_once(cfg: dict[str, Any], log_cb: Callable[[str], None] 
     Never overwrites an already-created backup file.
     """
     backup_path = get_pre_batch_backup_path()
-    if backup_path.is_file():
-        return backup_path
-    saved_jp = dict(cfg.get("saved_voices") or {})
-    saved_kr = dict(cfg.get("saved_voices_kr") or {})
-    if not saved_jp and not saved_kr:
-        return None
-    snapshot = {
-        "backed_up_at": time.time(),
-        "saved_voices": saved_jp,
-        "saved_voices_kr": saved_kr,
-        "fish_reference_id": str(cfg.get("fish_reference_id") or ""),
-    }
-    _atomic_write_json(backup_path, snapshot)
+    with _BATCH_PERSIST_LOCK:
+        if backup_path.is_file():
+            return backup_path
+        saved_jp = dict(_as_dict(cfg.get("saved_voices")))
+        saved_kr = dict(_as_dict(cfg.get("saved_voices_kr")))
+        if not saved_jp and not saved_kr:
+            return None
+        snapshot = {
+            "backed_up_at": time.time(),
+            "saved_voices": saved_jp,
+            "saved_voices_kr": saved_kr,
+            "fish_reference_id": str(cfg.get("fish_reference_id") or ""),
+        }
+        _atomic_write_json(backup_path, snapshot)
     if callable(log_cb):
         log_cb(
             f"💾 [안전 백업] 기존 연결 보이스 (JP {len(saved_jp)}개 · KR {len(saved_kr)}개)를 "
@@ -297,6 +366,31 @@ def _sync_active_reference_id(cfg: dict[str, Any], char_id: str, lang_up: str, m
         cfg["fish_reference_id"] = model_id
 
 
+def _update_manifest_entry_locked(
+    entry_key: str,
+    patch: dict[str, Any],
+    manifest: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Thread-safe read-merge-write of a single manifest entry without losing concurrent updates."""
+    with _BATCH_PERSIST_LOCK:
+        disk_m = load_batch_manifest()
+        disk_entries = _ensure_dict(disk_m, "entries")
+        if manifest is not None:
+            mem_entries = _ensure_dict(manifest, "entries")
+            for dk, dv in disk_entries.items():
+                if dk not in mem_entries and isinstance(dv, dict):
+                    mem_entries[dk] = dv
+            target_m = manifest
+            entries = mem_entries
+        else:
+            target_m = disk_m
+            entries = disk_entries
+        prev_ent = _as_dict(entries.get(entry_key))
+        entries[entry_key] = {**prev_ent, **patch}
+        save_batch_manifest(target_m)
+        return target_m
+
+
 def record_self_owned_model(
     char_id: str,
     name_kr: str,
@@ -307,26 +401,25 @@ def record_self_owned_model(
     manifest: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Record a model created on the user's own Fish Audio account in `fish_batch_manifest.json`."""
-    m = manifest if manifest is not None else load_batch_manifest()
-    entries = m.setdefault("entries", {})
     lang_up = lang.upper()
     key = f"{char_id}::{lang_up}"
-    entries[key] = {
-        **(entries.get(key) or {}),
-        "char_id": char_id,
-        "name_kr": name_kr,
-        "lang": lang_up,
-        "quality_profile": quality_profile,
-        "extracted": True,
-        "uploaded": True,
-        "owned_by_self": True,
-        "model_id": _clean_model_id(model_id),
-        "visibility": visibility,
-        "error": "",
-        "updated_at": time.time(),
-    }
-    save_batch_manifest(m)
-    return m
+    return _update_manifest_entry_locked(
+        key,
+        {
+            "char_id": char_id,
+            "name_kr": name_kr,
+            "lang": lang_up,
+            "quality_profile": quality_profile,
+            "extracted": True,
+            "uploaded": True,
+            "owned_by_self": True,
+            "model_id": _clean_model_id(model_id),
+            "visibility": visibility,
+            "error": "",
+            "updated_at": time.time(),
+        },
+        manifest=manifest,
+    )
 
 
 def get_batch_manifest_path() -> Path:
@@ -336,20 +429,33 @@ def get_batch_manifest_path() -> Path:
 def load_batch_manifest() -> dict[str, Any]:
     path = get_batch_manifest_path()
     default: dict[str, Any] = {"schema_version": 1, "updated_at": 0.0, "entries": {}}
-    if path.is_file():
+    with _BATCH_PERSIST_LOCK:
+        if path.is_symlink() or not path.is_file():
+            return default
         try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
+            if path.stat().st_size > MAX_MANIFEST_JSON_BYTES:
+                return default
+            with open(path, "rb") as fh:
+                raw_bytes = fh.read(MAX_MANIFEST_JSON_BYTES + 1)
+            if len(raw_bytes) > MAX_MANIFEST_JSON_BYTES:
+                return default
+            raw = json.loads(raw_bytes.decode("utf-8"))
             if isinstance(raw, dict) and isinstance(raw.get("entries"), dict):
                 default.update(raw)
+                default["entries"] = {
+                    str(k): v for k, v in raw["entries"].items() if isinstance(v, dict)
+                }
         except Exception:
             pass
     return default
 
 
 def save_batch_manifest(manifest: dict[str, Any]) -> Path:
-    manifest["schema_version"] = 1
-    manifest["updated_at"] = time.time()
-    return _atomic_write_json(get_batch_manifest_path(), manifest)
+    with _BATCH_PERSIST_LOCK:
+        _ensure_dict(manifest, "entries")
+        manifest["schema_version"] = 1
+        manifest["updated_at"] = time.time()
+        return _atomic_write_json(get_batch_manifest_path(), manifest)
 
 
 def load_all_character_configs(config_dir: Path | None = None) -> dict[str, dict[str, Any]]:
@@ -444,19 +550,36 @@ def is_studio_v2_extracted(
             return False
     except OSError:
         return False
+    if meta_file.is_symlink():
+        return False
     try:
         meta = json.loads(meta_file.read_text(encoding="utf-8"))
     except Exception:
         return False
+    if not isinstance(meta, dict):
+        return False
+    pipe_ver = _safe_int(meta.get("pipeline_version"), 0)
+    if pipe_ver < STUDIO_PIPELINE_VERSION:
+        return False
     if quality_profile:
         want_prof, _ = resolve_quality_profile(quality_profile)
-        saved_prof = str(meta.get("quality_profile") or "standard45").strip().lower()
-        pipe_ver = int(meta.get("pipeline_version", 0) or 0)
-        if want_prof == "pro85" and (saved_prof != "pro85" or pipe_ver < 3):
+        saved_prof = str(meta.get("quality_profile") or "").strip().lower()
+        if saved_prof != want_prof:
             return False
     if isinstance(char_data, dict):
         want_flt_hash = compute_clip_filter_hash(char_data)
-        if want_flt_hash and str(meta.get("clip_filter_hash") or "") != want_flt_hash:
+        saved_flt_hash = str(meta.get("clip_filter_hash") or "")
+        if saved_flt_hash != want_flt_hash:
+            return False
+        if "extraction_config_hash" in meta:
+            want_cfg_hash = compute_extraction_config_hash(char_data, lang=lang)
+            if str(meta.get("extraction_config_hash") or "") != want_cfg_hash:
+                return False
+    cur_gd_sig = get_gamedata_signature(lang=lang)
+    if cur_gd_sig:
+        if "gamedata_sig" in meta and str(meta.get("gamedata_sig") or "") != cur_gd_sig:
+            return False
+        if "gamedata_available" in meta and not bool(meta.get("gamedata_available")):
             return False
     return True
 
@@ -524,12 +647,10 @@ def scan_voiced_roster(
     prof_key, _ = resolve_quality_profile(quality_profile)
     norm_langs = tuple(l.upper() for l in langs if l.upper() in ("JP", "KR")) or ("JP", "KR")
     flt = _normalize_char_filter(character_filter)
-    saved_jp = cfg.get("saved_voices") or {}
-    saved_kr = cfg.get("saved_voices_kr") or {}
+    saved_jp = _as_dict(cfg.get("saved_voices"))
+    saved_kr = _as_dict(cfg.get("saved_voices_kr"))
     man = manifest if manifest is not None else load_batch_manifest()
-    man_entries = man.get("entries") if isinstance(man, dict) else {}
-    if not isinstance(man_entries, dict):
-        man_entries = {}
+    man_entries = _as_dict(man.get("entries")) if isinstance(man, dict) else {}
     owned_remote_set = {(str(c).lower(), str(l).upper()) for c, l in (self_owned_keys or set())}
 
     jobs: list[BatchVoiceJob] = []
@@ -560,14 +681,14 @@ def scan_voiced_roster(
         any_voice = False
         for lang_up in norm_langs:
             molrus = find_character_voice_molru_files(ch, lang=lang_up, game_dir=game_dir)
-            if not molrus:
+            extracted = is_studio_v2_extracted(cid, lang_up, quality_profile=prof_key, char_data=ch)
+            if not molrus and not extracted and not _has_any_local_wavs(cid, lang_up):
                 continue
             any_voice = True
             rlang = "ko" if lang_up == "KR" else "ja"
             existing_id = _clean_model_id(str((saved_kr if lang_up == "KR" else saved_jp).get(cid) or ""))
-            extracted = is_studio_v2_extracted(cid, lang_up, quality_profile=prof_key, char_data=ch)
 
-            entry = man_entries.get(f"{cid}::{lang_up}") or {}
+            entry = _as_dict(man_entries.get(f"{cid}::{lang_up}"))
             man_mid = _clean_model_id(str(entry.get("model_id") or ""))
             man_owned = bool(entry.get("owned_by_self") or entry.get("uploaded")) and bool(man_mid)
             owned_by_self = (cid.lower(), lang_up) in owned_remote_set or (
@@ -621,11 +742,189 @@ def scan_voiced_roster(
     return {"jobs": jobs, "unvoiced": unvoiced, "summary": summary}
 
 
-def parse_fish_model_identity(model_obj: dict[str, Any]) -> tuple[str, str] | None:
+_NAME_NORM_STRIP_RE = re.compile(r"[\s_\-·•*＊()（）\[\]{}/／:,.'\"`~!@#$%^&+=|\\]+")
+_TITLE_PREFIX_STRIP_RE = re.compile(
+    r"^(?:(?:blue\s*archive|블루\s*아카이브|블루아카|블아|ブルーアーカイブ|ブルアカ)\s*[-–—:|/\s]+|\d{1,3}[_.\-\s]+)+",
+    re.IGNORECASE,
+)
+_TITLE_REF_SUFFIX_STRIP_RE = re.compile(r"(?:[_\-\s]+fishaudio[_\-\s]*reference)?(?:\.wav)?$", re.IGNORECASE)
+_TITLE_LANG_SUFFIX_RE = re.compile(
+    r"""(?ix)
+    (?:
+        [\s_\-–—/|,:]*[\(\[（【]\s*(?P<br_lang>jp|ja|jpn|japanese|일음|일본어|일본|일|kr|ko|kor|korean|한음|한국어|한국|더빙|한)\s*[\)\]）】]
+        |
+        (?:[\s_\-–—/|,:]+)(?P<sp_lang>jp|ja|jpn|japanese|일음|일본어|일본|kr|ko|kor|korean|한음|한국어|한국|더빙)
+    )\s*$
     """
-    Extract `(char_id, lang)` from a Fish Audio model object using structured tags first
-    (`ba-char-<id>` / `ba-lang-<jp|kr>` or legacy `ba_char:<id>` / `ba_lang:<JP|KR>`),
-    falling back to our canonical title pattern.
+)
+_EXPLICIT_CHAR_ALIASES: dict[str, tuple[str, ...]] = {
+    "Shiroko_Terror": ("시로코테러", "시로코*테러", "시로코 테러", "시로코(테러)", "쿠로코", "シロコテラー", "クロコ", "kuroko", "shirokoterror"),
+    "Shun_Small": ("어린슌", "어린 슌", "유녀슌", "슌유녀", "슌(유녀)", "슈에링", "어린이슌", "꼬마슌", "シュエリン", "幼女シュン", "shunsmall", "shunling"),
+    "Kisaki_Kiki": ("키키", "키사키키키", "키사키(키키)", "류우게키사키키키", "キキ", "kisakikiki", "kiki"),
+    "Kei": ("케이", "텐도케이", "케이(key)", "케이key", "key", "ケイ"),
+    "GSC_President": ("총학생회장", "連邦生徒会長", "gscpresident"),
+    "Hatsune_Miku": ("하츠네미쿠", "미쿠", "初音ミク", "ミク", "miku"),
+    "Misaka_Mikoto": ("미사카미코토", "미사카", "미코토", "御坂美琴", "美琴", "mikoto"),
+    "Shokuhou_Misaki": ("쇼쿠호미사키", "쇼쿠호", "食蜂操祈", "shokuhou"),
+    "Saten_Ruiko": ("사텐루이코", "사텐", "루이코", "佐天涙子", "saten", "ruiko"),
+}
+_RECOMMENDED_SHORT_TITLE_OVERRIDES: dict[str, str] = {
+    "Shiroko_Terror": "시로코*테러",
+    "Shun_Small": "어린 슌",
+    "Kisaki_Kiki": "키키",
+    "Kei": "케이",
+    "Misaki": "이마시노 미사키",
+    "Shokuhou_Misaki": "쇼쿠호 미사키",
+    "Hatsune_Miku": "하츠네 미쿠",
+    "Misaka_Mikoto": "미사카 미코토",
+    "Saten_Ruiko": "사텐 루이코",
+    "GSC_President": "총학생회장",
+}
+_DEFAULT_CHARACTER_NAME_INDEX_CACHE: dict[str, str] | None = None
+
+
+def build_recommended_short_title(char_id: str, name_kr: str, lang: str = "JP") -> str:
+    """
+    Build the crisp, collision-free short title recommended for manual Fish Audio web uploads.
+    Guaranteed to round-trip 100% cleanly via `parse_fish_model_identity` for all JP & KR slots.
+    """
+    cid = str(char_id or "").strip()
+    lang_up = "KR" if str(lang or "JP").strip().upper() == "KR" else "JP"
+    base = _RECOMMENDED_SHORT_TITLE_OVERRIDES.get(cid, "")
+    if not base:
+        clean_kr = re.sub(r"\s*[(\（][^)\）]*[)\）]\s*", " ", str(name_kr or cid)).strip()
+        parts = [p for p in clean_kr.split() if p]
+        base = parts[-1] if len(parts) >= 2 else (clean_kr or cid)
+    return f"{base} KR" if lang_up == "KR" else base
+
+
+def _norm_identity_key(raw: str) -> str:
+    return _NAME_NORM_STRIP_RE.sub("", str(raw or "").strip()).lower()
+
+
+def _lang_code_from_token(tok: str) -> str:
+    low = str(tok or "").strip().lower()
+    if low in ("kr", "ko", "kor", "korean", "한음", "한국어", "한국", "더빙", "한"):
+        return "KR"
+    if low in ("jp", "ja", "jpn", "japanese", "일음", "일본어", "일본", "일"):
+        return "JP"
+    return ""
+
+
+def _lang_from_model_metadata(model_obj: dict[str, Any]) -> str:
+    langs = model_obj.get("languages")
+    if isinstance(langs, list):
+        normed = {str(x or "").strip().lower() for x in langs if str(x or "").strip()}
+        has_ko = bool(normed & {"ko", "kr", "kor", "korean"})
+        has_ja = bool(normed & {"ja", "jp", "jpn", "japanese"})
+        if has_ko and not has_ja:
+            return "KR"
+        if has_ja and not has_ko:
+            return "JP"
+    tags = model_obj.get("tags")
+    if isinstance(tags, list):
+        tset = {str(x or "").strip().lower() for x in tags}
+        has_ko = bool(tset & {"kr", "ko", "korean", "한국어", "한음"})
+        has_ja = bool(tset & {"jp", "ja", "japanese", "일본어", "일음"})
+        if has_ko and not has_ja:
+            return "KR"
+        if has_ja and not has_ko:
+            return "JP"
+    return ""
+
+
+def build_character_name_index(characters: dict[str, dict[str, Any]] | None = None) -> dict[str, str]:
+    """
+    Build a collision-safe normalized name/alias -> canonical `char_id` lookup table so
+    users can upload models with just the character's name (e.g. `유우카`, `하야세 유우카`,
+    `유우카 KR`, `Yuuka`, `早瀬ユウカ`, `시로코*테러`, `어린 슌`, `키키`) and still auto-sync.
+    """
+    global _DEFAULT_CHARACTER_NAME_INDEX_CACHE
+    if characters is None:
+        if _DEFAULT_CHARACTER_NAME_INDEX_CACHE is not None:
+            return _DEFAULT_CHARACTER_NAME_INDEX_CACHE
+        characters = load_all_character_configs()
+        built = build_character_name_index(characters)
+        _DEFAULT_CHARACTER_NAME_INDEX_CACHE = built
+        return built
+
+    primary: dict[str, str] = {}
+    secondary_counts: dict[str, list[str]] = {}
+    targets = _iter_voice_targets(characters)
+    valid_cids = {cid for cid, _, _ in targets}
+
+    def _add_primary(alias: str, cid: str) -> None:
+        k = _norm_identity_key(alias)
+        if k:
+            primary.setdefault(k, cid)
+
+    def _add_secondary(alias: str, cid: str) -> None:
+        k = _norm_identity_key(alias)
+        if k and k not in primary:
+            lst = secondary_counts.setdefault(k, [])
+            if cid not in lst:
+                lst.append(cid)
+
+    # Pass 1: exact canonical IDs, full KR/JP names, and curated unambiguous aliases
+    for cid, ch, is_alt in targets:
+        _add_primary(cid, cid)
+        name_kr = str(ch.get("name_kr") or "").strip()
+        name_jp = str(ch.get("name_jp") or "").strip()
+        if name_kr:
+            _add_primary(name_kr, cid)
+        if name_jp:
+            _add_primary(name_jp, cid)
+        # Base character owns the parenthetical-stripped full name (prevents alt variants colliding with base)
+        if not is_alt and cid not in ("Shiroko_Terror", "Shun_Small"):
+            kr_no_paren = re.sub(r"\s*[(\（][^)\）]*[)\）]\s*", " ", name_kr).strip()
+            jp_no_paren = re.sub(r"\s*[(\（][^)\）]*[)\）]\s*", "", name_jp).strip()
+            if kr_no_paren:
+                _add_primary(kr_no_paren, cid)
+            if jp_no_paren:
+                _add_primary(jp_no_paren, cid)
+        for alias in _EXPLICIT_CHAR_ALIASES.get(cid, ()):
+            _add_primary(alias, cid)
+
+    # Preferred default owners for the 3 shared short Korean given names when no variant suffix is typed
+    for short_alias, owner_cid in (("시로코", "Shiroko"), ("슌", "Shun"), ("미사키", "Misaki")):
+        if owner_cid in valid_cids:
+            _add_primary(short_alias, owner_cid)
+
+    # Pass 2: short given names (last token of Korean name, JP given-name katakana/kana tail) when unambiguous
+    for cid, ch, is_alt in targets:
+        if is_alt or cid in ("Shiroko_Terror", "Shun_Small", "Shokuhou_Misaki"):
+            continue
+        name_kr = str(ch.get("name_kr") or "").strip()
+        kr_no_paren = re.sub(r"\s*[(\（][^)\）]*[)\）]\s*", " ", name_kr).strip()
+        parts = [p for p in kr_no_paren.split() if p]
+        if len(parts) >= 2:
+            _add_secondary(parts[-1], cid)
+        # Extract trailing kana given name from JP full name (e.g. 早瀬ユウカ -> ユウカ)
+        name_jp = str(ch.get("name_jp") or "").strip()
+        jp_no_paren = re.sub(r"\s*[(\（][^)\）]*[)\）]\s*", "", name_jp).strip()
+        m_jp_tail = re.search(r"([ァ-ヶー]{2,}|[ぁ-ん]{2,})$", jp_no_paren)
+        if m_jp_tail and m_jp_tail.group(1) != jp_no_paren:
+            _add_secondary(m_jp_tail.group(1), cid)
+
+    merged = dict(primary)
+    for k, cids in secondary_counts.items():
+        if len(cids) == 1:
+            merged[k] = cids[0]
+    return merged
+
+
+def parse_fish_model_identity(
+    model_obj: dict[str, Any],
+    *,
+    characters: dict[str, dict[str, Any]] | None = None,
+    name_index: dict[str, str] | None = None,
+) -> tuple[str, str] | None:
+    """
+    Extract `(char_id, lang)` from a Fish Audio model object:
+      1. Structured tags (`ba-char-<id>` / `ba-lang-<jp|kr>` or legacy `ba_char:` / `ba_lang:`)
+      2. Canonical title pattern (`Blue Archive - <ID> (... / JP|KR ...)`)
+      3. Short manual title matching just the character name (+ optional JP/KR suffix or model `languages`),
+         e.g. `유우카`, `하야세 유우카`, `유우카 KR`, `Yuuka`, `早瀬ユウカ`, `시로코*테러`, `어린 슌`, `키키`.
     """
     if not isinstance(model_obj, dict):
         return None
@@ -657,7 +956,67 @@ def parse_fish_model_identity(model_obj: dict[str, Any]) -> tuple[str, str] | No
         parsed_cid = m.group(1).strip()
         if is_safe_entity_id(parsed_cid):
             return parsed_cid, m.group(2).strip().upper()
-    return None
+
+    # 3. Short/manual character-name matching (e.g. "유우카", "하야세 유우카 KR", "Yuuka", "早瀬ユウカ JP")
+    if not title:
+        return None
+    idx = name_index if name_index is not None else build_character_name_index(characters)
+    if not idx:
+        return None
+
+    cleaned = _TITLE_REF_SUFFIX_STRIP_RE.sub("", title).strip()
+    cleaned = _TITLE_PREFIX_STRIP_RE.sub("", cleaned).strip()
+
+    explicit_lang = tag_lang
+    while True:
+        lm = _TITLE_LANG_SUFFIX_RE.search(cleaned)
+        if not lm:
+            break
+        tok = lm.group("br_lang") or lm.group("sp_lang") or ""
+        parsed_lang = _lang_code_from_token(tok)
+        if parsed_lang and not explicit_lang:
+            explicit_lang = parsed_lang
+        cleaned = cleaned[: lm.start()].strip()
+
+    # Also allow leading language tag like "[KR] 유우카" or "KR 유우카"
+    m_lead_lang = re.match(
+        r"^(?:[\(\[（【]\s*(jp|ja|jpn|일음|일본어|일|kr|ko|kor|한음|한국어|한)\s*[\)\]）】]\s*|(jp|ja|kr|ko|일음|한음|일본어|한국어)[\s_\-–—:|/]+)(.+)$",
+        cleaned,
+        re.IGNORECASE,
+    )
+    if m_lead_lang:
+        lead_tok = m_lead_lang.group(1) or m_lead_lang.group(2) or ""
+        parsed_lang = _lang_code_from_token(lead_tok)
+        if parsed_lang and not explicit_lang:
+            explicit_lang = parsed_lang
+        cleaned = m_lead_lang.group(3).strip()
+
+    # Support folder/filename pastes like "001_Airi_쿠리무라_아이리_JP" or "134_Shiroko_Terror_스나오오카미_시로코_(시로코_테러)_JP".
+    # Try longest underscore-joined prefix first so multi-word IDs (Shiroko_Terror, Kisaki_Kiki,
+    # Shun_Small, Hatsune_Miku, Misaka_Mikoto, Shokuhou_Misaki, Saten_Ruiko, GSC_President)
+    # ALWAYS resolve before single-token base IDs (Shiroko, Kisaki, Shun).
+    candidates_to_try: list[str] = [cleaned]
+    if "_" in cleaned:
+        parts = [p.strip() for p in cleaned.split("_") if p.strip()]
+        if len(parts) >= 2:
+            max_prefix = min(3, len(parts) - 1)
+            for k in range(max_prefix, 0, -1):
+                candidates_to_try.append("_".join(parts[:k]))
+            for k in range(1, max_prefix + 1):
+                candidates_to_try.append("_".join(parts[k:]))
+
+    matched_cid = ""
+    for cand in candidates_to_try:
+        key = _norm_identity_key(cand)
+        if key and key in idx:
+            matched_cid = idx[key]
+            break
+
+    if not matched_cid or not is_safe_entity_id(matched_cid):
+        return None
+
+    resolved_lang = explicit_lang or _lang_from_model_metadata(model_obj) or "JP"
+    return matched_cid, resolved_lang
 
 
 def sync_existing_fish_models(
@@ -668,6 +1027,11 @@ def sync_existing_fish_models(
     http_session: Any = None,
     log_cb: Callable[[str], None] | None = None,
     manifest: dict[str, Any] | None = None,
+    stop_event: threading.Event | None = None,
+    max_retries: int = 3,
+    persist_voice_link_cb: Callable[[str, str, str], None] | None = None,
+    timeout: float = 30.0,
+    prefer_new_self_owned: bool = False,
 ) -> dict[str, Any]:
     """
     Query `GET https://api.fish.audio/model?self=true` across all pages and link any existing
@@ -683,14 +1047,18 @@ def sync_existing_fish_models(
             "synced": 0,
             "total_remote": 0,
             "matched_keys": [],
+            "matched_models": {},
+            "synced_models": {},
             "self_owned_ids": [],
         }
 
     sess = http_session or requests
     headers = {"Authorization": f"Bearer {clean_key}"}
+    eff_chars = characters if characters is not None else load_all_character_configs()
+    name_index = build_character_name_index(eff_chars)
     cid_ci: dict[str, str] = {}
     name_by_cid: dict[str, str] = {}
-    for target_cid, target_ch, _ in _iter_voice_targets(characters or {}):
+    for target_cid, target_ch, _ in _iter_voice_targets(eff_chars):
         cid_ci[target_cid.lower()] = target_cid
         name_by_cid[target_cid] = str(target_ch.get("name_kr") or target_cid)
 
@@ -700,60 +1068,141 @@ def sync_existing_fish_models(
     synced = 0
     seen_remote_ids: set[str] = set()
     matched_models: dict[tuple[str, str], str] = {}
+    retry_limit = max(0, int(max_retries))
+    eff_timeout = max(1.0, float(_safe_float(timeout, 30.0) or 30.0))
+
+    def _stopped_result() -> dict[str, Any]:
+        return {
+            "ok": False,
+            "fatal_code": "STOPPED",
+            "error": "사용자에 의해 안전 중지되었습니다.",
+            "synced": synced,
+            "total_remote": total_remote,
+            "matched_keys": list(matched_models.keys()),
+            "matched_models": {f"{c}::{l}": m for (c, l), m in matched_models.items()},
+            "synced_models": {},
+            "self_owned_ids": sorted(seen_remote_ids),
+        }
 
     while page <= 50:
-        try:
-            url = _validate_fish_api_url(FISH_MODEL_URL)
-            if _is_real_requests(sess):
-                resp = sess.get(
-                    url,
-                    headers=headers,
-                    params={"self": "true", "page_size": page_size, "page_number": page},
-                    timeout=30,
-                    verify=True,
-                    allow_redirects=False,
-                    stream=True,
-                )
-            else:
-                resp = sess.get(
-                    url,
-                    headers=headers,
-                    params={"self": "true", "page_size": page_size, "page_number": page},
-                    timeout=30,
-                )
-            resp_code, resp_text, body, _ = _read_bounded_response(resp, MAX_FISH_JSON_RESPONSE_BYTES)
-        except Exception as exc:
-            return {
-                "ok": False,
-                "fatal_code": "",
-                "error": _redact_secrets(f"계정 모델 조회 네트워크 오류: {exc}", extra_secrets=(clean_key,)),
-                "synced": synced,
-                "total_remote": total_remote,
-                "matched_keys": list(matched_models.keys()),
-                "self_owned_ids": sorted(seen_remote_ids),
-            }
+        if stop_event is not None and stop_event.is_set():
+            return _stopped_result()
 
-        if resp_code == 401:
-            return {
-                "ok": False,
-                "fatal_code": "AUTH_ERROR",
-                "error": "Fish Audio API Key가 유효하지 않습니다 (HTTP 401).",
-                "synced": 0,
-                "total_remote": 0,
-                "matched_keys": [],
-                "self_owned_ids": [],
-            }
-        if resp_code != 200:
-            safe_txt = _redact_secrets(resp_text[:200], extra_secrets=(clean_key,))
-            return {
-                "ok": False,
-                "fatal_code": "",
-                "error": f"계정 모델 목록 조회 실패 (HTTP {resp_code}): {safe_txt}",
-                "synced": synced,
-                "total_remote": total_remote,
-                "matched_keys": list(matched_models.keys()),
-                "self_owned_ids": sorted(seen_remote_ids),
-            }
+        resp_code = 0
+        resp_text = ""
+        body: Any = None
+        resp_headers: Any = {}
+
+        for attempt in range(retry_limit + 1):
+            if stop_event is not None and stop_event.is_set():
+                return _stopped_result()
+            try:
+                url = _validate_fish_api_url(FISH_MODEL_URL)
+                if _is_real_requests(sess):
+                    resp = sess.get(
+                        url,
+                        headers=headers,
+                        params={"self": "true", "page_size": page_size, "page_number": page},
+                        timeout=eff_timeout,
+                        verify=True,
+                        allow_redirects=False,
+                        stream=True,
+                    )
+                else:
+                    resp = sess.get(
+                        url,
+                        headers=headers,
+                        params={"self": "true", "page_size": page_size, "page_number": page},
+                        timeout=eff_timeout,
+                    )
+                resp_code, resp_text, body, resp_headers = _read_bounded_response(resp, MAX_FISH_JSON_RESPONSE_BYTES)
+            except Exception as exc:
+                err_txt = _redact_secrets(f"계정 모델 조회 네트워크 오류: {exc}", extra_secrets=(clean_key,))
+                if attempt < retry_limit:
+                    wait_s = min(30.0, 2.0 * (2**attempt))
+                    if callable(log_cb):
+                        log_cb(f"⏳ [계정 동기화] {err_txt} → {wait_s:.0f}초 후 재시도 ({attempt + 1}/{retry_limit})")
+                    if _interruptible_sleep(wait_s, stop_event):
+                        return _stopped_result()
+                    continue
+                return {
+                    "ok": False,
+                    "fatal_code": "",
+                    "error": err_txt,
+                    "synced": synced,
+                    "total_remote": total_remote,
+                    "matched_keys": list(matched_models.keys()),
+                    "matched_models": {f"{c}::{l}": m for (c, l), m in matched_models.items()},
+                    "synced_models": {},
+                    "self_owned_ids": sorted(seen_remote_ids),
+                }
+
+            if resp_code == 401:
+                return {
+                    "ok": False,
+                    "fatal_code": "AUTH_ERROR",
+                    "error": "Fish Audio API Key가 유효하지 않습니다 (HTTP 401).",
+                    "synced": 0,
+                    "total_remote": 0,
+                    "matched_keys": [],
+                    "matched_models": {},
+                    "synced_models": {},
+                    "self_owned_ids": [],
+                }
+            if resp_code == 429:
+                wait_s = _parse_retry_after(resp_headers, default_sec=min(60.0, 3.0 * (2**attempt)))
+                if attempt < retry_limit:
+                    if callable(log_cb):
+                        log_cb(f"⏳ [계정 동기화] 속도 제한(429) → {wait_s:.0f}초 후 재시도 ({attempt + 1}/{retry_limit})")
+                    if _interruptible_sleep(wait_s, stop_event):
+                        return _stopped_result()
+                    continue
+                safe_txt = _redact_secrets(resp_text[:200], extra_secrets=(clean_key,))
+                return {
+                    "ok": False,
+                    "fatal_code": "",
+                    "error": f"계정 모델 목록 조회 속도 제한 (HTTP 429): {safe_txt}",
+                    "synced": synced,
+                    "total_remote": total_remote,
+                    "matched_keys": list(matched_models.keys()),
+                    "matched_models": {f"{c}::{l}": m for (c, l), m in matched_models.items()},
+                    "synced_models": {},
+                    "self_owned_ids": sorted(seen_remote_ids),
+                }
+            if resp_code >= 500:
+                wait_s = min(30.0, 2.0 * (2**attempt))
+                if attempt < retry_limit:
+                    if callable(log_cb):
+                        log_cb(f"⏳ [계정 동기화] 서버 일시 오류({resp_code}) → {wait_s:.0f}초 후 재시도 ({attempt + 1}/{retry_limit})")
+                    if _interruptible_sleep(wait_s, stop_event):
+                        return _stopped_result()
+                    continue
+                safe_txt = _redact_secrets(resp_text[:200], extra_secrets=(clean_key,))
+                return {
+                    "ok": False,
+                    "fatal_code": "",
+                    "error": f"계정 모델 목록 조회 서버 오류 (HTTP {resp_code}): {safe_txt}",
+                    "synced": synced,
+                    "total_remote": total_remote,
+                    "matched_keys": list(matched_models.keys()),
+                    "matched_models": {f"{c}::{l}": m for (c, l), m in matched_models.items()},
+                    "synced_models": {},
+                    "self_owned_ids": sorted(seen_remote_ids),
+                }
+            if resp_code != 200:
+                safe_txt = _redact_secrets(resp_text[:200], extra_secrets=(clean_key,))
+                return {
+                    "ok": False,
+                    "fatal_code": "",
+                    "error": f"계정 모델 목록 조회 실패 (HTTP {resp_code}): {safe_txt}",
+                    "synced": synced,
+                    "total_remote": total_remote,
+                    "matched_keys": list(matched_models.keys()),
+                    "matched_models": {f"{c}::{l}": m for (c, l), m in matched_models.items()},
+                    "synced_models": {},
+                    "self_owned_ids": sorted(seen_remote_ids),
+                }
+            break
 
         if body is None:
             break
@@ -772,7 +1221,9 @@ def sync_existing_fish_models(
             seen_remote_ids.add(mid)
             new_on_page += 1
             total_remote += 1
-            ident = parse_fish_model_identity(item)
+            if str(item.get("state") or "").strip().lower() == "failed":
+                continue
+            ident = parse_fish_model_identity(item, name_index=name_index)
             if not ident:
                 continue
             raw_cid, lang_up = ident
@@ -786,49 +1237,70 @@ def sync_existing_fish_models(
             if not bool(body.get("has_more")):
                 break
         else:
-            total_reported = int(body.get("total", 0) or 0) if isinstance(body, dict) else 0
+            total_reported = _safe_int(body.get("total"), 0) if isinstance(body, dict) else 0
             if len(items) < page_size or (total_reported and total_remote >= total_reported):
                 break
         page += 1
 
-    saved_jp = cfg.setdefault("saved_voices", {})
-    saved_kr = cfg.setdefault("saved_voices_kr", {})
-    man = manifest if manifest is not None else load_batch_manifest()
-    entries = man.setdefault("entries", {})
-    manifest_dirty = False
+    synced_models: dict[str, str] = {}
+    persisted_links: list[tuple[str, str, str]] = []
+    with _BATCH_PERSIST_LOCK:
+        saved_jp = _ensure_dict(cfg, "saved_voices")
+        saved_kr = _ensure_dict(cfg, "saved_voices_kr")
+        disk_man = load_batch_manifest()
+        disk_entries = _ensure_dict(disk_man, "entries")
+        if manifest is not None:
+            entries = _ensure_dict(manifest, "entries")
+            for dk, dv in disk_entries.items():
+                if dk not in entries and isinstance(dv, dict):
+                    entries[dk] = dv
+            man = manifest
+        else:
+            man = disk_man
+            entries = disk_entries
+        manifest_dirty = False
 
-    for (cid, lang_up), mid in matched_models.items():
-        bucket = saved_kr if lang_up == "KR" else saved_jp
-        prev_id = _clean_model_id(str(bucket.get(cid) or ""))
-        if overwrite or not prev_id:
-            if prev_id and prev_id != mid:
-                backup_saved_voices_once(cfg, log_cb=log_cb)
-            if prev_id != mid:
-                bucket[cid] = mid
-                _sync_active_reference_id(cfg, cid, lang_up, mid)
-                synced += 1
+        for (cid, lang_up), mid in matched_models.items():
+            bucket = saved_kr if lang_up == "KR" else saved_jp
+            prev_id = _clean_model_id(str(bucket.get(cid) or ""))
+            entry_key = f"{cid}::{lang_up}"
+            old_ent = _as_dict(entries.get(entry_key))
+            prev_owned_mid = _clean_model_id(str(old_ent.get("model_id") or "")) if old_ent.get("owned_by_self") else ""
+            is_newly_discovered_self = bool(prefer_new_self_owned) and (prev_owned_mid != mid)
+            if overwrite or not prev_id or is_newly_discovered_self:
+                if prev_id and prev_id != mid:
+                    backup_saved_voices_once(cfg, log_cb=log_cb)
+                if prev_id != mid:
+                    bucket[cid] = mid
+                    _sync_active_reference_id(cfg, cid, lang_up, mid)
+                    synced += 1
+                    synced_models[entry_key] = mid
+                    persisted_links.append((cid, lang_up, mid))
 
-        entry_key = f"{cid}::{lang_up}"
-        old_ent = entries.get(entry_key) or {}
-        if not old_ent.get("owned_by_self") or _clean_model_id(str(old_ent.get("model_id") or "")) != mid:
-            ch_name = str(name_by_cid.get(cid) or old_ent.get("name_kr") or cid)
-            entries[entry_key] = {
-                **old_ent,
-                "char_id": cid,
-                "name_kr": ch_name,
-                "lang": lang_up,
-                "uploaded": True,
-                "owned_by_self": True,
-                "model_id": mid,
-                "error": "",
-                "updated_at": time.time(),
-            }
-            manifest_dirty = True
+            if not old_ent.get("owned_by_self") or _clean_model_id(str(old_ent.get("model_id") or "")) != mid:
+                ch_name = str(name_by_cid.get(cid) or old_ent.get("name_kr") or cid)
+                entries[entry_key] = {
+                    **old_ent,
+                    "char_id": cid,
+                    "name_kr": ch_name,
+                    "lang": lang_up,
+                    "uploaded": True,
+                    "owned_by_self": True,
+                    "model_id": mid,
+                    "error": "",
+                    "updated_at": time.time(),
+                }
+                manifest_dirty = True
 
-    if synced > 0:
-        save_user_config(cfg)
-    if manifest_dirty:
-        save_batch_manifest(man)
+        if synced > 0 and not callable(persist_voice_link_cb):
+            save_user_config(copy.deepcopy(cfg))
+        if manifest_dirty:
+            save_batch_manifest(man)
+
+    if callable(persist_voice_link_cb) and persisted_links:
+        for pcid, plang, pmid in persisted_links:
+            persist_voice_link_cb(pcid, plang, pmid)
+
     if callable(log_cb):
         log_cb(f"🔄 [계정 동기화] 내 Fish Audio 모델 {total_remote}개 스캔 → 블루아카 매칭 {len(matched_models)}개 · 새로 연결 {synced}개")
 
@@ -840,6 +1312,7 @@ def sync_existing_fish_models(
         "total_remote": total_remote,
         "matched_keys": list(matched_models.keys()),
         "matched_models": {f"{c}::{l}": m for (c, l), m in matched_models.items()},
+        "synced_models": synced_models,
         "self_owned_ids": sorted(seen_remote_ids),
     }
 
@@ -856,22 +1329,29 @@ def extract_job_reference(
     comb_wav, samples_dir = _char_ref_dir(job.char_id, job.lang)
     if (not force) and is_studio_v2_extracted(job.char_id, job.lang, quality_profile=prof_key, char_data=job.char_data):
         meta_path = samples_dir / "studio_v2_meta.json"
-        meta = {}
+        meta: dict[str, Any] = {}
         try:
-            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            loaded_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            if isinstance(loaded_meta, dict):
+                meta = loaded_meta
         except Exception:
-            pass
+            meta = {}
+        wav_files = sorted(samples_dir.glob("*.wav"))
         return {
             "skipped": True,
             "character_id": job.char_id,
             "lang": job.lang,
+            "pipeline_version": _safe_int(meta.get("pipeline_version"), STUDIO_PIPELINE_VERSION),
             "quality_profile": str(meta.get("quality_profile") or prof_key),
-            "clip_count": int(meta.get("clip_count", len(list(samples_dir.glob("*.wav"))))),
-            "total_duration_sec": float(meta.get("total_duration_sec", 0.0)),
-            "transcript_matched": int(meta.get("transcript_matched", 0)),
+            "clip_count": _safe_int(meta.get("clip_count"), len(wav_files)),
+            "memoriallobby_clips": _safe_int(meta.get("memoriallobby_clips"), 0),
+            "total_duration_sec": _safe_float(meta.get("total_duration_sec"), 0.0),
+            "transcript_matched": _safe_int(meta.get("transcript_matched"), 0),
+            "transcript_coverage": _safe_float(meta.get("transcript_coverage"), 0.0),
+            "transcript_locked": bool(meta.get("transcript_locked", False)),
             "combined_wav": comb_wav,
             "samples_dir": samples_dir,
-            "sample_files": sorted(samples_dir.glob("*.wav")),
+            "sample_files": wav_files,
         }
 
     res = build_character_fish_reference(
@@ -887,9 +1367,26 @@ def _parse_retry_after(headers: Any, default_sec: float) -> float:
     try:
         raw = headers.get("Retry-After") or headers.get("retry-after")
         if raw is not None:
-            val = float(str(raw).strip())
-            if 0.5 <= val <= 180.0:
-                return val
+            s = str(raw).strip()
+            if not s:
+                return default_sec
+            try:
+                val = float(s)
+                if math.isfinite(val) and val >= 0.5:
+                    return min(180.0, val)
+                return default_sec
+            except (ValueError, TypeError):
+                pass
+            try:
+                dt = parsedate_to_datetime(s)
+                if dt is not None:
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=datetime.timezone.utc)
+                    delta = (dt - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
+                    if math.isfinite(delta) and delta >= 0.5:
+                        return min(180.0, delta)
+            except Exception:
+                pass
     except Exception:
         pass
     return default_sec
@@ -922,9 +1419,9 @@ def run_preflight_checks(
         return {"ok": False, "fatal_code": "AUTH_ERROR", "error": "Fish Audio API Key가 비어 있습니다. 설정 1단계에 키를 입력해 주세요."}
 
     if mode in ("extract_only", "upload"):
-        # Check free disk space on user data drive
+        # Check free disk space on models target drive
         try:
-            usage = shutil.disk_usage(get_user_data_dir())
+            usage = shutil.disk_usage(get_user_models_dir())
             free_gb = usage.free / (1024**3)
             if usage.free < _MIN_FREE_DISK_BYTES:
                 return {
@@ -933,7 +1430,7 @@ def run_preflight_checks(
                     "error": f"저장 공간이 부족합니다 (남은 공간 {free_gb:.2f} GB). 최소 1 GB 이상 확보한 뒤 다시 시도해 주세요.",
                 }
             if usage.free < _WARN_FREE_DISK_BYTES and callable(log_cb):
-                log_cb(f"⚠️ [공간 안내] 현재 남은 디스크 공간은 {free_gb:.1f} GB입니다 (전 캐릭터 305건 pro85 추출 시 약 4.5 GB 필요).")
+                log_cb(f"⚠️ [공간 안내] 현재 남은 디스크 공간은 {free_gb:.1f} GB입니다 (전 캐릭터 307건 고품질 추출 시 약 5~8 GB 필요).")
         except Exception:
             pass
 
@@ -961,6 +1458,278 @@ def run_preflight_checks(
     return {"ok": True, "fatal_code": "", "error": ""}
 
 
+def _probe_wav_info(path: Path) -> tuple[int, int, float] | None:
+    """Return `(frames, samplerate, duration_sec)` for a readable WAV file, or None."""
+    try:
+        info = sf.info(str(path))
+        frames = int(getattr(info, "frames", 0) or 0)
+        sr = int(getattr(info, "samplerate", 0) or 0)
+        if frames <= 0 or sr <= 0:
+            return None
+        return frames, sr, frames / float(sr)
+    except Exception:
+        return None
+
+
+def _estimate_resampled_samples(frames: int, orig_sr: int, target_sr: int) -> int:
+    """Exact output sample count produced by `scipy.signal.resample_poly(y, up, down)`."""
+    if frames <= 0 or orig_sr <= 0 or target_sr <= 0:
+        return 0
+    if orig_sr == target_sr:
+        return frames
+    g = math.gcd(int(orig_sr), int(target_sr))
+    up = int(target_sr) // g
+    down = int(orig_sr) // g
+    return (frames * up + down - 1) // down
+
+
+def _sum_wav_durations(wavs: list[Path], durations_by_path: dict[str, float] | None = None) -> float:
+    total = 0.0
+    cache = durations_by_path if durations_by_path is not None else {}
+    for w in wavs:
+        key = str(w)
+        if key in cache:
+            total += cache[key]
+            continue
+        info = _probe_wav_info(w)
+        if info is not None:
+            cache[key] = info[2]
+            total += info[2]
+    return round(total, 2)
+
+
+def pack_upload_samples_to_max_files(
+    wav_paths: list[Path],
+    texts: list[str],
+    *,
+    max_files: int = FISH_MAX_UPLOAD_FILES,
+    max_total_sec: float = 200.0,
+    pause_sec: float = INTER_CLIP_PAUSE_SEC,
+    target_sr: int = TARGET_SR,
+    temp_dir: Path | None = None,
+) -> dict[str, Any]:
+    """
+    Pack ordered transcript-matched reference clips into `<= max_files` (default 20) WAV files
+    strictly within `max_total_sec` (default 200.0s, safely under Fish Audio Plus 210s cap),
+    including all inserted inter-clip silence pauses (`pause_sec`, default 0.45s).
+
+    - If `len(kept) <= max_files`: returns the original WAV paths untouched (zero re-encoding).
+    - If `len(kept) > max_files`: performs balanced shortest-adjacent merging preserving natural
+      clip order so every bucket stays concise:
+        * Single-clip buckets reuse their original WAV path directly (zero copy/re-encode).
+        * Multi-clip buckets concatenate mono float32 @ `target_sr` with `pause_sec` zero silence,
+          resampling cleanly via `resample_poly` if needed, applying a gentle edge fade only when
+          a clip lacks quiet fade margins, and writing `PCM_16` WAVs (`pack_01.wav`, ...) into `temp_dir`.
+        * Bucket transcripts are joined verbatim with `" "` for 100% 1:1 alignment.
+    """
+    eff_max_files = max(1, int(max_files))
+    eff_sr = max(8000, int(target_sr))
+    raw_pause = _safe_float(pause_sec, INTER_CLIP_PAUSE_SEC)
+    eff_pause_sec = max(0.0, raw_pause)
+    pause_samples = int(round(eff_sr * eff_pause_sec)) if eff_pause_sec > 0.0 else 0
+    raw_max_sec = _safe_float(max_total_sec, 200.0)
+    eff_max_total_sec = raw_max_sec if raw_max_sec > 0.0 else 200.0
+    max_total_samples = int(math.floor(eff_max_total_sec * eff_sr + 1e-6))
+
+    in_wavs = list(wav_paths or [])
+    input_count = len(in_wavs)
+    if not in_wavs:
+        return {
+            "wavs": [],
+            "texts": [],
+            "source_wavs": [],
+            "source_texts": [],
+            "packed": False,
+            "trimmed": False,
+            "input_clip_count": 0,
+            "source_clip_count": 0,
+            "packed_file_count": 0,
+            "raw_duration_sec": 0.0,
+            "packed_duration_sec": 0.0,
+            "merged_buckets": 0,
+            "reused_files": 0,
+            "bucket_sizes": [],
+            "durations_by_path": {},
+        }
+
+    raw_texts = [str(t or "").strip() for t in (texts or [])]
+    has_texts = bool(raw_texts) and len(raw_texts) == input_count and all(bool(t) for t in raw_texts)
+
+    # Probe clip headers without decoding full audio: (path, text, raw_dur_sec, est_target_samples, orig_sr)
+    probed: list[tuple[Path, str, float, int, int]] = []
+    for idx, w_path in enumerate(in_wavs):
+        txt = raw_texts[idx] if has_texts else ""
+        info = _probe_wav_info(w_path)
+        if info is None:
+            continue
+        frames, orig_sr, raw_dur = info
+        est_samples = _estimate_resampled_samples(frames, orig_sr, eff_sr)
+        if est_samples <= 0:
+            continue
+        probed.append((w_path, txt, raw_dur, est_samples, orig_sr))
+
+    if not probed:
+        fallback_wavs = in_wavs[:eff_max_files]
+        fallback_texts = raw_texts[: len(fallback_wavs)] if has_texts else []
+        return {
+            "wavs": fallback_wavs,
+            "texts": fallback_texts,
+            "source_wavs": list(fallback_wavs),
+            "source_texts": list(fallback_texts),
+            "packed": False,
+            "trimmed": len(fallback_wavs) < input_count,
+            "input_clip_count": input_count,
+            "source_clip_count": len(fallback_wavs),
+            "packed_file_count": len(fallback_wavs),
+            "raw_duration_sec": 0.0,
+            "packed_duration_sec": 0.0,
+            "merged_buckets": 0,
+            "reused_files": len(fallback_wavs),
+            "bucket_sizes": [1] * len(fallback_wavs),
+            "durations_by_path": {},
+        }
+
+    # Strictly enforce `max_total_sec` including internal pauses via exact integer sample-count math:
+    # For K clips packed into min(K, max_files) buckets, total internal pauses is always max(0, K - max_files).
+    kept: list[tuple[Path, str, float, int, int]] = []
+    kept_est_samples = 0
+    for item in probed:
+        est_s = item[3]
+        k_new = len(kept) + 1
+        merges_new = max(0, k_new - eff_max_files)
+        projected_samples = kept_est_samples + est_s + merges_new * pause_samples
+        if projected_samples <= max_total_samples:
+            kept.append(item)
+            kept_est_samples += est_s
+
+    if not kept:
+        kept.append(min(probed, key=lambda x: x[2]))
+
+    source_wavs = [x[0] for x in kept]
+    source_texts = [x[1] for x in kept] if has_texts else []
+    raw_dur_total = sum(x[2] for x in kept)
+    durations_by_path: dict[str, float] = {str(x[0]): x[2] for x in kept}
+    trimmed = len(kept) < input_count
+
+    # Zero-copy fast path when <= max_files clips remain within budget
+    if len(kept) <= eff_max_files:
+        return {
+            "wavs": list(source_wavs),
+            "texts": list(source_texts),
+            "source_wavs": source_wavs,
+            "source_texts": source_texts,
+            "packed": False,
+            "trimmed": trimmed,
+            "input_clip_count": input_count,
+            "source_clip_count": len(kept),
+            "packed_file_count": len(kept),
+            "raw_duration_sec": round(raw_dur_total, 2),
+            "packed_duration_sec": round(raw_dur_total, 2),
+            "merged_buckets": 0,
+            "reused_files": len(kept),
+            "bucket_sizes": [1] * len(kept),
+            "durations_by_path": durations_by_path,
+        }
+
+    if temp_dir is None:
+        raise ValueError("temp_dir is required when packing more than max_files clips")
+    out_dir = Path(temp_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Balanced order-preserving shortest-adjacent merging into `eff_max_files` ordered buckets
+    buckets: list[list[int]] = [[i] for i in range(len(kept))]
+    bucket_samples: list[int] = [kept[i][3] for i in range(len(kept))]
+    while len(buckets) > eff_max_files:
+        best_j = 0
+        best_key = (
+            bucket_samples[0] + pause_samples + bucket_samples[1],
+            len(buckets[0]) + len(buckets[1]),
+            0,
+        )
+        for j in range(1, len(buckets) - 1):
+            cand_key = (
+                bucket_samples[j] + pause_samples + bucket_samples[j + 1],
+                len(buckets[j]) + len(buckets[j + 1]),
+                j,
+            )
+            if cand_key < best_key:
+                best_key = cand_key
+                best_j = j
+        buckets[best_j] = buckets[best_j] + buckets[best_j + 1]
+        bucket_samples[best_j] = bucket_samples[best_j] + pause_samples + bucket_samples[best_j + 1]
+        del buckets[best_j + 1]
+        del bucket_samples[best_j + 1]
+
+    pause_arr = np.zeros(pause_samples, dtype=np.float32) if pause_samples > 0 else None
+    out_wavs: list[Path] = []
+    out_texts: list[str] = []
+    actual_total_dur = 0.0
+    merged_buckets = 0
+    reused_files = 0
+    edge_check_samples = max(1, int(round(eff_sr * 0.002)))
+
+    for b_idx, idxs in enumerate(buckets, 1):
+        if has_texts:
+            joined_text = " ".join(kept[i][1].strip() for i in idxs if kept[i][1].strip())
+            out_texts.append(joined_text)
+
+        if len(idxs) == 1:
+            w_path = kept[idxs[0]][0]
+            clip_dur = kept[idxs[0]][2]
+            out_wavs.append(w_path)
+            actual_total_dur += clip_dur
+            durations_by_path[str(w_path)] = clip_dur
+            reused_files += 1
+            continue
+
+        parts: list[np.ndarray] = []
+        for pos, clip_i in enumerate(idxs):
+            src_path = kept[clip_i][0]
+            y, sr = sf.read(str(src_path), dtype="float32", always_2d=False)
+            y_arr = np.asarray(y, dtype=np.float32)
+            if y_arr.ndim > 1:
+                y_arr = np.mean(y_arr, axis=1, dtype=np.float32)
+            y_arr = np.nan_to_num(y_arr, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
+            if int(sr) != eff_sr and len(y_arr) > 0:
+                y_arr = resample_audio(y_arr, int(sr), eff_sr)
+            ec = min(len(y_arr), edge_check_samples)
+            if len(y_arr) >= 8 and (
+                float(np.max(np.abs(y_arr[:ec]))) > 1e-3
+                or float(np.max(np.abs(y_arr[-ec:]))) > 1e-3
+            ):
+                y_arr = apply_cosine_fade(y_arr, eff_sr, fade_ms=5.0)
+            parts.append(y_arr)
+            if pos + 1 < len(idxs) and pause_arr is not None:
+                parts.append(pause_arr)
+
+        merged = np.clip(np.concatenate(parts), -1.0, 1.0).astype(np.float32, copy=False)
+        out_path = out_dir / f"pack_{b_idx:02d}.wav"
+        sf.write(str(out_path), merged, eff_sr, subtype="PCM_16")
+        merged_dur = len(merged) / float(eff_sr)
+        out_wavs.append(out_path)
+        actual_total_dur += merged_dur
+        durations_by_path[str(out_path)] = merged_dur
+        merged_buckets += 1
+
+    return {
+        "wavs": out_wavs,
+        "texts": out_texts if has_texts else [],
+        "source_wavs": source_wavs,
+        "source_texts": source_texts,
+        "packed": merged_buckets > 0,
+        "trimmed": trimmed,
+        "input_clip_count": input_count,
+        "source_clip_count": len(kept),
+        "packed_file_count": len(out_wavs),
+        "raw_duration_sec": round(raw_dur_total, 2),
+        "packed_duration_sec": round(actual_total_dur, 2),
+        "merged_buckets": merged_buckets,
+        "reused_files": reused_files,
+        "bucket_sizes": [len(b) for b in buckets],
+        "durations_by_path": durations_by_path,
+    }
+
+
 def _build_upload_fallback_plans(
     selected_wavs: list[Path],
     texts_list: list[str],
@@ -968,15 +1737,33 @@ def _build_upload_fallback_plans(
     comb_wav: Path,
     vis: str,
     has_cover: bool,
+    *,
+    unpacked_wavs: list[Path] | None = None,
+    unpacked_texts: list[str] | None = None,
+    packed_from_clips: int | None = None,
+    packed_duration_sec: float | None = None,
+    durations_by_path: dict[str, float] | None = None,
 ) -> list[dict[str, Any]]:
     """
     Build deduplicated progressive fallback payload plans for HTTP 400/413/422 self-healing.
-    Plan 0 is always the optimal full-quality payload (up to 14 clips + 100% locked transcripts + clean tags + cover).
+    Plan 0 is always the optimal full-quality payload (full-packed <=20 WAVs + 100%-locked
+    verbatim transcripts + clean tags + cover when >20 clips are available; or direct clips otherwise),
+    falling back progressively to unpacked top-20 individual WAVs, no-tags, compact-8, and single WAV.
     """
     plans: list[dict[str, Any]] = []
     seen_sigs: set[tuple[Any, ...]] = set()
+    dur_cache: dict[str, float] = dict(durations_by_path or {})
 
-    def _add(name: str, wavs: list[Path], texts: list[str], use_tags: bool, use_cover: bool) -> None:
+    def _add(
+        name: str,
+        wavs: list[Path],
+        texts: list[str],
+        use_tags: bool,
+        use_cover: bool,
+        *,
+        source_clips: int | None = None,
+        dur_sec: float | None = None,
+    ) -> None:
         if not wavs:
             return
         use_texts = list(texts) if (texts and len(texts) == len(wavs)) else []
@@ -985,6 +1772,11 @@ def _build_upload_fallback_plans(
         if sig in seen_sigs:
             return
         seen_sigs.add(sig)
+        eff_dur = (
+            round(float(dur_sec), 2)
+            if dur_sec is not None
+            else _sum_wav_durations(wavs, dur_cache)
+        )
         plans.append(
             {
                 "name": name,
@@ -992,22 +1784,54 @@ def _build_upload_fallback_plans(
                 "texts": use_texts,
                 "use_tags": bool(use_tags),
                 "use_cover": eff_cover,
+                "packed_from_clips": int(source_clips) if source_clips is not None else len(wavs),
+                "duration_sec": eff_dur,
             }
         )
 
     init_texts = texts_list if (transcript_attached and len(texts_list) == len(selected_wavs)) else []
-    _add("optimal", selected_wavs, init_texts, True, True)
-    _add("no_tags", selected_wavs, init_texts, False, True)
-    if len(selected_wavs) > 8:
-        _add("compact_8_clips", selected_wavs[:8], init_texts[:8] if init_texts else [], False, True)
-    if init_texts:
-        _add("auto_asr_no_texts", selected_wavs[:8] if len(selected_wavs) > 8 else selected_wavs, [], False, True)
+    eff_unpacked_wavs = list(unpacked_wavs) if unpacked_wavs else list(selected_wavs)
+    eff_unpacked_texts = (
+        list(unpacked_texts)
+        if (transcript_attached and unpacked_texts and len(unpacked_texts) == len(eff_unpacked_wavs))
+        else ([] if unpacked_wavs else init_texts)
+    )
+    is_packed = bool(
+        unpacked_wavs
+        and (
+            tuple(str(w) for w in selected_wavs) != tuple(str(w) for w in eff_unpacked_wavs)
+            or (packed_from_clips is not None and int(packed_from_clips) > len(selected_wavs))
+        )
+    )
+
+    if is_packed:
+        _add(
+            "packed_optimal",
+            selected_wavs,
+            init_texts,
+            True,
+            True,
+            source_clips=packed_from_clips if packed_from_clips is not None else len(selected_wavs),
+            dur_sec=packed_duration_sec,
+        )
+        _add("unpacked_top20", eff_unpacked_wavs, eff_unpacked_texts, True, True)
+        _add("no_tags", eff_unpacked_wavs, eff_unpacked_texts, False, True)
+    else:
+        _add("optimal", selected_wavs, init_texts, True, True, dur_sec=packed_duration_sec)
+        _add("no_tags", selected_wavs, init_texts, False, True, dur_sec=packed_duration_sec)
+
+    base_wavs = eff_unpacked_wavs
+    base_texts = eff_unpacked_texts
+    if len(base_wavs) > 8:
+        _add("compact_8_clips", base_wavs[:8], base_texts[:8] if base_texts else [], False, True)
+    if base_texts:
+        _add("auto_asr_no_texts", base_wavs[:8] if len(base_wavs) > 8 else base_wavs, [], False, True)
     if vis != "public" and has_cover:
-        _add("no_cover", selected_wavs[:8] if len(selected_wavs) > 8 else selected_wavs, [], False, False)
+        _add("no_cover", base_wavs[:8] if len(base_wavs) > 8 else base_wavs, [], False, False)
     if comb_wav.is_file():
         _add("single_combined_wav", [comb_wav], [], False, vis == "public")
-    elif selected_wavs:
-        _add("single_first_clip", [selected_wavs[0]], [], False, vis == "public")
+    elif base_wavs:
+        _add("single_first_clip", [base_wavs[0]], [], False, vis == "public")
     return plans
 
 
@@ -1026,7 +1850,8 @@ def upload_job_to_fish_audio(
 ) -> dict[str, Any]:
     """
     Upload one student's studio reference samples to Fish Audio `POST /model`
-    with exponential backoff, 100%-aligned official transcripts, clean tags, portrait cover,
+    with <=20-file full-duration paragraph packing (up to profile `max_clips` / `max_dur_sec`),
+    exponential backoff, 100%-aligned official transcripts, clean tags, portrait cover,
     and automatic HTTP 400/413/422 self-healing fallback.
     """
     game_dir = resolve_ba_game_dir(game_dir)
@@ -1035,7 +1860,9 @@ def upload_job_to_fish_audio(
         return {"ok": False, "fatal_code": "AUTH_ERROR", "error": "Fish Audio API Key가 비어 있습니다."}
 
     prof_key, prof_cfg = resolve_quality_profile(quality_profile)
-    max_clips = int(prof_cfg["max_clips"])
+    # Select ALL curated clips up to profile `max_clips` (e.g. 30 for plus200) before packing into <=20 files
+    profile_max_clips = max(1, int(prof_cfg["max_clips"]))
+    profile_max_dur = float(prof_cfg["max_dur_sec"])
     vis = visibility if visibility in VALID_VISIBILITIES else "private"
     comb_wav, samples_dir = _char_ref_dir(job.char_id, job.lang)
     if not is_studio_v2_extracted(job.char_id, job.lang, quality_profile=prof_key, char_data=job.char_data):
@@ -1053,16 +1880,22 @@ def upload_job_to_fish_audio(
 
     transcript_map: dict[str, str] = {}
     tr_json = samples_dir / "transcripts.json"
-    if tr_json.is_file():
+    if tr_json.is_file() and not tr_json.is_symlink():
         try:
-            transcript_map = json.loads(tr_json.read_text(encoding="utf-8"))
+            loaded_tr = json.loads(tr_json.read_text(encoding="utf-8"))
+            if isinstance(loaded_tr, dict):
+                transcript_map = {
+                    str(k): str(v)
+                    for k, v in loaded_tr.items()
+                    if isinstance(k, str) and isinstance(v, str)
+                }
         except Exception:
             transcript_map = {}
 
     selected_wavs, texts_list, transcript_attached = select_upload_samples_with_transcript_lock(
         sample_wavs,
         transcript_map,
-        max_clips=max_clips,
+        max_clips=profile_max_clips,
         min_paired_clips=4,
     )
 
@@ -1074,184 +1907,247 @@ def upload_job_to_fish_audio(
         except Exception:
             cover_bytes = None
 
-    ch = job.char_data
-    cv_name = str(((ch.get("voice_variants") or {}).get(job.lang) or {}).get("voice_actor") or "")
+    ch = job.char_data if isinstance(job.char_data, dict) else {}
+    cv_name = str(_as_dict(_as_dict(ch.get("voice_variants")).get(job.lang)).get("voice_actor") or "")
     name_tag = job.name_kr if job.lang == "KR" else job.name_jp
     title = build_fish_model_title(job.char_id, name_tag, job.lang, cv_name=cv_name)
     desc = f"Blue Archive {job.name_jp} ({job.name_kr}) {job.lang} studio voice"
 
-    plans = _build_upload_fallback_plans(
-        selected_wavs=selected_wavs,
-        texts_list=texts_list,
-        transcript_attached=transcript_attached,
-        comb_wav=comb_wav,
-        vis=vis,
-        has_cover=bool(cover_bytes),
-    )
-    sess = http_session or requests
-    last_err = ""
-    plan_idx = 0
+    pack_tmp: tempfile.TemporaryDirectory[str] | None = None
+    try:
+        pack_tmp_dir: Path | None = None
+        if len(selected_wavs) > FISH_MAX_UPLOAD_FILES:
+            preferred_tmp_root = samples_dir.parent
+            if preferred_tmp_root.is_dir() and not preferred_tmp_root.is_symlink():
+                try:
+                    pack_tmp = tempfile.TemporaryDirectory(
+                        prefix="ba_fish_pack_",
+                        dir=str(preferred_tmp_root),
+                    )
+                except OSError:
+                    pack_tmp = None
+            if pack_tmp is None:
+                pack_tmp = tempfile.TemporaryDirectory(prefix="ba_fish_pack_")
+            pack_tmp_dir = Path(pack_tmp.name)
 
-    while plan_idx < len(plans):
-        plan = plans[plan_idx]
-        plan_wavs: list[Path] = plan["wavs"]
-        plan_texts: list[str] = plan["texts"]
-        use_tags: bool = bool(plan["use_tags"])
-        use_cover: bool = bool(plan["use_cover"])
+        pack_res = pack_upload_samples_to_max_files(
+            selected_wavs,
+            texts_list if transcript_attached else [],
+            max_files=FISH_MAX_UPLOAD_FILES,
+            max_total_sec=profile_max_dur,
+            pause_sec=INTER_CLIP_PAUSE_SEC,
+            target_sr=TARGET_SR,
+            temp_dir=pack_tmp_dir,
+        )
+        packed_wavs: list[Path] = list(pack_res["wavs"])
+        packed_texts: list[str] = list(pack_res["texts"])
+        packed_tr_attached = bool(transcript_attached and packed_texts and len(packed_texts) == len(packed_wavs))
 
-        data_fields: list[tuple[str, str]] = [
-            ("type", "tts"),
-            ("title", title),
-            ("description", desc),
-            ("visibility", vis),
-            ("train_mode", "fast"),
-            ("enhance_audio_quality", "false"),
-        ]
-        if use_tags:
-            data_fields.extend(
-                [
-                    ("tags", "blue-archive"),
-                    ("tags", f"ba-char-{job.char_id.lower()}"),
-                    ("tags", f"ba-lang-{job.lang.lower()}"),
-                ]
+        unpacked_wavs: list[Path] | None = None
+        unpacked_texts: list[str] | None = None
+        if pack_res.get("packed"):
+            src_wavs: list[Path] = list(pack_res.get("source_wavs") or selected_wavs)
+            src_texts: list[str] = list(pack_res.get("source_texts") or (texts_list if transcript_attached else []))
+            unpacked_wavs = src_wavs[:FISH_MAX_UPLOAD_FILES]
+            unpacked_texts = (
+                src_texts[: len(unpacked_wavs)]
+                if (packed_tr_attached and len(src_texts) >= len(unpacked_wavs))
+                else []
             )
-        for t_item in plan_texts:
-            data_fields.append(("texts", t_item))
+            if callable(log_cb):
+                tr_lock_txt = " · 공식 대본 100% 정렬" if packed_tr_attached else ""
+                log_cb(
+                    f"📦 [{job.name_kr} {job.lang}] {int(round(profile_max_dur))}초 풀패킹 적용: "
+                    f"{pack_res['source_clip_count']}클립({pack_res['raw_duration_sec']:.1f}초) → "
+                    f"{pack_res['packed_file_count']}파일({pack_res['packed_duration_sec']:.1f}초"
+                    f"{tr_lock_txt})"
+                )
 
-        escalate_plan = False
-        for attempt in range(max(1, int(max_retries) + 1)):
-            if stop_event is not None and stop_event.is_set():
-                return {"ok": False, "fatal_code": "STOPPED", "error": "사용자에 의해 안전 중지되었습니다."}
+        plans = _build_upload_fallback_plans(
+            selected_wavs=packed_wavs,
+            texts_list=packed_texts,
+            transcript_attached=packed_tr_attached,
+            comb_wav=comb_wav,
+            vis=vis,
+            has_cover=bool(cover_bytes),
+            unpacked_wavs=unpacked_wavs,
+            unpacked_texts=unpacked_texts,
+            packed_from_clips=int(pack_res.get("source_clip_count", len(packed_wavs))),
+            packed_duration_sec=float(pack_res.get("packed_duration_sec", 0.0)),
+            durations_by_path=pack_res.get("durations_by_path"),
+        )
+        sess = http_session or requests
+        last_err = ""
+        plan_idx = 0
 
-            handles = []
-            try:
-                files: list[tuple[str, Any]] = []
-                for w in plan_wavs:
-                    fh = open(w, "rb")
-                    handles.append(fh)
-                    files.append(("voices", (w.name, fh, "audio/wav")))
-                if use_cover and cover_bytes:
-                    files.append(("cover_image", (f"{job.char_id}.png", cover_bytes, "image/png")))
+        while plan_idx < len(plans):
+            plan = plans[plan_idx]
+            plan_wavs: list[Path] = plan["wavs"]
+            plan_texts: list[str] = plan["texts"]
+            use_tags: bool = bool(plan["use_tags"])
+            use_cover: bool = bool(plan["use_cover"])
 
-                post_url = _validate_fish_api_url(FISH_MODEL_URL)
-                if _is_real_requests(sess):
-                    resp = sess.post(
-                        post_url,
-                        headers={"Authorization": f"Bearer {clean_key}"},
-                        data=data_fields,
-                        files=files,
-                        timeout=120,
-                        verify=True,
-                        allow_redirects=False,
-                        stream=True,
-                    )
-                else:
-                    resp = sess.post(
-                        post_url,
-                        headers={"Authorization": f"Bearer {clean_key}"},
-                        data=data_fields,
-                        files=files,
-                        timeout=120,
-                    )
-                code, resp_text, resp_body, resp_headers = _read_bounded_response(resp, MAX_FISH_JSON_RESPONSE_BYTES)
-            except Exception as exc:
-                last_err = _redact_secrets(f"네트워크 오류: {exc}", extra_secrets=(clean_key,))
-                if attempt < max_retries:
-                    wait_s = min(60.0, 4.0 * (2**attempt))
-                    if callable(log_cb):
-                        log_cb(f"⏳ [{job.name_kr} {job.lang}] {last_err} → {wait_s:.0f}초 후 재시도 ({attempt + 1}/{max_retries})")
-                    if _interruptible_sleep(wait_s, stop_event):
-                        return {"ok": False, "fatal_code": "STOPPED", "error": "사용자에 의해 안전 중지되었습니다."}
-                    continue
-                return {"ok": False, "fatal_code": "", "error": last_err}
-            finally:
-                for fh in handles:
-                    try:
-                        fh.close()
-                    except Exception:
-                        pass
+            data_fields: list[tuple[str, str]] = [
+                ("type", "tts"),
+                ("title", title),
+                ("description", desc),
+                ("visibility", vis),
+                ("train_mode", "fast"),
+                ("enhance_audio_quality", "false"),
+            ]
+            if use_tags:
+                data_fields.extend(
+                    [
+                        ("tags", "blue-archive"),
+                        ("tags", f"ba-char-{job.char_id.lower()}"),
+                        ("tags", f"ba-lang-{job.lang.lower()}"),
+                    ]
+                )
+            for t_item in plan_texts:
+                data_fields.append(("texts", t_item))
 
-            if code in (200, 201):
-                body = resp_body if isinstance(resp_body, dict) else {}
-                mid = _clean_model_id(str(body.get("_id") or body.get("id") or ""))
-                if not mid:
-                    safe_body = _redact_secrets(str(body)[:180], extra_secrets=(clean_key,))
-                    return {"ok": False, "fatal_code": "", "error": f"응답에 모델 ID가 없습니다: {safe_body}"}
-                actual_vis = str(body.get("visibility") or vis).strip().lower()
-                if actual_vis != vis and callable(log_cb):
-                    log_cb(
-                        f"ℹ️ [{job.name_kr} {job.lang}] 요청 공개범위는 '{vis}'였으나 Fish Audio가 '{actual_vis}'로 저장했습니다."
-                    )
-                return {
-                    "ok": True,
-                    "fatal_code": "",
-                    "model_id": mid,
-                    "visibility": actual_vis,
-                    "requested_visibility": vis,
-                    "quality_profile": prof_key,
-                    "clip_count": len(plan_wavs),
-                    "transcript_attached": bool(plan_texts),
-                    "upload_plan": plan["name"],
-                }
+            escalate_plan = False
+            for attempt in range(max(1, int(max_retries) + 1)):
+                if stop_event is not None and stop_event.is_set():
+                    return {"ok": False, "fatal_code": "STOPPED", "error": "사용자에 의해 안전 중지되었습니다."}
 
-            err_txt = _redact_secrets(resp_text.strip(), extra_secrets=(clean_key,))
-            if code == 401:
-                return {"ok": False, "fatal_code": "AUTH_ERROR", "error": "Fish Audio API Key 인증 실패 (HTTP 401). 키를 확인해 주세요."}
+                handles = []
+                try:
+                    files: list[tuple[str, Any]] = []
+                    for w in plan_wavs:
+                        fh = open(w, "rb")
+                        handles.append(fh)
+                        files.append(("voices", (w.name, fh, "audio/wav")))
+                    if use_cover and cover_bytes:
+                        files.append(("cover_image", (f"{job.char_id}.png", cover_bytes, "image/png")))
 
-            if code in (402, 403):
-                low = err_txt.lower()
-                if "limit" in low or "quota" in low or "credit" in low or "slot" in low or "private" in low or code == 402:
-                    hint = (
-                        "Fish Audio 요금제 슬롯 또는 크레딧 한도에 도달했습니다 "
-                        "(Plus: 비공개 10개 / 공개 무제한 · Pro: 비공개 무제한). "
-                        "지금까지 성공한 모델은 모두 자동 저장되었으며, 요금제 업그레이드 또는 공개 범위 변경 후 이어서 실행할 수 있습니다."
-                    )
-                    return {"ok": False, "fatal_code": "QUOTA_LIMIT", "error": f"{hint} [HTTP {code}: {err_txt[:180]}]"}
-                return {"ok": False, "fatal_code": "QUOTA_LIMIT", "error": f"Fish Audio 권한/한도 오류 (HTTP {code}): {err_txt[:180]}"}
-
-            if code == 429:
-                wait_s = _parse_retry_after(resp_headers, default_sec=min(90.0, 5.0 * (2**attempt)))
-                last_err = f"요청 속도 제한 (HTTP 429): {err_txt[:140]}"
-                if attempt < max_retries:
-                    if callable(log_cb):
-                        log_cb(f"⏳ [{job.name_kr} {job.lang}] 속도 제한(429) → {wait_s:.0f}초 대기 후 재시도 ({attempt + 1}/{max_retries})")
-                    if _interruptible_sleep(wait_s, stop_event):
-                        return {"ok": False, "fatal_code": "STOPPED", "error": "사용자에 의해 안전 중지되었습니다."}
-                    continue
-                return {"ok": False, "fatal_code": "", "error": last_err}
-
-            if code >= 500:
-                wait_s = min(60.0, 4.0 * (2**attempt))
-                last_err = f"Fish Audio 서버 일시 오류 (HTTP {code}): {err_txt[:140]}"
-                if attempt < max_retries:
-                    if callable(log_cb):
-                        log_cb(f"⏳ [{job.name_kr} {job.lang}] 서버 오류({code}) → {wait_s:.0f}초 후 재시도 ({attempt + 1}/{max_retries})")
-                    if _interruptible_sleep(wait_s, stop_event):
-                        return {"ok": False, "fatal_code": "STOPPED", "error": "사용자에 의해 안전 중지되었습니다."}
-                    continue
-                return {"ok": False, "fatal_code": "", "error": last_err}
-
-            if code in (400, 413, 422):
-                last_err = f"업로드 요청 검증 오류 (HTTP {code}): {err_txt[:200]}"
-                if plan_idx + 1 < len(plans):
-                    next_plan = plans[plan_idx + 1]
-                    if callable(log_cb):
-                        log_cb(
-                            f"🛠️ [{job.name_kr} {job.lang}] HTTP {code} 응답 → "
-                            f"자동 호환 폴백({next_plan['name']})으로 재시도합니다..."
+                    post_url = _validate_fish_api_url(FISH_MODEL_URL)
+                    if _is_real_requests(sess):
+                        resp = sess.post(
+                            post_url,
+                            headers={"Authorization": f"Bearer {clean_key}"},
+                            data=data_fields,
+                            files=files,
+                            timeout=120,
+                            verify=True,
+                            allow_redirects=False,
+                            stream=True,
                         )
-                    escalate_plan = True
-                    break
-                return {"ok": False, "fatal_code": "", "error": last_err}
+                    else:
+                        resp = sess.post(
+                            post_url,
+                            headers={"Authorization": f"Bearer {clean_key}"},
+                            data=data_fields,
+                            files=files,
+                            timeout=120,
+                        )
+                    code, resp_text, resp_body, resp_headers = _read_bounded_response(resp, MAX_FISH_JSON_RESPONSE_BYTES)
+                except Exception as exc:
+                    last_err = _redact_secrets(f"네트워크 오류: {exc}", extra_secrets=(clean_key,))
+                    if attempt < max_retries:
+                        wait_s = min(60.0, 4.0 * (2**attempt))
+                        if callable(log_cb):
+                            log_cb(f"⏳ [{job.name_kr} {job.lang}] {last_err} → {wait_s:.0f}초 후 재시도 ({attempt + 1}/{max_retries})")
+                        if _interruptible_sleep(wait_s, stop_event):
+                            return {"ok": False, "fatal_code": "STOPPED", "error": "사용자에 의해 안전 중지되었습니다."}
+                        continue
+                    return {"ok": False, "fatal_code": "", "error": last_err}
+                finally:
+                    for fh in handles:
+                        try:
+                            fh.close()
+                        except Exception:
+                            pass
 
-            return {"ok": False, "fatal_code": "", "error": f"업로드 실패 (HTTP {code}): {err_txt[:200]}"}
+                if code in (200, 201):
+                    body = resp_body if isinstance(resp_body, dict) else {}
+                    mid = _clean_model_id(str(body.get("_id") or body.get("id") or ""))
+                    if not mid:
+                        safe_body = _redact_secrets(str(body)[:180], extra_secrets=(clean_key,))
+                        return {"ok": False, "fatal_code": "", "error": f"응답에 모델 ID가 없습니다: {safe_body}"}
+                    actual_vis = str(body.get("visibility") or vis).strip().lower()
+                    if actual_vis != vis and callable(log_cb):
+                        log_cb(
+                            f"ℹ️ [{job.name_kr} {job.lang}] 요청 공개범위는 '{vis}'였으나 Fish Audio가 '{actual_vis}'로 저장했습니다."
+                        )
+                    return {
+                        "ok": True,
+                        "fatal_code": "",
+                        "model_id": mid,
+                        "visibility": actual_vis,
+                        "requested_visibility": vis,
+                        "quality_profile": prof_key,
+                        "clip_count": len(plan_wavs),
+                        "packed_from_clips": int(plan.get("packed_from_clips", len(plan_wavs))),
+                        "packed_duration_sec": round(float(plan.get("duration_sec", 0.0)), 2),
+                        "transcript_attached": bool(plan_texts),
+                        "upload_plan": plan["name"],
+                    }
 
-        if escalate_plan:
-            plan_idx += 1
-            continue
-        break
+                err_txt = _redact_secrets(resp_text.strip(), extra_secrets=(clean_key,))
+                if code == 401:
+                    return {"ok": False, "fatal_code": "AUTH_ERROR", "error": "Fish Audio API Key 인증 실패 (HTTP 401). 키를 확인해 주세요."}
 
-    return {"ok": False, "fatal_code": "", "error": last_err or "알 수 없는 업로드 오류"}
+                if code in (402, 403):
+                    low = err_txt.lower()
+                    if "limit" in low or "quota" in low or "credit" in low or "slot" in low or "private" in low or code == 402:
+                        hint = (
+                            "Fish Audio 요금제 슬롯 또는 크레딧 한도에 도달했습니다 "
+                            "(Plus: 비공개 10개 / 공개 무제한 · Pro: 비공개 무제한). "
+                            "지금까지 성공한 모델은 모두 자동 저장되었으며, 요금제 업그레이드 또는 공개 범위 변경 후 이어서 실행할 수 있습니다."
+                        )
+                        return {"ok": False, "fatal_code": "QUOTA_LIMIT", "error": f"{hint} [HTTP {code}: {err_txt[:180]}]"}
+                    return {"ok": False, "fatal_code": "QUOTA_LIMIT", "error": f"Fish Audio 권한/한도 오류 (HTTP {code}): {err_txt[:180]}"}
+
+                if code == 429:
+                    wait_s = _parse_retry_after(resp_headers, default_sec=min(90.0, 5.0 * (2**attempt)))
+                    last_err = f"요청 속도 제한 (HTTP 429): {err_txt[:140]}"
+                    if attempt < max_retries:
+                        if callable(log_cb):
+                            log_cb(f"⏳ [{job.name_kr} {job.lang}] 속도 제한(429) → {wait_s:.0f}초 대기 후 재시도 ({attempt + 1}/{max_retries})")
+                        if _interruptible_sleep(wait_s, stop_event):
+                            return {"ok": False, "fatal_code": "STOPPED", "error": "사용자에 의해 안전 중지되었습니다."}
+                        continue
+                    return {"ok": False, "fatal_code": "", "error": last_err}
+
+                if code >= 500:
+                    wait_s = min(60.0, 4.0 * (2**attempt))
+                    last_err = f"Fish Audio 서버 일시 오류 (HTTP {code}): {err_txt[:140]}"
+                    if attempt < max_retries:
+                        if callable(log_cb):
+                            log_cb(f"⏳ [{job.name_kr} {job.lang}] 서버 오류({code}) → {wait_s:.0f}초 후 재시도 ({attempt + 1}/{max_retries})")
+                        if _interruptible_sleep(wait_s, stop_event):
+                            return {"ok": False, "fatal_code": "STOPPED", "error": "사용자에 의해 안전 중지되었습니다."}
+                        continue
+                    return {"ok": False, "fatal_code": "", "error": last_err}
+
+                if code in (400, 413, 422):
+                    last_err = f"업로드 요청 검증 오류 (HTTP {code}): {err_txt[:200]}"
+                    if plan_idx + 1 < len(plans):
+                        next_plan = plans[plan_idx + 1]
+                        if callable(log_cb):
+                            log_cb(
+                                f"🛠️ [{job.name_kr} {job.lang}] HTTP {code} 응답 → "
+                                f"자동 호환 폴백({next_plan['name']})으로 재시도합니다..."
+                            )
+                        escalate_plan = True
+                        break
+                    return {"ok": False, "fatal_code": "", "error": last_err}
+
+                return {"ok": False, "fatal_code": "", "error": f"업로드 실패 (HTTP {code}): {err_txt[:200]}"}
+
+            if escalate_plan:
+                plan_idx += 1
+                continue
+            break
+
+        return {"ok": False, "fatal_code": "", "error": last_err or "알 수 없는 업로드 오류"}
+    finally:
+        if pack_tmp is not None:
+            try:
+                pack_tmp.cleanup()
+            except Exception:
+                shutil.rmtree(pack_tmp.name, ignore_errors=True)
 
 
 def run_fish_batch_pipeline(
@@ -1276,6 +2172,7 @@ def run_fish_batch_pipeline(
     on_model_linked: Callable[[str, str, str], None] | None = None,
     log_cb: Callable[[str], None] | None = None,
     http_session: Any = None,
+    persist_voice_link_cb: Callable[[str, str, str], None] | None = None,
 ) -> dict[str, Any]:
     """
     Full-automation resumable pipeline for extracting and/or uploading all voiced Blue Archive
@@ -1288,11 +2185,14 @@ def run_fish_batch_pipeline(
     """
     prof_key, _ = resolve_quality_profile(quality_profile)
     all_chars = characters if characters is not None else load_all_character_configs()
-    user_cfg = cfg if cfg is not None else load_user_config()
+    if cfg is not None:
+        user_cfg = copy.deepcopy(cfg) if callable(persist_voice_link_cb) else cfg
+    else:
+        user_cfg = load_user_config()
     game_dir = resolve_ba_game_dir(game_dir, user_cfg)
     eff_key = (api_key or str(user_cfg.get("fish_api_key") or "")).strip()
     manifest = load_batch_manifest()
-    entries = manifest.setdefault("entries", {})
+    _ensure_dict(manifest, "entries")
 
     counts = {
         "total_jobs": 0,
@@ -1358,17 +2258,23 @@ def run_fish_batch_pipeline(
                 http_session=sess,
                 log_cb=log_cb,
                 manifest=manifest,
+                stop_event=stop_event,
+                persist_voice_link_cb=persist_voice_link_cb,
             )
-            counts["synced"] = int(sync_res.get("synced", 0) or 0)
+            counts["synced"] = _safe_int(sync_res.get("synced"), 0)
             if not sync_res.get("ok"):
                 err = str(sync_res.get("error") or "계정 동기화 실패")
+                fcode = str(sync_res.get("fatal_code") or "")
+                if fcode == "STOPPED":
+                    _emit("stopped", 0, 1, status="stopped", msg=f"⏹ {err}")
+                    return {"ok": True, "fatal_code": "STOPPED", "error": err, "counts": counts}
                 _emit("error", 0, 1, status="error", msg=f"❌ {err}")
-                return {"ok": False, "fatal_code": sync_res.get("fatal_code", ""), "error": err, "counts": counts}
+                return {"ok": False, "fatal_code": fcode, "error": err, "counts": counts}
             for pair in sync_res.get("matched_keys") or []:
                 if isinstance(pair, (list, tuple)) and len(pair) == 2:
                     self_owned_keys.add((str(pair[0]), str(pair[1]).upper()))
             if callable(on_model_linked):
-                for key_str, mid in (sync_res.get("matched_models") or {}).items():
+                for key_str, mid in (sync_res.get("synced_models") or {}).items():
                     if "::" in key_str:
                         scid, slang = key_str.split("::", 1)
                         try:
@@ -1445,6 +2351,7 @@ def run_fish_batch_pipeline(
 
         asset_mgr = MomoTalkAssetManager(ba_root_hint=game_dir) if (mode == "upload" and (include_cover or visibility == "public")) else None
         uploads_done_this_run = 0
+        limit_reached = False
         fatal_code = ""
         fatal_err = ""
 
@@ -1463,20 +2370,26 @@ def run_fish_batch_pipeline(
                         _emit("extract", idx, len(jobs), job=job, status="skipped", msg=f"[{idx}/{len(jobs)}] ⏭ {job.name_kr} ({job.lang}) 이미 추출됨 ({prof_key})")
                     else:
                         counts["extracted"] += 1
-                        entries[job.key] = {
-                            **(entries.get(job.key) or {}),
-                            "char_id": job.char_id,
-                            "name_kr": job.name_kr,
-                            "lang": job.lang,
-                            "quality_profile": prof_key,
-                            "extracted": True,
-                            "clip_count": int(res.get("clip_count", 0)),
-                            "duration_sec": float(res.get("total_duration_sec", 0.0)),
-                            "transcript_matched": int(res.get("transcript_matched", 0)),
-                            "transcript_locked": bool(res.get("transcript_locked", False)),
-                            "updated_at": time.time(),
-                        }
-                        save_batch_manifest(manifest)
+                        _update_manifest_entry_locked(
+                            job.key,
+                            {
+                                "char_id": job.char_id,
+                                "name_kr": job.name_kr,
+                                "lang": job.lang,
+                                "pipeline_version": _safe_int(res.get("pipeline_version"), STUDIO_PIPELINE_VERSION),
+                                "quality_profile": prof_key,
+                                "extracted": True,
+                                "clip_count": _safe_int(res.get("clip_count"), 0),
+                                "memoriallobby_clips": _safe_int(res.get("memoriallobby_clips"), 0),
+                                "duration_sec": _safe_float(res.get("total_duration_sec"), 0.0),
+                                "transcript_matched": _safe_int(res.get("transcript_matched"), 0),
+                                "transcript_coverage": _safe_float(res.get("transcript_coverage"), 0.0),
+                                "transcript_locked": bool(res.get("transcript_locked", False)),
+                                "gamedata_available": bool(res.get("gamedata_available", False)),
+                                "updated_at": time.time(),
+                            },
+                            manifest=manifest,
+                        )
                         lock_tag = " · 대본100%" if res.get("transcript_locked") else ""
                         _emit(
                             "extract",
@@ -1493,15 +2406,17 @@ def run_fish_batch_pipeline(
                 except Exception as exc:
                     counts["failed"] += 1
                     safe_exc = _redact_secrets(str(exc), extra_secrets=(eff_key,))
-                    entries[job.key] = {
-                        **(entries.get(job.key) or {}),
-                        "char_id": job.char_id,
-                        "name_kr": job.name_kr,
-                        "lang": job.lang,
-                        "error": safe_exc,
-                        "updated_at": time.time(),
-                    }
-                    save_batch_manifest(manifest)
+                    _update_manifest_entry_locked(
+                        job.key,
+                        {
+                            "char_id": job.char_id,
+                            "name_kr": job.name_kr,
+                            "lang": job.lang,
+                            "error": safe_exc,
+                            "updated_at": time.time(),
+                        },
+                        manifest=manifest,
+                    )
                     _emit("extract", idx, len(jobs), job=job, status="failed", msg=f"[{idx}/{len(jobs)}] ⚠️ {job.name_kr} ({job.lang}) 추출 실패: {safe_exc}")
                 continue
 
@@ -1514,6 +2429,7 @@ def run_fish_batch_pipeline(
                 continue
 
             if limit is not None and limit > 0 and uploads_done_this_run >= limit:
+                limit_reached = True
                 _emit("done", idx - 1, len(jobs), job=job, status="limit_reached", msg=f"⏸ 설정한 업로드 상한({limit}개)에 도달해 정상 종료했습니다.")
                 break
 
@@ -1523,9 +2439,31 @@ def run_fish_batch_pipeline(
                     if not ext_res.get("skipped"):
                         counts["extracted"] += 1
                 except Exception as exc:
-                    counts["failed"] += 1
-                    _emit("upload", idx, len(jobs), job=job, status="failed", msg=f"[{idx}/{len(jobs)}] ⚠️ {job.name_kr} ({job.lang}) 추출 실패: {exc}")
-                    continue
+                    safe_exc = _redact_secrets(str(exc), extra_secrets=(eff_key,))
+                    if _has_any_local_wavs(job.char_id, job.lang):
+                        _emit(
+                            "upload",
+                            idx,
+                            len(jobs),
+                            job=job,
+                            status="extract_fallback",
+                            msg=f"[{idx}/{len(jobs)}] ⚠️ {job.name_kr} ({job.lang}) 재추출 실패({safe_exc}) → 기존 로컬 WAV로 업로드를 계속합니다.",
+                        )
+                    else:
+                        counts["failed"] += 1
+                        _update_manifest_entry_locked(
+                            job.key,
+                            {
+                                "char_id": job.char_id,
+                                "name_kr": job.name_kr,
+                                "lang": job.lang,
+                                "error": safe_exc,
+                                "updated_at": time.time(),
+                            },
+                            manifest=manifest,
+                        )
+                        _emit("upload", idx, len(jobs), job=job, status="failed", msg=f"[{idx}/{len(jobs)}] ⚠️ {job.name_kr} ({job.lang}) 추출 실패: {safe_exc}")
+                        continue
 
             replacing_ext = bool(job.existing_model_id) and (not job.owned_by_self)
             rep_note = " · 기존 외부링크 교체" if replacing_ext else ""
@@ -1547,12 +2485,17 @@ def run_fish_batch_pipeline(
                 mid = str(up_res["model_id"])
                 actual_vis = str(up_res.get("visibility") or visibility)
                 bucket_name = "saved_voices_kr" if job.lang == "KR" else "saved_voices"
-                prev_id = _clean_model_id(str((user_cfg.get(bucket_name) or {}).get(job.char_id) or ""))
-                if prev_id and prev_id != mid:
-                    backup_saved_voices_once(user_cfg, log_cb=log_cb)
-                user_cfg.setdefault(bucket_name, {})[job.char_id] = mid
-                _sync_active_reference_id(user_cfg, job.char_id, job.lang, mid)
-                save_user_config(user_cfg)
+                with _BATCH_PERSIST_LOCK:
+                    bucket = _ensure_dict(user_cfg, bucket_name)
+                    prev_id = _clean_model_id(str(bucket.get(job.char_id) or ""))
+                    if prev_id and prev_id != mid:
+                        backup_saved_voices_once(user_cfg, log_cb=log_cb)
+                    bucket[job.char_id] = mid
+                    _sync_active_reference_id(user_cfg, job.char_id, job.lang, mid)
+                    if not callable(persist_voice_link_cb):
+                        save_user_config(copy.deepcopy(user_cfg))
+                if callable(persist_voice_link_cb):
+                    persist_voice_link_cb(job.char_id, job.lang, mid)
 
                 uploads_done_this_run += 1
                 counts["uploaded"] += 1
@@ -1574,7 +2517,16 @@ def run_fish_batch_pipeline(
                     except Exception:
                         pass
 
-                plan_note = f" [{up_res.get('upload_plan')}]" if up_res.get("upload_plan") not in (None, "", "optimal") else ""
+                plan_name = str(up_res.get("upload_plan") or "")
+                packed_from = _safe_int(up_res.get("packed_from_clips"), 0)
+                clip_cnt = _safe_int(up_res.get("clip_count"), 0)
+                packed_dur = _safe_float(up_res.get("packed_duration_sec"), 0.0)
+                if plan_name == "packed_optimal" and packed_from > clip_cnt:
+                    plan_note = f" [풀패킹 {packed_from}클립→{clip_cnt}파일 · {packed_dur:.1f}초]"
+                elif plan_name not in ("", "optimal"):
+                    plan_note = f" [{plan_name}]"
+                else:
+                    plan_note = ""
                 rep_done = " (기존 외부링크 → 내 모델 교체)" if replacing_ext else ""
                 _emit(
                     "upload",
@@ -1599,15 +2551,17 @@ def run_fish_batch_pipeline(
                     _emit("stopped", idx - 1, len(jobs), job=job, status="stopped", msg=f"⏹ {err_msg}")
                     break
                 counts["failed"] += 1
-                entries[job.key] = {
-                    **(entries.get(job.key) or {}),
-                    "char_id": job.char_id,
-                    "name_kr": job.name_kr,
-                    "lang": job.lang,
-                    "error": err_msg,
-                    "updated_at": time.time(),
-                }
-                save_batch_manifest(manifest)
+                _update_manifest_entry_locked(
+                    job.key,
+                    {
+                        "char_id": job.char_id,
+                        "name_kr": job.name_kr,
+                        "lang": job.lang,
+                        "error": err_msg,
+                        "updated_at": time.time(),
+                    },
+                    manifest=manifest,
+                )
                 if fcode in ("AUTH_ERROR", "QUOTA_LIMIT"):
                     fatal_code = fcode
                     fatal_err = err_msg
@@ -1615,7 +2569,7 @@ def run_fish_batch_pipeline(
                     break
                 _emit("upload", idx, len(jobs), job=job, status="failed", msg=f"[{idx}/{len(jobs)}] ⚠️ {job.name_kr} ({job.lang}) 실패: {err_msg}")
 
-        if not fatal_code:
+        if not fatal_code and not limit_reached:
             rep_str = f" (외부링크 교체 {counts['replaced_external']}건 포함)" if counts["replaced_external"] else ""
             _emit(
                 "done",
@@ -1720,6 +2674,7 @@ def auto_generate_and_link_student_voice(
     on_stage: Callable[[str, str], None] | None = None,
     on_model_linked: Callable[[str, str, str], None] | None = None,
     log_cb: Callable[[str], None] | None = None,
+    persist_voice_link_cb: Callable[[str, str, str], None] | None = None,
 ) -> dict[str, Any]:
     """
     On-demand 1-click voice creation & auto-linking engine designed for distributed end-users.
@@ -1737,7 +2692,10 @@ def auto_generate_and_link_student_voice(
       6. If `include_alt_voices=True` and the student declares `alt_voice_personas` (e.g. Kisaki -> Kiki),
          extract/upload/link any missing alt voice slot too (non-fatal if an extra slot hits quota).
     """
-    user_cfg = cfg if cfg is not None else load_user_config()
+    if cfg is not None:
+        user_cfg = copy.deepcopy(cfg) if callable(persist_voice_link_cb) else cfg
+    else:
+        user_cfg = load_user_config()
     eff_key = (api_key or str(user_cfg.get("fish_api_key") or "")).strip()
     cid = str(char_data.get("id") or "").strip()
     name_kr = str(char_data.get("name_kr") or cid)
@@ -1783,21 +2741,26 @@ def auto_generate_and_link_student_voice(
         sess = http_session
 
     def _persist_link(target_cid: str, target_name_kr: str, model_id: str, actual_vis: str) -> None:
-        prev_id = _clean_model_id(str((user_cfg.get(bucket_name) or {}).get(target_cid) or ""))
-        if prev_id and prev_id != model_id:
-            backup_saved_voices_once(user_cfg, log_cb=log_cb)
-        user_cfg.setdefault(bucket_name, {})[target_cid] = model_id
-        _sync_active_reference_id(user_cfg, target_cid, lang_up, model_id)
-        save_user_config(user_cfg)
-        record_self_owned_model(
-            char_id=target_cid,
-            name_kr=target_name_kr,
-            lang=lang_up,
-            model_id=model_id,
-            visibility=actual_vis,
-            quality_profile=prof_key,
-            manifest=manifest,
-        )
+        with _BATCH_PERSIST_LOCK:
+            bucket = _ensure_dict(user_cfg, bucket_name)
+            prev_id = _clean_model_id(str(bucket.get(target_cid) or ""))
+            if prev_id and prev_id != model_id:
+                backup_saved_voices_once(user_cfg, log_cb=log_cb)
+            bucket[target_cid] = model_id
+            _sync_active_reference_id(user_cfg, target_cid, lang_up, model_id)
+            if not callable(persist_voice_link_cb):
+                save_user_config(copy.deepcopy(user_cfg))
+            record_self_owned_model(
+                char_id=target_cid,
+                name_kr=target_name_kr,
+                lang=lang_up,
+                model_id=model_id,
+                visibility=actual_vis,
+                quality_profile=prof_key,
+                manifest=manifest,
+            )
+        if callable(persist_voice_link_cb):
+            persist_voice_link_cb(target_cid, lang_up, model_id)
         if callable(on_model_linked):
             try:
                 on_model_linked(target_cid, lang_up, model_id)
@@ -1813,12 +2776,14 @@ def auto_generate_and_link_student_voice(
             return alt_results
 
         for ak in sorted(alts.keys()):
+            if stop_event is not None and stop_event.is_set():
+                break
             alt_ch = build_alt_voice_char_data(char_data, ak)
             if alt_ch is None:
                 continue
             alt_cid = str(alt_ch["id"])
             alt_name = str(alt_ch.get("name_kr") or alt_cid)
-            alt_existing = _clean_model_id(str((user_cfg.get(bucket_name) or {}).get(alt_cid) or ""))
+            alt_existing = _clean_model_id(str(_as_dict(user_cfg.get(bucket_name)).get(alt_cid) or ""))
             remote_alt_id = matched_remote.get(f"{alt_cid}::{lang_up}", "")
             if (not force_recreate) and remote_alt_id:
                 _persist_link(alt_cid, alt_name, remote_alt_id, eff_vis)
@@ -1880,6 +2845,8 @@ def auto_generate_and_link_student_voice(
                         "error": str(alt_up.get("error") or ""),
                     }
                 )
+                if str(alt_up.get("fatal_code") or "") == "STOPPED":
+                    break
         return alt_results
 
     try:
@@ -1895,24 +2862,29 @@ def auto_generate_and_link_student_voice(
                 http_session=sess,
                 log_cb=log_cb,
                 manifest=manifest,
+                stop_event=stop_event,
+                persist_voice_link_cb=persist_voice_link_cb,
             )
-            if not sync_res.get("ok") and sync_res.get("fatal_code") == "AUTH_ERROR":
+            if not sync_res.get("ok") and sync_res.get("fatal_code") in ("AUTH_ERROR", "STOPPED"):
+                fcode = str(sync_res.get("fatal_code") or "")
                 err = str(sync_res.get("error") or "Fish Audio API Key 인증 실패")
-                _stage("error", f"❌ {err}")
-                return {"ok": False, "fatal_code": "AUTH_ERROR", "error": err, "char_id": cid, "lang": lang_up}
+                _stage("stopped" if fcode == "STOPPED" else "error", f"{'⏹' if fcode == 'STOPPED' else '❌'} {err}")
+                return {"ok": False, "fatal_code": fcode, "error": err, "char_id": cid, "lang": lang_up}
 
             if sync_res.get("ok"):
                 matched_remote = dict(sync_res.get("matched_models") or {})
-                # Notify UI for any models newly linked during account sync
+                existing_remote_id = _clean_model_id(str(matched_remote.get(f"{cid}::{lang_up}") or ""))
+                # Notify UI ONLY for models newly linked during account sync (do not overwrite pinned voices)
                 if callable(on_model_linked):
-                    for key_str, rmid in matched_remote.items():
+                    for key_str, rmid in (sync_res.get("synced_models") or {}).items():
+                        if existing_remote_id and key_str == f"{cid}::{lang_up}":
+                            continue
                         if "::" in key_str:
                             scid, slang = key_str.split("::", 1)
                             try:
                                 on_model_linked(scid, slang, str(rmid))
                             except Exception:
                                 pass
-                existing_remote_id = _clean_model_id(str(matched_remote.get(f"{cid}::{lang_up}") or ""))
                 if existing_remote_id:
                     _stage("link", f"🔄 내 계정의 기존 [{name_kr} ({lang_up})] 모델을 자동 연결합니다...")
                     _persist_link(cid, name_kr, existing_remote_id, eff_vis)
@@ -2002,12 +2974,16 @@ def auto_generate_and_link_student_voice(
             reply_lang=rlang,
             molru_files=molru_files,
             already_extracted=already_extracted,
-            existing_model_id=_clean_model_id(str((user_cfg.get(bucket_name) or {}).get(cid) or "")),
+            existing_model_id=_clean_model_id(str(_as_dict(user_cfg.get(bucket_name)).get(cid) or "")),
             char_data=char_data,
         )
 
         if not job.already_extracted and molru_files:
-            prof_tag = "고품질 85초" if prof_key == "pro85" else "표준 45초"
+            prof_tag = {
+                "plus200": "Plus 200초 최고품질",
+                "pro85": "고품질 85초",
+                "standard45": "표준 45초",
+            }.get(prof_key, prof_key)
             _stage("extract", f"🎧 [{name_kr} ({lang_up})] 스팀 원음 추출 중 ({prof_tag})...")
             try:
                 extract_job_reference(job, force=False, game_dir=eff_game_dir, quality_profile=prof_key)
@@ -2054,10 +3030,18 @@ def auto_generate_and_link_student_voice(
         _persist_link(cid, name_kr, model_id, actual_vis)
         alt_results = _build_and_link_alt_voices(matched_remote)
 
+        packed_from = _safe_int(up_res.get("packed_from_clips"), 0)
+        clip_cnt = _safe_int(up_res.get("clip_count"), 0)
+        packed_dur = _safe_float(up_res.get("packed_duration_sec"), 0.0)
+        clip_desc = (
+            f"{packed_from}클립→{clip_cnt}파일 풀패킹 · {packed_dur:.1f}초"
+            if packed_from > clip_cnt
+            else f"{clip_cnt}클립"
+        )
         tr_note = " · 공식대본 100%" if up_res.get("transcript_attached") else ""
         _stage(
             "done",
-            f"💗 [{name_kr} ({lang_up})] 목소리 자동 생성 & 연결 완료! ({up_res.get('clip_count', 0)}클립{tr_note} · ID: {model_id})",
+            f"💗 [{name_kr} ({lang_up})] 목소리 자동 생성 & 연결 완료! ({clip_desc}{tr_note} · ID: {model_id})",
         )
         return {
             "ok": True,
@@ -2069,7 +3053,9 @@ def auto_generate_and_link_student_voice(
             "visibility": actual_vis,
             "requested_visibility": eff_vis,
             "quality_profile": prof_key,
-            "clip_count": int(up_res.get("clip_count", 0) or 0),
+            "clip_count": clip_cnt,
+            "packed_from_clips": packed_from if packed_from > 0 else clip_cnt,
+            "packed_duration_sec": round(packed_dur, 2),
             "transcript_attached": bool(up_res.get("transcript_attached", False)),
             "upload_plan": str(up_res.get("upload_plan") or "optimal"),
             "alt_results": alt_results,

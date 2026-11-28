@@ -21,14 +21,22 @@ import re
 import struct
 import tempfile
 import threading
+import time
 import zlib
 from pathlib import Path
 from typing import Any, Callable
 
 import numpy as np
 
-from src.extractor.ba_molru_extractor import DEFAULT_GAME_DIR, discover_steam_blue_archive_dir
+from src.extractor.ba_molru_extractor import (
+    DEFAULT_GAME_DIR,
+    _normalize_ba_candidate,
+    discover_steam_blue_archive_dir,
+)
 from src.utils.app_paths import get_app_root, get_cache_dir
+
+_PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+MAX_BUNDLE_INDEX_JSON_BYTES = 32 * 1024 * 1024
 
 # Hardened binary parser & resource limits (defends against decompression bombs / OOM DoS)
 MAX_PNG_DIMENSION = 4096
@@ -74,11 +82,49 @@ def _safe_rendered_file(rendered_dir: Path, fname: str) -> Path:
     return target_res
 
 
+def _atomic_write_bytes(target: Path, payload: bytes) -> None:
+    """Atomically write bytes via temp file + `os.replace` with Windows PermissionError retries."""
+    if target.is_symlink():
+        raise ValueError(f"Refusing to overwrite symlink cache file: {target}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp_name = ""
+    fd = -1
+    fd_closed = True
+    try:
+        fd, tmp_name = tempfile.mkstemp(prefix=".momo_", suffix=".tmp", dir=str(target.parent))
+        fd_closed = False
+        with os.fdopen(fd, "wb") as fh:
+            fd_closed = True
+            fh.write(payload)
+        last_err: Exception | None = None
+        for attempt in range(5):
+            try:
+                os.replace(tmp_name, target)
+                last_err = None
+                break
+            except PermissionError as exc:
+                last_err = exc
+                time.sleep(0.03 * (attempt + 1))
+        if last_err is not None:
+            raise last_err
+    finally:
+        if not fd_closed and fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if tmp_name and os.path.exists(tmp_name):
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+
+
 def _discover_ba_root(custom_hint: str | Path | None = None) -> Path | None:
     if custom_hint is not None:
-        p = Path(custom_hint)
-        if p.name.lower() == "bluearchive_data":
-            p = p.parent
+        p = _normalize_ba_candidate(custom_hint)
+        if p is None:
+            return None
         gd = p / "BlueArchive_Data" / "StreamingAssets" / "PUB" / "Resource" / "GameData" / "Windows"
         if gd.is_dir():
             return p
@@ -140,10 +186,11 @@ CHARACTER_PORTRAIT_ALIASES: dict[str, tuple[str, ...]] = {
     "Saten_Ruiko": ("SatenRuiko", "Saten"),
     "Aris": ("Aris", "Alice"),
     "Utaha": ("Utaha",),
-    "NerU": ("Neru",),
+    "Neru": ("Neru",),
     "Shiroko": ("Shiroko",),
     "Shiroko_Terror": ("Shiroko_Terror", "ShirokoTerror", "CH0263"),
     "Hoshino": ("Hoshino",),
+    "Reijo": ("Reizyo", "CH0134"),
     "GSC_President": ("GSCPresident", "President"),
     "Prof_Niyaniya": ("Niyaniya", "ProfNiyaniya"),
 }
@@ -319,7 +366,9 @@ def parse_unityfs_header(bundle_path: Path) -> dict[str, Any]:
             raise ValueError(f"Truncated UnityFS node header in {bundle_path}")
         ofs, sz, _st = struct.unpack_from(">qqI", ib, ip)
         ip += 20
-        end = ib.index(b"\x00", ip)
+        end = ib.find(b"\x00", ip)
+        if end == -1:
+            raise ValueError(f"Unterminated UnityFS node name in {bundle_path}")
         nm = ib[ip:end].decode("utf-8", errors="replace")
         ip = end + 1
         if ofs < 0 or sz < 0:
@@ -439,7 +488,9 @@ def unpack_unityfs(bundle_path: Path) -> dict[str, bytes]:
 
     def _rstr() -> str:
         nonlocal pos
-        end = data.index(b"\x00", pos)
+        end = data.find(b"\x00", pos)
+        if end == -1:
+            raise ValueError(f"Unterminated UnityFS header string in {bundle_path}")
         val = data[pos:end].decode("utf-8", errors="replace")
         pos = end + 1
         return val
@@ -447,10 +498,14 @@ def unpack_unityfs(bundle_path: Path) -> dict[str, bytes]:
     sig = _rstr()
     if sig != "UnityFS":
         raise ValueError(f"Unsupported bundle signature: {sig!r}")
+    if pos + 4 > len(data):
+        raise ValueError(f"Truncated UnityFS version field in {bundle_path}")
     ver = struct.unpack_from(">I", data, pos)[0]
     pos += 4
     _rstr()  # unity_version
     _rstr()  # unity_revision
+    if pos + 20 > len(data):
+        raise ValueError(f"Truncated UnityFS size fields in {bundle_path}")
     size, c_ib, u_ib, flags = struct.unpack_from(">qIII", data, pos)
     pos += 20
     if c_ib > MAX_UNITYFS_HEADER_BYTES or u_ib > MAX_UNITYFS_HEADER_BYTES:
@@ -462,6 +517,8 @@ def unpack_unityfs(bundle_path: Path) -> dict[str, bytes]:
             raise ValueError(f"Invalid UnityFS tail bounds: size={size}, c_ib={c_ib}")
         ib_raw = data[size - c_ib : size]
     else:
+        if pos + c_ib > len(data):
+            raise ValueError(f"Truncated UnityFS blocksInfo in {bundle_path}")
         ib_raw = data[pos : pos + c_ib]
         pos += c_ib
     if flags & 0x200:
@@ -471,6 +528,8 @@ def unpack_unityfs(bundle_path: Path) -> dict[str, bytes]:
     ib = lz4_decompress(ib_raw, u_ib, max_size=MAX_UNITYFS_HEADER_BYTES) if comp in (2, 3) else ib_raw
 
     ip = 16
+    if ip + 4 > len(ib):
+        raise ValueError(f"Truncated UnityFS block count in {bundle_path}")
     b_cnt = struct.unpack_from(">I", ib, ip)[0]
     ip += 4
     if b_cnt > MAX_UNITYFS_BLOCKS or ip + 10 * b_cnt > len(ib):
@@ -490,7 +549,9 @@ def unpack_unityfs(bundle_path: Path) -> dict[str, bytes]:
             raise ValueError(f"Truncated UnityFS node header in {bundle_path}")
         ofs, sz, _st = struct.unpack_from(">qqI", ib, ip)
         ip += 20
-        end = ib.index(b"\x00", ip)
+        end = ib.find(b"\x00", ip)
+        if end == -1:
+            raise ValueError(f"Unterminated UnityFS node name in {bundle_path}")
         nm = ib[ip:end].decode("utf-8", errors="replace")
         ip = end + 1
         if ofs < 0 or sz < 0:
@@ -521,8 +582,13 @@ def parse_serialized_texture2d_entries(cab_bytes: bytes) -> list[dict[str, Any]]
     endian = cab_bytes[16]
     le = "<" if endian == 0 else ">"
     data_ofs = struct.unpack_from(">q", cab_bytes, 32)[0]
-    p = cab_bytes.index(b"\x00", 48) + 1
+    nul_pos = cab_bytes.find(b"\x00", 48)
+    if nul_pos == -1:
+        return []
+    p = nul_pos + 1
     p += 4  # target_platform
+    if p + 5 > len(cab_bytes):
+        return []
     enable_tt = cab_bytes[p]
     p += 1
     tcnt = struct.unpack_from(le + "i", cab_bytes, p)[0]
@@ -578,6 +644,8 @@ def parse_serialized_texture2d_entries(cab_bytes: bytes) -> list[dict[str, Any]]
             continue
         name = ob[4 : 4 + nlen].decode("utf-8", errors="replace")
         off = (4 + nlen + 3) & ~3
+        if off + 88 > len(ob):
+            continue
         w, h, complete_sz, _mips_stripped, tex_fmt, mip_cnt = struct.unpack_from("<6i", ob, off + 8)
         if w <= 0 or h <= 0 or w > 4096 or h > 4096:
             continue
@@ -1257,8 +1325,12 @@ class MomoTalkAssetManager:
         self._bundled_assets_dir: Path | None = Path(bundled_assets_dir) if bundled_assets_dir is not None else None
         self._bundled_file_maps: dict[str, dict[str, Path]] = {}
         self._lock = threading.Lock()
+        self._build_lock = threading.Lock()
         self._bundle_cache_lock = threading.Lock()
+        self._io_write_lock = threading.Lock()
+        self._closed = threading.Event()
         self._index: dict[str, Any] | None = None
+        self._index_gen: int = 0
         self._raw_rgba_cache: dict[str, np.ndarray] = {}
         self._bundle_header_cache: dict[str, dict[str, Any]] = {}
         self._block_cache: OrderedDict[tuple[str, int], bytes] = OrderedDict()
@@ -1267,6 +1339,21 @@ class MomoTalkAssetManager:
         self._rendered_dir_path: Path | None = None
         self._rendered_files: set[str] | None = None
         self._indexing_thread: threading.Thread | None = None
+        self._index_callbacks: list[Callable[[], None]] = []
+
+    def close(self) -> None:
+        """Signal any background index/render work to abort and wait for in-flight disk writes to finish."""
+        self._closed.set()
+        with self._io_write_lock:
+            pass
+        with self._lock:
+            self._index_callbacks.clear()
+            idx_t = self._indexing_thread
+        if idx_t is not None and idx_t.is_alive() and idx_t is not threading.current_thread():
+            try:
+                idx_t.join(timeout=1.5)
+            except Exception:
+                pass
 
     def _get_bundled_assets_dir(self) -> Path:
         if self._bundled_assets_dir is not None:
@@ -1324,21 +1411,34 @@ class MomoTalkAssetManager:
         return None
 
     def set_ba_root_hint(self, ba_root_hint: str | Path | None) -> None:
-        """Update Steam Blue Archive root hint at runtime and clear stale empty bundle index."""
+        """Update Steam Blue Archive root hint at runtime and clear stale bundle index & texture caches."""
         with self._lock:
             self._ba_root_hint = ba_root_hint
             self._index = None
+            self._index_gen += 1
+        with self._bundle_cache_lock:
+            self._raw_rgba_cache.clear()
+            self._bundle_header_cache.clear()
+            self._block_cache.clear()
 
-    def _ensure_cache_paths(self) -> tuple[Path, Path, set[str]]:
+    def _ensure_cache_paths_unlocked(self) -> tuple[Path, Path, set[str]]:
         env_dir = os.environ.get("VOICE_COMPANION_DATA_DIR", "")
-        with self._lock:
-            if (
-                self._cached_env_dir == env_dir
-                and self._cached_root_path is not None
-                and self._rendered_dir_path is not None
-                and self._rendered_files is not None
-            ):
-                return self._cached_root_path, self._rendered_dir_path, self._rendered_files
+        if (
+            self._cached_env_dir == env_dir
+            and self._cached_root_path is not None
+            and self._rendered_dir_path is not None
+            and self._rendered_files is not None
+        ):
+            return self._cached_root_path, self._rendered_dir_path, self._rendered_files
+        if self._closed.is_set():
+            base_dir = Path(env_dir).expanduser() if env_dir.strip() else Path(os.environ.get("LOCALAPPDATA", ".") or ".") / "VoiceCompanionData"
+            root = base_dir / "cache" / "momotalk_ui"
+            return root, root / "rendered", set()
+        with self._io_write_lock:
+            if self._closed.is_set():
+                base_dir = Path(env_dir).expanduser() if env_dir.strip() else Path(os.environ.get("LOCALAPPDATA", ".") or ".") / "VoiceCompanionData"
+                root = base_dir / "cache" / "momotalk_ui"
+                return root, root / "rendered", set()
             root = get_cache_dir() / "momotalk_ui"
             rendered = root / "rendered"
             rendered.mkdir(parents=True, exist_ok=True)
@@ -1346,15 +1446,36 @@ class MomoTalkAssetManager:
                 files = set(os.listdir(rendered))
             except Exception:
                 files = set()
-            self._cached_env_dir = env_dir
-            self._cached_root_path = root
-            self._rendered_dir_path = rendered
-            self._rendered_files = files
-            return root, rendered, files
+        self._cached_env_dir = env_dir
+        self._cached_root_path = root
+        self._rendered_dir_path = rendered
+        self._rendered_files = files
+        return root, rendered, files
+
+    def _ensure_cache_paths(self) -> tuple[Path, Path, set[str]]:
+        with self._lock:
+            root, rendered, files = self._ensure_cache_paths_unlocked()
+            return root, rendered, set(files)
+
+    def _get_rendered_dir_and_check(self, fname: str) -> tuple[Path, bool]:
+        with self._lock:
+            _, rendered, files = self._ensure_cache_paths_unlocked()
+            return rendered, (fname in files)
+
+    def _is_rendered_cached(self, fname: str) -> bool:
+        with self._lock:
+            _, _, files = self._ensure_cache_paths_unlocked()
+            return fname in files
+
+    def _discard_rendered_cached(self, fname: str) -> None:
+        with self._lock:
+            if self._rendered_files is not None:
+                self._rendered_files.discard(fname)
 
     @property
     def cache_root(self) -> Path:
-        return self._ensure_cache_paths()[0]
+        with self._lock:
+            return self._ensure_cache_paths_unlocked()[0]
 
     def _resource_root_dir(self) -> Path | None:
         ba = _discover_ba_root(self._ba_root_hint)
@@ -1370,138 +1491,229 @@ class MomoTalkAssetManager:
         gd = res / "GameData" / "Windows"
         return gd if gd.is_dir() else None
 
+    @classmethod
+    def _validate_bundle_index(cls, loaded: Any, gd: Path, res_root: Path) -> bool:
+        """Validate full `bundle_index_v3.json` schema and confirm referenced Steam bundles still exist."""
+        if not isinstance(loaded, dict):
+            return False
+        if loaded.get("version") != cls.INDEX_VERSION or loaded.get("gd") != str(gd):
+            return False
+        referenced_rel: set[str] = set()
+        referenced_name: set[str] = set()
+        for bucket in ("portraits", "schools", "ui_icons"):
+            bmap = loaded.get(bucket)
+            if not isinstance(bmap, dict):
+                return False
+            for k, entry in bmap.items():
+                if not isinstance(k, str) or not isinstance(entry, dict):
+                    return False
+                if not isinstance(entry.get("name"), str) or not entry.get("name"):
+                    return False
+                for int_field in ("w", "h", "fmt"):
+                    v = entry.get(int_field)
+                    if isinstance(v, bool) or not isinstance(v, int):
+                        return False
+                for opt_int in ("stream_off", "stream_sz"):
+                    v = entry.get(opt_int, 0)
+                    if isinstance(v, bool) or not isinstance(v, int):
+                        return False
+                brel = entry.get("bundle_rel")
+                bname = entry.get("bundle")
+                if isinstance(brel, str) and brel.strip():
+                    referenced_rel.add(brel.replace("\\", "/"))
+                elif isinstance(bname, str) and bname.strip():
+                    referenced_name.add(bname)
+                else:
+                    return False
+
+        # Invalidate stale index immediately if Steam updated/renamed any referenced bundle file
+        try:
+            res_root_res = res_root.resolve()
+            gd_res = gd.resolve()
+        except OSError:
+            return False
+        for rel in referenced_rel:
+            if ".." in rel.split("/") or rel.startswith("/"):
+                return False
+            cand = res_root / rel
+            try:
+                if not cand.is_file() or cand.is_symlink() or not cand.resolve().is_relative_to(res_root_res):
+                    return False
+            except OSError:
+                return False
+        for bname in referenced_name:
+            if "/" in bname or "\\" in bname or ".." in bname:
+                return False
+            cand = gd / bname
+            try:
+                if not cand.is_file() or cand.is_symlink() or not cand.resolve().is_relative_to(gd_res):
+                    return False
+            except OSError:
+                return False
+        return True
+
     def ensure_index(self) -> dict[str, Any]:
         with self._lock:
             if self._index is not None:
                 return self._index
+        if self._closed.is_set():
+            return {"version": self.INDEX_VERSION, "gd": "", "portraits": {}, "schools": {}, "ui_icons": {}}
 
-        res_root = self._resource_root_dir()
-        gd = self._game_data_dir()
-        if gd is None or res_root is None:
-            empty = {"version": self.INDEX_VERSION, "gd": "", "portraits": {}, "schools": {}, "ui_icons": {}}
+        with self._build_lock:
             with self._lock:
-                self._index = empty
-            return empty
+                if self._index is not None:
+                    return self._index
+                build_gen = self._index_gen
+            if self._closed.is_set():
+                return {"version": self.INDEX_VERSION, "gd": "", "portraits": {}, "schools": {}, "ui_icons": {}}
 
-        idx_path = self.cache_root / f"bundle_index_v{self.INDEX_VERSION}.json"
-        if idx_path.exists():
-            try:
-                loaded = json.loads(idx_path.read_text(encoding="utf-8"))
-                if (
-                    isinstance(loaded, dict)
-                    and loaded.get("version") == self.INDEX_VERSION
-                    and loaded.get("gd") == str(gd)
-                    and isinstance(loaded.get("portraits"), dict)
-                ):
-                    with self._lock:
-                        self._index = loaded
-                    return loaded
-            except Exception:
-                pass
+            res_root = self._resource_root_dir()
+            gd = self._game_data_dir()
+            if self._closed.is_set():
+                return {"version": self.INDEX_VERSION, "gd": "", "portraits": {}, "schools": {}, "ui_icons": {}}
+            if gd is None or res_root is None:
+                empty = {"version": self.INDEX_VERSION, "gd": "", "portraits": {}, "schools": {}, "ui_icons": {}}
+                with self._lock:
+                    if self._index_gen == build_gen:
+                        self._index = empty
+                return empty
 
-        portraits: dict[str, dict[str, Any]] = {}
-        schools: dict[str, dict[str, Any]] = {}
-        ui_icons: dict[str, dict[str, Any]] = {}
-
-        preload_win = res_root / "Preload" / "Windows"
-        scan_specs: list[tuple[Path, str, str]] = [
-            (gd, "uis-01_common-01_character-*.bundle", "portraits"),
-            (preload_win, "prologgroup-assets-*01_common-01_character*.bundle", "portraits"),
-            (gd, "uis-01_common-11_schoolicon-*.bundle", "schools"),
-            (gd, "uis-03_scenario-03_emoticon-sprite-*.bundle", "ui_icons"),
-            (gd, "uis-00_images-_mxload-2024-11-18_000_*.bundle", "ui_icons"),
-        ]
-        for base_dir, pat, bucket in scan_specs:
-            if not base_dir.is_dir():
-                continue
-            for bp in sorted(base_dir.glob(pat)):
+            idx_path = self.cache_root / f"bundle_index_v{self.INDEX_VERSION}.json"
+            if self._closed.is_set():
+                return {"version": self.INDEX_VERSION, "gd": "", "portraits": {}, "schools": {}, "ui_icons": {}}
+            if idx_path.exists() and not idx_path.is_symlink():
                 try:
-                    cab = read_unityfs_node_slice(
-                        bp,
-                        lambda k: not k.endswith((".resS", ".resource")),
-                        header_cache=self._bundle_header_cache,
-                        block_cache=self._block_cache,
-                        cache_lock=self._bundle_cache_lock,
-                    )
-                except Exception:
-                    continue
-                if cab is None:
-                    continue
-                try:
-                    rel_bundle = str(bp.relative_to(res_root)).replace("\\", "/")
-                except Exception:
-                    rel_bundle = f"GameData/Windows/{bp.name}"
-                for entry in parse_serialized_texture2d_entries(cab):
-                    nm = entry["name"]
-                    nlow = nm.lower()
-                    meta = {
-                        "name": nm,
-                        "bundle": bp.name,
-                        "bundle_rel": rel_bundle,
-                        "w": entry["w"],
-                        "h": entry["h"],
-                        "fmt": entry["fmt"],
-                        "stream_off": entry["stream_off"],
-                        "stream_sz": entry["stream_sz"],
-                    }
-                    if bucket == "portraits":
-                        portraits[nlow] = meta
-                    elif bucket == "schools":
-                        if nlow.startswith("school_icon_"):
-                            schools[nm[len("School_Icon_") :].upper()] = meta
-                    else:
-                        if any(k in nlow for k in ("momo", "phone", "sns", "star", "heart")):
-                            ui_icons[nlow] = meta
-
-        idx_obj = {
-            "version": self.INDEX_VERSION,
-            "gd": str(gd),
-            "portraits": portraits,
-            "schools": schools,
-            "ui_icons": ui_icons,
-        }
-        try:
-            if not idx_path.is_symlink():
-                idx_path.parent.mkdir(parents=True, exist_ok=True)
-                fd, tmp_name = tempfile.mkstemp(prefix=".idx_", suffix=".tmp", dir=str(idx_path.parent))
-                try:
-                    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                        fh.write(json.dumps(idx_obj, ensure_ascii=False))
-                    os.replace(tmp_name, idx_path)
-                except Exception:
-                    try:
-                        os.unlink(tmp_name)
-                    except OSError:
-                        pass
-        except Exception:
-            pass
-        with self._lock:
-            self._index = idx_obj
-        return idx_obj
-
-    def ensure_index_async(self, on_ready: Callable[[], None] | None = None) -> None:
-        with self._lock:
-            already = self._index is not None
-            thr = self._indexing_thread
-        if already:
-            if on_ready is not None:
-                on_ready()
-            return
-        if thr is not None and thr.is_alive():
-            return
-
-        def _worker() -> None:
-            self.ensure_index()
-            if on_ready is not None:
-                try:
-                    on_ready()
+                    if idx_path.stat().st_size <= MAX_BUNDLE_INDEX_JSON_BYTES:
+                        loaded = json.loads(idx_path.read_text(encoding="utf-8"))
+                        if self._validate_bundle_index(loaded, gd, res_root):
+                            with self._lock:
+                                if self._index_gen == build_gen:
+                                    self._index = loaded
+                            return loaded
                 except Exception:
                     pass
 
-        t = threading.Thread(target=_worker, daemon=True, name="momotalk-asset-index")
+            portraits: dict[str, dict[str, Any]] = {}
+            schools: dict[str, dict[str, Any]] = {}
+            ui_icons: dict[str, dict[str, Any]] = {}
+
+            preload_win = res_root / "Preload" / "Windows"
+            scan_specs: list[tuple[Path, str, str]] = [
+                (gd, "uis-01_common-01_character-*.bundle", "portraits"),
+                (preload_win, "prologgroup-assets-*01_common-01_character*.bundle", "portraits"),
+                (gd, "uis-01_common-11_schoolicon-*.bundle", "schools"),
+                (gd, "uis-03_scenario-03_emoticon-sprite-*.bundle", "ui_icons"),
+                (gd, "uis-00_images-_mxload-2024-11-18_000_*.bundle", "ui_icons"),
+            ]
+            for base_dir, pat, bucket in scan_specs:
+                if self._closed.is_set():
+                    return {"version": self.INDEX_VERSION, "gd": "", "portraits": {}, "schools": {}, "ui_icons": {}}
+                if not base_dir.is_dir():
+                    continue
+                for bp in sorted(base_dir.glob(pat)):
+                    if self._closed.is_set():
+                        return {"version": self.INDEX_VERSION, "gd": "", "portraits": {}, "schools": {}, "ui_icons": {}}
+                    try:
+                        cab = read_unityfs_node_slice(
+                            bp,
+                            lambda k: not k.endswith((".resS", ".resource")),
+                            header_cache=self._bundle_header_cache,
+                            block_cache=self._block_cache,
+                            cache_lock=self._bundle_cache_lock,
+                        )
+                    except Exception:
+                        continue
+                    if cab is None or self._closed.is_set():
+                        continue
+                    try:
+                        rel_bundle = str(bp.relative_to(res_root)).replace("\\", "/")
+                    except Exception:
+                        rel_bundle = f"GameData/Windows/{bp.name}"
+                    for entry in parse_serialized_texture2d_entries(cab):
+                        nm = entry["name"]
+                        nlow = nm.lower()
+                        meta = {
+                            "name": nm,
+                            "bundle": bp.name,
+                            "bundle_rel": rel_bundle,
+                            "w": entry["w"],
+                            "h": entry["h"],
+                            "fmt": entry["fmt"],
+                            "stream_off": entry["stream_off"],
+                            "stream_sz": entry["stream_sz"],
+                        }
+                        if bucket == "portraits":
+                            portraits[nlow] = meta
+                        elif bucket == "schools":
+                            if nlow.startswith("school_icon_"):
+                                schools[nm[len("School_Icon_") :].upper()] = meta
+                        else:
+                            if any(k in nlow for k in ("momo", "phone", "sns", "star", "heart")):
+                                ui_icons[nlow] = meta
+
+            if self._closed.is_set():
+                return {"version": self.INDEX_VERSION, "gd": "", "portraits": {}, "schools": {}, "ui_icons": {}}
+
+            idx_obj = {
+                "version": self.INDEX_VERSION,
+                "gd": str(gd),
+                "portraits": portraits,
+                "schools": schools,
+                "ui_icons": ui_icons,
+            }
+            try:
+                with self._io_write_lock:
+                    if not self._closed.is_set():
+                        _atomic_write_bytes(idx_path, json.dumps(idx_obj, ensure_ascii=False).encode("utf-8"))
+            except Exception:
+                pass
+            if not self._closed.is_set():
+                with self._lock:
+                    if self._index_gen == build_gen:
+                        self._index = idx_obj
+            return idx_obj
+
+    def ensure_index_async(self, on_ready: Callable[[], None] | None = None) -> None:
+        if self._closed.is_set():
+            return
+
+        def _worker() -> None:
+            try:
+                if not self._closed.is_set():
+                    self.ensure_index()
+            finally:
+                with self._lock:
+                    callbacks = list(self._index_callbacks)
+                    self._index_callbacks.clear()
+                    self._indexing_thread = None
+                if not self._closed.is_set():
+                    for cb in callbacks:
+                        try:
+                            cb()
+                        except Exception:
+                            pass
+
         with self._lock:
-            self._indexing_thread = t
-        t.start()
+            if self._closed.is_set():
+                return
+            if self._index is not None:
+                already = True
+                t = None
+            else:
+                already = False
+                if on_ready is not None:
+                    self._index_callbacks.append(on_ready)
+                if self._indexing_thread is not None and self._indexing_thread.is_alive():
+                    return
+                t = threading.Thread(target=_worker, daemon=True, name="momotalk-asset-index")
+                self._indexing_thread = t
+
+        if already:
+            if on_ready is not None and not self._closed.is_set():
+                on_ready()
+            return
+        if t is not None:
+            t.start()
 
     def is_index_ready(self) -> bool:
         with self._lock:
@@ -1630,6 +1842,45 @@ class MomoTalkAssetManager:
             if self._rendered_files is not None:
                 self._rendered_files.add(fname)
 
+    def _read_valid_cached_png(self, cache_file: Path, fname: str) -> bytes | None:
+        try:
+            if cache_file.is_symlink() or not cache_file.is_file():
+                self._discard_rendered_cached(fname)
+                return None
+            sz = cache_file.stat().st_size
+            if sz < 33 or sz > MAX_PNG_COMPRESSED_BYTES:
+                try:
+                    cache_file.unlink()
+                except OSError:
+                    pass
+                self._discard_rendered_cached(fname)
+                return None
+            data = cache_file.read_bytes()
+            if len(data) >= 33 and data[:8] == _PNG_MAGIC:
+                return data
+            # Corrupt/truncated cached PNG -> remove and force clean regeneration
+            try:
+                cache_file.unlink()
+            except OSError:
+                pass
+            self._discard_rendered_cached(fname)
+            return None
+        except Exception:
+            self._discard_rendered_cached(fname)
+            return None
+
+    def _write_cached_png(self, cache_file: Path, fname: str, png_bytes: bytes) -> None:
+        if self._closed.is_set():
+            return
+        try:
+            with self._io_write_lock:
+                if self._closed.is_set():
+                    return
+                _atomic_write_bytes(cache_file, png_bytes)
+            self._mark_rendered_cached(fname)
+        except Exception:
+            pass
+
     def has_cached_portrait(
         self,
         char_data: dict[str, Any],
@@ -1638,13 +1889,13 @@ class MomoTalkAssetManager:
         ring_rgb: tuple[int, int, int] = (218, 226, 236),
     ) -> bool:
         fname = self._portrait_cache_name(char_data, size=size, bg_rgb=bg_rgb, ring_rgb=ring_rgb)
-        return fname in self._ensure_cache_paths()[2]
+        return self._is_rendered_cached(fname)
 
     def has_cached_school_icon(self, school_kr: str, size: int = 22) -> bool:
-        return self._school_cache_name(school_kr, size=size) in self._ensure_cache_paths()[2]
+        return self._is_rendered_cached(self._school_cache_name(school_kr, size=size))
 
     def has_cached_ui_icon(self, icon_kind: str, size: int = 28) -> bool:
-        return self._ui_cache_name(icon_kind, size=size) in self._ensure_cache_paths()[2]
+        return self._is_rendered_cached(self._ui_cache_name(icon_kind, size=size))
 
     def get_portrait_png(
         self,
@@ -1662,16 +1913,13 @@ class MomoTalkAssetManager:
         """
         cid = str(char_data.get("id") or "unknown")
         size = max(8, min(MAX_RENDER_SIZE, int(size)))
-        _, rendered_dir, files = self._ensure_cache_paths()
         fname = self._portrait_cache_name(char_data, size=size, bg_rgb=bg_rgb, ring_rgb=ring_rgb)
+        rendered_dir, is_cached = self._get_rendered_dir_and_check(fname)
         steam_cache_file = _safe_rendered_file(rendered_dir, fname)
-        if fname in files:
-            try:
-                return steam_cache_file.read_bytes()
-            except Exception:
-                with self._lock:
-                    if self._rendered_files is not None:
-                        self._rendered_files.discard(fname)
+        if is_cached:
+            cached_bytes = self._read_valid_cached_png(steam_cache_file, fname)
+            if cached_bytes is not None:
+                return cached_bytes
 
         if not cached_only:
             # 1. Bundled portraits (works cleanly even when Steam Blue Archive is NOT installed)
@@ -1679,11 +1927,7 @@ class MomoTalkAssetManager:
             bundled_rgba = self._load_bundled_rgba("portraits", (entry_id, cid))
             if bundled_rgba is not None:
                 png_bytes = render_circular_avatar_png(bundled_rgba, size=size, bg_rgb=bg_rgb, ring_rgb=ring_rgb)
-                try:
-                    steam_cache_file.write_bytes(png_bytes)
-                    self._mark_rendered_cached(fname)
-                except Exception:
-                    pass
+                self._write_cached_png(steam_cache_file, fname, png_bytes)
                 return png_bytes
 
             # 2. Local Steam Blue Archive UnityFS extraction fallback
@@ -1695,11 +1939,7 @@ class MomoTalkAssetManager:
                     rgba = self._extract_texture_rgba(portraits[pkey])
                     if rgba is not None:
                         png_bytes = render_circular_avatar_png(rgba, size=size, bg_rgb=bg_rgb, ring_rgb=ring_rgb)
-                        try:
-                            steam_cache_file.write_bytes(png_bytes)
-                            self._mark_rendered_cached(fname)
-                        except Exception:
-                            pass
+                        self._write_cached_png(steam_cache_file, fname, png_bytes)
                         return png_bytes
 
         return render_fallback_avatar_png(
@@ -1719,27 +1959,20 @@ class MomoTalkAssetManager:
     ) -> bytes:
         code = SCHOOL_CODE_MAP.get(school_kr, "ETC").upper()
         size = max(8, min(MAX_RENDER_SIZE, int(size)))
-        _, rendered_dir, files = self._ensure_cache_paths()
         fname = self._school_cache_name(school_kr, size=size)
+        rendered_dir, is_cached = self._get_rendered_dir_and_check(fname)
         cache_file = _safe_rendered_file(rendered_dir, fname)
-        if fname in files:
-            try:
-                return cache_file.read_bytes()
-            except Exception:
-                with self._lock:
-                    if self._rendered_files is not None:
-                        self._rendered_files.discard(fname)
+        if is_cached:
+            cached_bytes = self._read_valid_cached_png(cache_file, fname)
+            if cached_bytes is not None:
+                return cached_bytes
 
         if not cached_only:
             # 1. Bundled school crests (works without Steam)
             bundled_rgba = self._load_bundled_rgba("schools", (code, "ETC"))
             if bundled_rgba is not None:
                 png_bytes = encode_png_rgba(resize_rgba(bundled_rgba, size, size))
-                try:
-                    cache_file.write_bytes(png_bytes)
-                    self._mark_rendered_cached(fname)
-                except Exception:
-                    pass
+                self._write_cached_png(cache_file, fname, png_bytes)
                 return png_bytes
 
             # 2. Local Steam UnityFS fallback
@@ -1747,16 +1980,12 @@ class MomoTalkAssetManager:
             if idx is not None:
                 schools = idx.get("schools") or {}
                 meta = schools.get(code) or schools.get("ETC")
-                if meta is not None:
+                if isinstance(meta, dict):
                     rgba = self._extract_texture_rgba(meta)
                     if rgba is not None:
                         resized = resize_rgba(rgba, size, size)
                         png_bytes = encode_png_rgba(resized)
-                        try:
-                            cache_file.write_bytes(png_bytes)
-                            self._mark_rendered_cached(fname)
-                        except Exception:
-                            pass
+                        self._write_cached_png(cache_file, fname, png_bytes)
                         return png_bytes
         return render_fallback_school_icon_png(school_kr, size=size)
 
@@ -1769,16 +1998,13 @@ class MomoTalkAssetManager:
     ) -> bytes:
         kind = icon_kind.lower().strip()
         size = max(8, min(MAX_RENDER_SIZE, int(size)))
-        _, rendered_dir, files = self._ensure_cache_paths()
         fname = self._ui_cache_name(kind, size=size)
+        rendered_dir, is_cached = self._get_rendered_dir_and_check(fname)
         cache_file = _safe_rendered_file(rendered_dir, fname)
-        if fname in files:
-            try:
-                return cache_file.read_bytes()
-            except Exception:
-                with self._lock:
-                    if self._rendered_files is not None:
-                        self._rendered_files.discard(fname)
+        if is_cached:
+            cached_bytes = self._read_valid_cached_png(cache_file, fname)
+            if cached_bytes is not None:
+                return cached_bytes
 
         target_names = {
             "momotalk": ("emoji_momotalk",),
@@ -1792,11 +2018,7 @@ class MomoTalkAssetManager:
             bundled_rgba = self._load_bundled_rgba("ui", (kind,))
             if bundled_rgba is not None:
                 png_bytes = encode_png_rgba(resize_rgba(bundled_rgba, size, size))
-                try:
-                    cache_file.write_bytes(png_bytes)
-                    self._mark_rendered_cached(fname)
-                except Exception:
-                    pass
+                self._write_cached_png(cache_file, fname, png_bytes)
                 return png_bytes
 
             # 2. Local Steam UnityFS fallback
@@ -1804,17 +2026,14 @@ class MomoTalkAssetManager:
             if idx is not None:
                 ui_icons = idx.get("ui_icons") or {}
                 for tn in target_names:
-                    if tn in ui_icons:
-                        rgba = self._extract_texture_rgba(ui_icons[tn])
+                    meta = ui_icons.get(tn)
+                    if isinstance(meta, dict):
+                        rgba = self._extract_texture_rgba(meta)
                         if rgba is not None:
                             if kind == "heart":
                                 rgba = _crop_tight_square_rgba(rgba, pad_ratio=0.08)
                             png_bytes = encode_png_rgba(resize_rgba(rgba, size, size))
-                            try:
-                                cache_file.write_bytes(png_bytes)
-                                self._mark_rendered_cached(fname)
-                            except Exception:
-                                pass
+                            self._write_cached_png(cache_file, fname, png_bytes)
                             return png_bytes
         if kind == "heart":
             return render_momotalk_heart_png(size=size)
@@ -2018,7 +2237,19 @@ class RingbackStreamState:
         with self._lock:
             return bool(self._active and not self._paused)
 
+    def prewarm(self, sample_rates: tuple[int, ...] = (44100, 48000)) -> None:
+        """Pre-synthesize ringback waves outside the audio callback lock to avoid callback stalls."""
+        for raw_sr in sample_rates:
+            sr = max(8000, int(raw_sr))
+            with self._lock:
+                if sr in self._wave_cache:
+                    continue
+            waves = MomoTalkCallAudioFX.build_dial_and_ringback_cycle(sr)
+            with self._lock:
+                self._wave_cache.setdefault(sr, waves)
+
     def start(self) -> None:
+        self.prewarm()
         with self._lock:
             self._active = True
             self._paused = False
@@ -2043,18 +2274,27 @@ class RingbackStreamState:
 
     def _get_waves(self, sample_rate: int) -> tuple[np.ndarray, np.ndarray]:
         sr = max(8000, int(sample_rate))
-        waves = self._wave_cache.get(sr)
+        with self._lock:
+            waves = self._wave_cache.get(sr)
         if waves is None:
-            waves = MomoTalkCallAudioFX.build_dial_and_ringback_cycle(sr)
-            self._wave_cache[sr] = waves
+            built = MomoTalkCallAudioFX.build_dial_and_ringback_cycle(sr)
+            with self._lock:
+                waves = self._wave_cache.setdefault(sr, built)
         return waves
 
     def next_chunk(self, n_frames: int, sample_rate: int, volume: float = 1.0) -> np.ndarray:
         n = max(1, int(n_frames))
+        sr = max(8000, int(sample_rate))
         with self._lock:
             if (not self._active) or self._paused:
                 return np.zeros((n, 2), dtype=np.float32)
-            intro, loop = self._get_waves(sample_rate)
+            waves = self._wave_cache.get(sr)
+        if waves is None:
+            waves = self._get_waves(sr)
+        with self._lock:
+            if (not self._active) or self._paused:
+                return np.zeros((n, 2), dtype=np.float32)
+            intro, loop = waves
             out = np.empty((n, 2), dtype=np.float32)
             filled = 0
             while filled < n:

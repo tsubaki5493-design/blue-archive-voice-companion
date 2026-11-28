@@ -17,6 +17,7 @@ import re
 import struct
 import sys
 import tempfile
+import threading
 import time
 import zipfile
 from dataclasses import dataclass, asdict
@@ -24,6 +25,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 _CATALOG_MEM_CACHE: Dict[str, Tuple[int, int, Dict[str, List[dict]]]] = {}
+_CATALOG_CACHE_LOCK = threading.RLock()
 
 DEFAULT_GAME_DIR = Path(r"C:\Program Files (x86)\Steam\steamapps\common\BlueArchive")
 _STEAM_VDF_PATH_RE = re.compile(r'"path"\s+"([^"]+)"', re.IGNORECASE)
@@ -34,7 +36,16 @@ if str(WORKSPACE_ROOT) not in sys.path:
 
 from src.utils.app_paths import get_user_data_dir
 
-DEFAULT_DATA_DIR = get_user_data_dir() / "data"
+
+def get_default_data_dir() -> Path:
+    """Resolve the default user data output directory lazily (avoids import-time filesystem side effects)."""
+    return get_user_data_dir() / "data"
+
+
+def __getattr__(name: str) -> Any:
+    if name == "DEFAULT_DATA_DIR":
+        return get_default_data_dir()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 # Security & resource limits for untrusted/corrupted binary archive parsing
 MAX_CATALOG_FILE_BYTES = 128 * 1024 * 1024   # 128 MB hard cap on MediaCatalog.bytes
@@ -129,7 +140,7 @@ def _normalize_ba_candidate(candidate: Path | str | None) -> Optional[Path]:
     if not raw:
         return None
     p = Path(raw)
-    if p.is_file() and p.name.lower() == "bluearchive.exe":
+    if p.name.lower() == "bluearchive.exe":
         p = p.parent
     if p.name.lower() == "bluearchive_data":
         p = p.parent
@@ -364,6 +375,53 @@ def parse_media_catalog(catalog_bytes_path: Path) -> Dict[str, List[CatalogEntry
     return catalog
 
 
+def _disambiguate_filename(name: str, used_lower: set[str]) -> str:
+    """Ensure colliding sanitized filenames receive deterministic numeric suffixes (`_2`, `_3`, ...)."""
+    low = name.lower()
+    if low not in used_lower:
+        used_lower.add(low)
+        return name
+    p = Path(name)
+    stem, ext = p.stem, p.suffix
+    n = 2
+    while True:
+        suffix = f"_{n}"
+        cand_stem = stem[: max(1, 96 - len(suffix))]
+        cand = f"{cand_stem}{suffix}{ext}"
+        cand_low = cand.lower()
+        if cand_low not in used_lower:
+            used_lower.add(cand_low)
+            return cand
+        n += 1
+
+
+def _is_valid_catalog_dict(data: Any) -> bool:
+    """Validate that loaded `catalog_cache.json` has `{str: [dict, ...]}` structure."""
+    if not isinstance(data, dict) or not data:
+        return False
+    for k, v in data.items():
+        if not isinstance(k, str) or not isinstance(v, list):
+            return False
+        for item in v:
+            if not isinstance(item, dict):
+                return False
+    return True
+
+
+def lookup_catalog_entries(catalog: Dict[str, List[dict]], mxmc_key: str) -> List[dict]:
+    """Lookup catalog entries by exact `mxmc_key` with case-insensitive fallback."""
+    if not isinstance(catalog, dict) or not mxmc_key:
+        return []
+    direct = catalog.get(mxmc_key)
+    if isinstance(direct, list):
+        return [e for e in direct if isinstance(e, dict)]
+    target_low = mxmc_key.lower()
+    for k, v in catalog.items():
+        if isinstance(k, str) and k.lower() == target_low and isinstance(v, list):
+            return [e for e in v if isinstance(e, dict)]
+    return []
+
+
 def load_or_build_catalog(game_dir: Path, cache_path: Path, force_refresh: bool = False) -> Dict[str, List[dict]]:
     """
     Load cached catalog JSON (with in-memory cache across 305-character batch runs) or parse MediaCatalog.bytes.
@@ -394,12 +452,14 @@ def load_or_build_catalog(game_dir: Path, cache_path: Path, force_refresh: bool 
         try:
             st = cache_path.stat()
             if st.st_size <= MAX_CATALOG_FILE_BYTES:
-                mem = _CATALOG_MEM_CACHE.get(resolved_cache)
-                if mem and mem[0] == st.st_mtime_ns and mem[1] == st.st_size:
-                    return mem[2]
+                with _CATALOG_CACHE_LOCK:
+                    mem = _CATALOG_MEM_CACHE.get(resolved_cache)
+                    if mem and mem[0] == st.st_mtime_ns and mem[1] == st.st_size:
+                        return mem[2]
                 data = json.loads(cache_path.read_text(encoding="utf-8"))
-                if isinstance(data, dict) and data:
-                    _CATALOG_MEM_CACHE[resolved_cache] = (st.st_mtime_ns, st.st_size, data)
+                if _is_valid_catalog_dict(data):
+                    with _CATALOG_CACHE_LOCK:
+                        _CATALOG_MEM_CACHE[resolved_cache] = (st.st_mtime_ns, st.st_size, data)
                     return data
         except Exception:
             # Corrupted/truncated cache file -> fall through and rebuild cleanly from MediaCatalog.bytes
@@ -413,9 +473,14 @@ def load_or_build_catalog(game_dir: Path, cache_path: Path, force_refresh: bool 
     serializable = {k: [asdict(e) for e in v] for k, v in parsed.items()}
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(serializable, ensure_ascii=False, indent=2)
-    fd, tmp_name = tempfile.mkstemp(prefix=".cat_", suffix=".tmp", dir=str(cache_path.parent))
+    tmp_name = ""
+    fd = -1
+    fd_closed = True
     try:
+        fd, tmp_name = tempfile.mkstemp(prefix=".cat_", suffix=".tmp", dir=str(cache_path.parent))
+        fd_closed = False
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fd_closed = True
             fh.write(payload)
         for attempt in range(5):
             try:
@@ -424,13 +489,22 @@ def load_or_build_catalog(game_dir: Path, cache_path: Path, force_refresh: bool 
             except PermissionError:
                 time.sleep(0.04 * (attempt + 1))
     except Exception:
-        try:
-            os.unlink(tmp_name)
-        except OSError:
-            pass
+        pass
+    finally:
+        if not fd_closed and fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if tmp_name and os.path.exists(tmp_name):
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
     try:
         st = cache_path.stat()
-        _CATALOG_MEM_CACHE[resolved_cache] = (st.st_mtime_ns, st.st_size, serializable)
+        with _CATALOG_CACHE_LOCK:
+            _CATALOG_MEM_CACHE[resolved_cache] = (st.st_mtime_ns, st.st_size, serializable)
     except OSError:
         pass
     print(f"[OK] Cached MediaCatalog ({sum(len(v) for v in serializable.values())} entries) -> {cache_path}")
@@ -461,6 +535,8 @@ def compute_exact_ogg_stream_end(
         header_type = data[pos + 5]
         serial = data[pos + 14 : pos + 18]
         if version != 0 or serial != target_serial:
+            break
+        if pos > start_offset and (header_type & 0x02):
             break
 
         num_segments = data[pos + 26]
@@ -506,8 +582,10 @@ def extract_ogg_streams_from_molru(
 
         # Verify OGG capture pattern version == 0
         if molru_bytes[idx + 4] == 0:
+            header_type = molru_bytes[idx + 5]
             serial = molru_bytes[idx + 14 : idx + 18]
-            if serial != current_serial:
+            # Start new OGG stream on RFC 3533 BOS flag (0x02) OR serial change
+            if (header_type & 0x02) or (serial != current_serial):
                 streams_raw_starts.append(idx)
                 current_serial = serial
             # Jump past this page header to speed up scanning
@@ -684,6 +762,7 @@ def build_clean_rvc_wav_dataset(
 
     wav_out_dir.mkdir(parents=True, exist_ok=True)
     kept_files: List[Path] = []
+    used_wav_names: set[str] = set()
     skipped_combat = 0
     skipped_short = 0
     total_duration_sec = 0.0
@@ -728,7 +807,8 @@ def build_clean_rvc_wav_dataset(
         if peak > 1e-4:
             audio = audio * (0.84 / peak)
 
-        safe_wav_name = sanitize_extract_filename(ogg_path.stem, default_ext=".wav", fallback_stem="clip")
+        raw_wav_name = sanitize_extract_filename(ogg_path.stem, default_ext=".wav", fallback_stem="clip")
+        safe_wav_name = _disambiguate_filename(raw_wav_name, used_wav_names)
         wav_path = _ensure_path_within(wav_out_dir, wav_out_dir / safe_wav_name)
         sf.write(str(wav_path), audio, target_sr, subtype="PCM_16")
         kept_files.append(wav_path)
@@ -736,11 +816,34 @@ def build_clean_rvc_wav_dataset(
 
     if zip_out_path.is_symlink():
         raise ValueError(f"Refusing to overwrite symlink ZIP target: {zip_out_path}")
-    # Create RVC dataset ZIP archive
-    with zipfile.ZipFile(zip_out_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for wav_file in kept_files:
-            arc_name = sanitize_extract_filename(wav_file.name, default_ext=".wav", fallback_stem="clip")
-            zf.write(wav_file, arcname=arc_name)
+    # Write RVC dataset ZIP archive atomically via temp file + os.replace
+    zip_out_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_zip = tempfile.mkstemp(prefix=".rvc_ds_", suffix=".zip.tmp", dir=str(zip_out_path.parent))
+    os.close(fd)
+    try:
+        with zipfile.ZipFile(tmp_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            used_arc_names: set[str] = set()
+            for wav_file in kept_files:
+                raw_arc = sanitize_extract_filename(wav_file.name, default_ext=".wav", fallback_stem="clip")
+                arc_name = _disambiguate_filename(raw_arc, used_arc_names)
+                zf.write(wav_file, arcname=arc_name)
+        last_err: Exception | None = None
+        for attempt in range(5):
+            try:
+                os.replace(tmp_zip, zip_out_path)
+                last_err = None
+                break
+            except PermissionError as exc:
+                last_err = exc
+                time.sleep(0.04 * (attempt + 1))
+        if last_err is not None:
+            raise last_err
+    finally:
+        if os.path.exists(tmp_zip):
+            try:
+                os.unlink(tmp_zip)
+            except OSError:
+                pass
 
     return {
         "total_raw_ogg": len(raw_ogg_files),
@@ -799,6 +902,7 @@ def extract_character(
         raw_ogg_dir.mkdir(parents=True, exist_ok=True)
 
         extracted_ogg_paths: List[Path] = []
+        used_ogg_names: set[str] = set()
         pack_details = []
 
         for molru_path in molru_files:
@@ -809,7 +913,7 @@ def extract_character(
                 continue
             rel_from_game = molru_path.relative_to(game_dir).as_posix()
             mxmc_key = rel_from_game[:-6] if rel_from_game.endswith(".molru") else rel_from_game
-            name_queue = list(catalog.get(mxmc_key, []))
+            name_queue = lookup_catalog_entries(catalog, mxmc_key)
 
             molru_bytes = molru_path.read_bytes()
             streams = extract_ogg_streams_from_molru(molru_bytes)
@@ -825,7 +929,8 @@ def extract_character(
                 # Prefix costume pack stem if needed to avoid collisions across variants
                 stem_suffix = molru_path.stem.split("_", 1)[-1].lower()
                 raw_out_name = fname if fname.lower().startswith(stem_suffix) else f"{molru_path.stem}_{fname}"
-                out_name = sanitize_extract_filename(raw_out_name, default_ext=".ogg", fallback_stem=fallback_stem)
+                sanitized_name = sanitize_extract_filename(raw_out_name, default_ext=".ogg", fallback_stem=fallback_stem)
+                out_name = _disambiguate_filename(sanitized_name, used_ogg_names)
                 out_path = _ensure_path_within(raw_ogg_dir, raw_ogg_dir / out_name)
                 out_path.write_bytes(ogg_data)
                 extracted_ogg_paths.append(out_path)
@@ -873,15 +978,16 @@ def extract_character(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Blue Archive Steam .molru Voice Extractor & RVC Dataset Builder")
     parser.add_argument("--game-dir", type=Path, default=DEFAULT_GAME_DIR, help="Path to BlueArchive Steam root")
-    parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR, help="Workspace data output directory")
+    parser.add_argument("--data-dir", type=Path, default=None, help="Workspace data output directory")
     parser.add_argument("--character", type=str, default="Aru", help="Character English ID prefix (e.g., Aru, Hina, Mika)")
     parser.add_argument("--lang", type=str, default="both", choices=["KR", "JP", "both"], help="Voice language to extract")
     parser.add_argument("--list-characters", action="store_true", help="List all voiced character packs from catalog")
     parser.add_argument("--no-wav", action="store_true", help="Extract raw .ogg only without 40kHz WAV conversion")
     args = parser.parse_args()
+    eff_data_dir = args.data_dir if args.data_dir is not None else get_default_data_dir()
 
     if args.list_characters:
-        catalog = load_or_build_catalog(args.game_dir, args.data_dir / "catalog_cache.json")
+        catalog = load_or_build_catalog(args.game_dir, eff_data_dir / "catalog_cache.json")
         roster = list_all_voiced_characters(catalog)
         print(f"KR Voiced Packs ({len(roster['KR'])}): {', '.join(roster['KR'][:30])} ...")
         print(f"JP Voiced Packs ({len(roster['JP'])}): {', '.join(roster['JP'][:30])} ...")
@@ -890,7 +996,7 @@ def main() -> None:
     langs = ["KR", "JP"] if args.lang == "both" else [args.lang]
     summary = extract_character(
         game_dir=args.game_dir,
-        data_dir=args.data_dir,
+        data_dir=eff_data_dir,
         character=args.character,
         langs=langs,
         build_wav=not args.no_wav,

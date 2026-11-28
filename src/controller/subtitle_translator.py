@@ -21,7 +21,19 @@ from urllib.parse import urlsplit
 
 import httpx
 
-from src.controller.gemini_connector import GEMINI_API_MODELS, GEMINI_BROWSER_MODELS
+from src.controller.gemini_connector import (
+    CHATGPT_API_MODELS,
+    CHATGPT_BROWSER_MODELS,
+    CLAUDE_API_MODELS,
+    CLAUDE_BROWSER_MODELS,
+    GEMINI_API_MODELS,
+    GEMINI_BROWSER_MODELS,
+    normalize_ai_provider,
+)
+from src.controller.ko_speech_profiles import (
+    _sanitize_for_banmal,
+    extract_ko_speech_profile,
+)
 
 SUBTITLE_MODES: tuple[str, ...] = ("jp_only", "kr_only", "jp_kr")
 
@@ -39,45 +51,63 @@ def get_subtitle_engine_choices(
     extra_api_models: list[str] | None = None,
     extra_web_models: list[tuple[str, str]] | None = None,
     web_models: list[tuple[str, str]] | None = None,
+    provider: str = "gemini",
 ) -> list[tuple[str, str]]:
-    """Build complete subtitle translation model choices across auto inline, all Gemini web/API models, and fast NMT."""
+    """Build complete subtitle translation model choices for the active AI provider + fast NMT."""
+    p = normalize_ai_provider(provider)
     choices: list[tuple[str, str]] = [
         ("auto_inline", "✨ 자동 동시번역 (기본 · 지연 0초)"),
     ]
     seen_codes: set[str] = {"auto_inline"}
 
-    base_web = list(web_models) if web_models else list(GEMINI_BROWSER_MODELS)
+    if p == "claude":
+        web_prefix, web_tag = "claude_web:", "🌐 클로드 웹 "
+        api_prefix, api_tag = "claude_api:", "⚡ Claude API "
+        default_web = list(CLAUDE_BROWSER_MODELS)
+        default_api = list(CLAUDE_API_MODELS)
+    elif p == "chatgpt":
+        web_prefix, web_tag = "chatgpt_web:", "🌐 챗지피티 웹 "
+        api_prefix, api_tag = "openai_api:", "⚡ OpenAI API "
+        default_web = list(CHATGPT_BROWSER_MODELS)
+        default_api = list(CHATGPT_API_MODELS)
+    else:
+        web_prefix, web_tag = "web:", "🌐 웹 "
+        api_prefix, api_tag = "api:", "⚡ API "
+        default_web = list(GEMINI_BROWSER_MODELS)
+        default_api = list(GEMINI_API_MODELS)
+
+    base_web = list(web_models) if web_models else default_web
     for code, lbl in base_web:
         short = _RE_STRIP_EMOJI_PREFIX.sub("", lbl.split("(", 1)[0]).strip()
         if not short:
             short = lbl.strip()
-        eng_code = f"web:{code}"
+        eng_code = f"{web_prefix}{code}"
         if eng_code not in seen_codes:
             seen_codes.add(eng_code)
-            choices.append((eng_code, f"🌐 웹 {short}"))
+            choices.append((eng_code, f"{web_tag}{short}"))
 
     for code, lbl in extra_web_models or []:
-        eng_code = f"web:{code}"
+        eng_code = f"{web_prefix}{code}"
         if eng_code not in seen_codes:
             seen_codes.add(eng_code)
             choices.append((eng_code, lbl if lbl.startswith("🌐") else f"🌐 {lbl}"))
 
-    for code, _lbl in GEMINI_API_MODELS:
-        eng_code = f"api:{code}"
+    for code, _lbl in default_api:
+        eng_code = f"{api_prefix}{code}"
         if eng_code not in seen_codes:
             seen_codes.add(eng_code)
-            choices.append((eng_code, f"⚡ API {code}"))
+            choices.append((eng_code, f"{api_tag}{code}"))
 
     for m in extra_api_models or []:
         clean_m = (m or "").strip()
         if not clean_m:
             continue
-        eng_code = f"api:{clean_m}"
+        eng_code = f"{api_prefix}{clean_m}"
         if eng_code not in seen_codes:
             seen_codes.add(eng_code)
-            choices.append((eng_code, f"⚡ API {clean_m}"))
+            choices.append((eng_code, f"{api_tag}{clean_m}"))
 
-    choices.append(("fast_nmt", "🚀 초고속 NMT 전용 (~0.15초 · 제미니 미사용)"))
+    choices.append(("fast_nmt", "🚀 초고속 NMT 전용 (~0.15초 · AI 미사용)"))
     return choices
 
 
@@ -88,17 +118,30 @@ SUBTITLE_ENGINE_LABELS: dict[str, str] = dict(SUBTITLE_ENGINES)
 
 def resolve_subtitle_engine_label(code: str, choices: list[tuple[str, str]] | None = None) -> str:
     """Return user-facing dropdown label for any stored `subtitle_engine` code."""
+    clean_code = str(code or "").strip()
     mapping = dict(choices or SUBTITLE_ENGINES)
-    if code in mapping:
-        return mapping[code]
-    if code.startswith("api:"):
-        return f"⚡ API {code[4:]}"
-    if code.startswith("web:"):
-        return f"🌐 웹 {code[4:]}"
+    if clean_code in mapping:
+        return mapping[clean_code]
+    if clean_code.startswith("claude_api:"):
+        return f"⚡ Claude API {clean_code[11:]}"
+    if clean_code.startswith("claude_web:"):
+        return f"🌐 클로드 웹 {clean_code[11:]}"
+    if clean_code.startswith("openai_api:"):
+        return f"⚡ OpenAI API {clean_code[11:]}"
+    if clean_code.startswith("chatgpt_web:"):
+        return f"🌐 챗지피티 웹 {clean_code[12:]}"
+    if clean_code.startswith("api:"):
+        return f"⚡ API {clean_code[4:]}"
+    if clean_code.startswith("web:"):
+        return f"🌐 웹 {clean_code[4:]}"
     return mapping.get("auto_inline", "✨ 자동 동시번역 (기본 · 지연 0초)")
 
+_RE_CLEAN_BASE_REG_NOTE = re.compile(r"※[^）)\n]*")
 _RE_CLEAN_BASE_REG = re.compile(
-    r"(?:敬語|丁寧語?|「?です・?ます」?)[^。、）\)]*(?:禁止|厳禁|不使用|使わない|使わず)"
+    r"(?:タメ口|敬語|丁寧語?|「?です・?ます」?)[^。、）\)]*(?:禁止|厳禁|不使用|使わない|使わず)"
+)
+_RE_CLEAN_BASE_REG_COND = re.compile(
+    r"(?:ただし|但し|焦ると|感情が昂ぶると|内心では|独り言では)[^。]*"
 )
 _RE_JP_NAME_SPLIT = re.compile(r"[\s・]+")
 
@@ -143,16 +186,78 @@ _CORE_GLOSSARY: dict[str, str] = {
     "アリウス": "아리우스",
     "ワイルドハント": "와일드헌트",
     "ハイランダー": "하이랜더",
+    "玄龍門": "현룡문",
+    "玄武商会": "현무상회",
+    "百花繚乱": "백화요란",
+    "忍術研究部": "인법연구부",
+    "陰陽部": "음양부",
+    "修行部": "수행부",
+    "梅花園": "매화원",
+    "錬丹術研究会": "연단방",
+    "ティーパーティー": "티파티",
+    "万魔殿": "판데모니움 소사이어티",
+    "温泉開発部": "온천개발부",
+    "給食部": "급양부",
+    "救急医学部": "응급의학부",
+    "シッテムの箱": "싯딤의 상자",
+    "アリウススクワッド": "아리우스 스쿼드",
+    "RABBIT小隊": "RABBIT 소대",
+    "FOX小隊": "FOX 소대",
+    "生活安全局": "생활안전국",
+    "公安局": "공안국",
+    "227号特別クラス": "227호 특별반",
+    "デカグラマトン": "데카그라마톤",
+    "七囚人": "일곱 죄수",
     "ご主人様": "주인님",
+    "主殿": "주군",
+    "あるじどの": "주군",
+    "あなた様": "당신님",
+    "カムラッド": "동무",
+    "身共": "소인",
+    "其方": "그대",
+    "先生殿": "선생 공",
+    "手前様": "나으리",
+    "ぼく様": "이 몸님",
+    "トレーナー": "트레이너",
+    "マスター": "마스터",
     "先生": "선생님",
     "先輩": "선배",
 }
 
 _INTERJECTION_GLOSSARY: dict[str, str] = {
+    "パンパカパーン": "빠밤빠밤",
     "パヒャヒャッ": "파햐햣",
     "パヒャッ": "파햣",
     "パヒャ": "파햐",
+    "ごきげんよう": "평안하신지요",
+    "ごめんあそばせ": "실례하겠어요",
+    "ピース、ピース": "피스, 피스",
+    "ぴーすぴーす": "피스 피스",
+    "おーほほっ": "오호홋",
+    "じゃじゃーん": "짜잔",
+    "じゃーん": "짜잔",
+    "ふっふーん": "흐흥",
+    "うははは": "우하하하",
     "あっはは": "아하하",
+    "うへへ〜": "우헤헤~",
+    "うへへ": "우헤헤",
+    "うへ〜": "우헤~",
+    "ニンニン": "닌닌",
+    "にんにん": "닌닌",
+    "にゅふふ": "뉴후후",
+    "にゃはは": "냐하하",
+    "きひひっ": "키히힛",
+    "わっぴ〜": "왓삐~",
+    "わっぴー": "왓삐~",
+    "えっへん": "에헴",
+    "イヒヒ": "이히히",
+    "イヒッ": "이힛",
+    "にはは": "니하하",
+    "メーッ": "메엣",
+    "やっほー": "야호",
+    "やっほ〜": "야호~",
+    "ふぁ〜": "흐아~",
+    "むにゃ": "음냐",
     "ふふっ": "후훗",
     "くふふ": "쿠후후",
     "へへっ": "헤헷",
@@ -189,14 +294,18 @@ def _validate_translate_url(url: str) -> str:
     raw = str(url or "").strip()
     if not raw or _RE_CTRL_OR_WS.search(raw):
         raise ValueError("Invalid translate URL")
-    parsed = urlsplit(raw)
+    try:
+        parsed = urlsplit(raw)
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("Invalid translate URL") from exc
     if parsed.scheme.lower() != "https":
         raise ValueError("Refusing non-HTTPS translate endpoint")
     if parsed.username is not None or parsed.password is not None:
         raise ValueError("Refusing credentials in translate URL")
     if (parsed.hostname or "").lower() not in _ALLOWED_TRANSLATE_HOSTS:
         raise ValueError("Refusing untrusted translate host")
-    if parsed.port not in (None, 443):
+    if port not in (None, 443):
         raise ValueError("Refusing non-standard port for translate endpoint")
     return raw
 
@@ -216,58 +325,106 @@ class SubtitleEntry:
     refining: bool = False
 
 
-def build_character_ko_style_guide(char_data: dict[str, Any] | None, jp_beginner_coach: bool = False) -> str:
-    """Build a compact Korean dialogue style guide from character metadata for LLM subtitles."""
+def build_character_ko_style_guide(
+    char_data: dict[str, Any] | None,
+    jp_beginner_coach: bool = False,
+    persona_variant: str = "official",
+) -> str:
+    """Build a rich, character-specific Korean dialogue style guide for LLM subtitles."""
+    vc = str(persona_variant or "official").strip().lower()
+    variant_tone_notes = {
+        "official": "- 현재 해석: 공식 원작 100% — 과장된 패러디나 임의 변형 없이 블루 아카이브 한국어판 공식 대사 어조 그대로 번역하라.",
+        "fanon_mainstream": "- 현재 해석: 2-A 주류 종합 — 공식 말투 뼈대 위에 친근한 2차창작 티키타카와 자연스러운 설렘이 살아나게 번역하라.",
+        "fanon_pure_love": "- 현재 해석: 2-B 고습도 순애 — 공식 말투 뼈대는 유지하되 다정하고 촉촉한 거리감·애정·은근한 독점 뉘앙스가 살아나게 번역하라.",
+        "fanon_spicy_meme": "- 현재 해석: 2-C 매운맛 개그 — 공식 말투 뼈대는 유지하되 억울한 해명·자폭·유쾌한 딴죽·밈 개그 리듬이 톡톡 튀게 번역하라.",
+        "fanon_optimal_blend": "- 현재 해석: 2-D 최적 배합 — 공식 말투 뼈대 속에서 일상↔밈↔순애 뉘앙스 전환이 자연스럽게 느껴지게 번역하라.",
+    }
+    variant_line = variant_tone_notes.get(vc, variant_tone_notes["official"])
     coach_line = (
         "- 서툰 일본어 배려 모드: 캐릭터 고유 말투(반말/존댓말)와 자연스러운 일상 회화 톤을 유지하고 선생처럼 가르치는 어조로 바꾸지 마라. "
         "사용자가 물어보거나 문맥상 `「...」` 일본어 표현이 대사에 직접 언급된 경우에만 한국어 자막에 `'한국어 발음' [뜻]` 형식으로 적고 전각 괄호 `（...）`는 쓰지 마라."
         if jp_beginner_coach
         else ""
     )
-    if not char_data:
-        base = "[캐릭터 한국어 자막 번역 가이드]\n- 일본어 원문 대사를 자연스럽고 생동감 있는 한국어 구어체 자막으로 번역하라."
+    if not isinstance(char_data, dict) or not char_data:
+        base = f"[캐릭터 한국어 자막 번역 가이드]\n- 일본어 원문 대사를 자연스럽고 생동감 있는 한국어 구어체 자막으로 번역하라.\n{variant_line}"
         return f"{base}\n{coach_line}" if coach_line else base
-    name_kr = _strip_parens(str(char_data.get("name_kr") or char_data.get("id") or "캐릭터"))
-    user_title = str(char_data.get("user_title") or "선생님").strip()
-    persona = char_data.get("persona") or {}
-    sm = char_data.get("speech_mechanics_jp") or persona.get("speech_mechanics_jp") or {}
+
+    profile = extract_ko_speech_profile(char_data)
+    name_kr = profile["name_kr"]
+    raw_persona = char_data.get("persona")
+    persona = raw_persona if isinstance(raw_persona, dict) else {}
+    raw_sm = char_data.get("speech_mechanics_jp")
+    if not isinstance(raw_sm, dict):
+        raw_sm = persona.get("speech_mechanics_jp")
+    sm = raw_sm if isinstance(raw_sm, dict) else {}
     base_reg = str(sm.get("base_register") or "")
-    speech_mode = str(sm.get("speech_mode") or "")
+    speech_mode = str(sm.get("speech_mode") or "").strip().lower()
     summary = str(persona.get("summary") or "").strip()
 
-    clean_base_reg = _RE_CLEAN_BASE_REG.sub("", base_reg)
+    clean_base_reg = _RE_CLEAN_BASE_REG_NOTE.sub("", base_reg)
+    clean_base_reg = _RE_CLEAN_BASE_REG.sub("", clean_base_reg)
+    clean_base_reg = _RE_CLEAN_BASE_REG_COND.sub("", clean_base_reg)
     if "tameguchi" in speech_mode:
-        reg_rule = "번역 자막 말투는 반드시 친근하고 생동감 있는 한국어 반말(해체, 과한 문어체 금지)로 번역하라."
+        polarity = "banmal"
     elif "keigo" in speech_mode:
-        reg_rule = "번역 자막 말투는 반드시 자연스러운 한국어 존댓말(해요체 중심, 딱딱한 번역투 금지)로 번역하라."
+        polarity = "jondaetmal"
     elif "タメ口" in clean_base_reg or "반말" in summary:
-        reg_rule = "번역 자막 말투는 반드시 친근하고 생동감 있는 한국어 반말(해체, 과한 문어체 금지)로 번역하라."
+        polarity = "banmal"
     elif any(k in clean_base_reg for k in ("敬語", "丁寧", "です", "ます")) or "존댓말" in summary:
-        reg_rule = "번역 자막 말투는 반드시 자연스러운 한국어 존댓말(해요체 중심, 딱딱한 번역투 금지)로 번역하라."
+        polarity = "jondaetmal"
     else:
-        reg_rule = "번역 자막은 캐릭터 성격과 호칭에 맞는 자연스러운 한국어 구어체(반말/존댓말 일관 유지)로 번역하라."
+        polarity = profile.get("polarity", "mixed")
+
+    register_kr = profile["register_kr"]
+    if polarity == "banmal":
+        reg_rule = (
+            f"번역 자막 말투는 반드시 캐릭터 고유의 한국어 반말 어조로 번역하라 — {register_kr}"
+        )
+    elif polarity == "jondaetmal":
+        reg_rule = (
+            f"번역 자막 말투는 반드시 캐릭터 고유의 한국어 존댓말 어조로 번역하라 — {register_kr}"
+        )
+    else:
+        reg_rule = (
+            f"번역 자막 말투는 캐릭터 성격과 호칭에 맞는 자연스러운 한국어 구어체로 번역하라 — {register_kr}"
+        )
 
     lines = [
         f"[캐릭터 한국어 자막 번역 가이드: {name_kr}]",
-        f"- 화자: {name_kr}, 상대방 호칭: {user_title}",
+        f"- 화자: {name_kr} | 한국어 1인칭: {profile['first_person_kr']} | 상대방 호칭: {profile['sensei_address_kr']}",
         f"- {reg_rule}",
     ]
+    if profile["signature_endings_kr"]:
+        lines.append("- 대표 한국어 어미: " + " / ".join(profile["signature_endings_kr"][:5]))
+    if profile["interjections_kr"]:
+        lines.append("- 고유 감탄사·말버릇: " + " / ".join(profile["interjections_kr"][:5]))
+    if profile["forbidden_kr"]:
+        lines.append("- 자막 금지 표현: " + " | ".join(profile["forbidden_kr"][:3]))
+    lines.append(variant_line)
     if base_reg:
-        lines.append(f"- 원문 어조 참고: {base_reg[:180]}")
-    if summary:
-        lines.append(f"- 성격 요약: {summary[:220]}")
+        lines.append(f"- 원문 어조 참고: {base_reg[:160]}")
+    if profile["sample_lines_kr"]:
+        lines.append(f'- 한국어 번역 감각 참고(복사 금지): "{profile["sample_lines_kr"][0]}"')
+    if summary and vc == "official":
+        # Keep official mode grounded without injecting fanon summary lines into 2-A~2-D
+        lines.append(f"- 기본 캐릭터 참고: {summary[:140]}")
+
+    body = "\n".join(lines)
+    if polarity == "banmal":
+        body = _sanitize_for_banmal(body)
     if coach_line:
-        lines.append(coach_line)
-    return "\n".join(lines)
+        body = f"{body}\n{coach_line}"
+    return body
 
 
 def contains_japanese(text: str) -> bool:
     """Return True when text contains Hiragana, Katakana, or Kanji."""
-    return bool(_RE_JAPANESE.search(text or ""))
+    return bool(_RE_JAPANESE.search(str(text or "")))
 
 
 def _strip_parens(text: str) -> str:
-    return _RE_PARENS.sub("", (text or "")).strip()
+    return _RE_PARENS.sub("", str(text or "")).strip()
 
 
 def _extract_given_pair(name_jp: str, name_kr: str) -> tuple[str, str]:
@@ -306,7 +463,7 @@ def _replace_term(text: str, jp_term: str, kr_term: str) -> str:
 
 def normalize_korean_subtitle(text: str) -> str:
     """Clean machine-translated punctuation spacing for readable subtitles."""
-    out = (text or "").strip()
+    out = str(text or "").strip()
     if not out:
         return ""
     out = _RE_EXC_QUEST.sub("!?", out)
@@ -333,7 +490,9 @@ class BlueArchiveGlossary:
         merged.update(_CORE_GLOSSARY)
         merged.update(_INTERJECTION_GLOSSARY)
 
-        for c in (characters or {}).values():
+        for c in (characters.values() if isinstance(characters, dict) else ()):
+            if not isinstance(c, dict):
+                continue
             raw_jp = _strip_parens(str(c.get("name_jp") or ""))
             raw_kr = _strip_parens(str(c.get("name_kr") or ""))
             if len(raw_jp) >= 3 and raw_kr:
@@ -365,6 +524,8 @@ class BlueArchiveGlossary:
             self._char_terms_cache.clear()
 
     def _get_char_specific_terms(self, char_data: dict[str, Any]) -> list[tuple[str, str]]:
+        if not isinstance(char_data, dict):
+            return []
         cid = str(char_data.get("id") or "")
         if cid:
             with self._lock:
@@ -399,11 +560,11 @@ class BlueArchiveGlossary:
 
     def prepare_for_translation(self, text: str, char_data: dict[str, Any] | None = None) -> str:
         """Substitute known Japanese Blue Archive proper nouns into Hangul prior to NMT."""
-        result = (text or "").strip()
+        result = str(text or "").strip()
         if not result:
             return ""
 
-        if char_data:
+        if isinstance(char_data, dict) and char_data:
             for jp_term, kr_term in self._get_char_specific_terms(char_data):
                 result = _replace_term(result, jp_term, kr_term)
 
@@ -430,11 +591,16 @@ class RealtimeSubtitleTranslator:
         llm_translator: Callable[..., str] | None = None,
     ) -> None:
         self.glossary = BlueArchiveGlossary(characters)
-        self._cache_size = max(32, int(cache_size))
+        try:
+            parsed_cache_size = int(cache_size) if not isinstance(cache_size, bool) else 512
+        except Exception:
+            parsed_cache_size = 512
+        self._cache_size = max(32, parsed_cache_size)
         self._cache: OrderedDict[tuple[str, str], tuple[str, str]] = OrderedDict()
         self._cache_lock = threading.Lock()
         self._ctx_lock = threading.Lock()
         self._recent_context: deque[str] = deque(maxlen=6)
+        self._state_lock = threading.Lock()
         self._owns_client = http_client is None
         self._http: httpx.Client | None = http_client
         self._http_lock = threading.Lock()
@@ -446,9 +612,9 @@ class RealtimeSubtitleTranslator:
         self._closed = False
 
     def _get_http_client(self) -> httpx.Client:
-        if self._http is not None:
-            return self._http
         with self._http_lock:
+            if self._closed:
+                raise RuntimeError("Subtitle translator is closed")
             if self._http is None:
                 limits = httpx.Limits(max_keepalive_connections=4, max_connections=6, keepalive_expiry=120.0)
                 self._http = httpx.Client(
@@ -466,25 +632,37 @@ class RealtimeSubtitleTranslator:
             return self._http
 
     def set_llm_translator(self, cb: Callable[..., str] | None) -> None:
-        self._llm_translator = cb
         if cb is None:
-            self._llm_accepts_level = True
-            return
-        try:
-            sig = inspect.signature(cb)
-            params = list(sig.parameters.values())
-            self._llm_accepts_level = len(params) >= 5 or any(
-                p.kind == inspect.Parameter.VAR_POSITIONAL for p in params
-            )
-        except Exception:
-            self._llm_accepts_level = True
+            accepts_level = True
+        else:
+            try:
+                sig = inspect.signature(cb)
+                params = list(sig.parameters.values())
+                accepts_level = len(params) >= 5 or any(
+                    p.kind == inspect.Parameter.VAR_POSITIONAL for p in params
+                )
+            except Exception:
+                accepts_level = True
+        with self._state_lock:
+            self._llm_translator = cb
+            self._llm_accepts_level = accepts_level
 
     def update_characters(self, characters: dict[str, dict[str, Any]]) -> None:
         self.glossary.update_characters(characters)
 
-    def _cache_key(self, clean_text: str, char_data: dict[str, Any] | None) -> tuple[str, str]:
-        cid = str((char_data or {}).get("id") or "")
-        return cid, clean_text
+    def _cache_key(
+        self,
+        clean_text: str,
+        char_data: dict[str, Any] | None,
+        *,
+        persona_variant: str = "official",
+        jp_beginner_coach: bool = False,
+    ) -> tuple[str, str]:
+        cid = str(char_data.get("id") or "") if isinstance(char_data, dict) else ""
+        vc = str(persona_variant or "official").strip().lower() or "official"
+        if vc == "official" and not jp_beginner_coach:
+            return cid, clean_text
+        return f"{cid}|{vc}|{'coach' if jp_beginner_coach else 'std'}", clean_text
 
     def _cache_get_entry(self, key: tuple[str, str]) -> tuple[str, str] | None:
         with self._cache_lock:
@@ -513,18 +691,36 @@ class RealtimeSubtitleTranslator:
         kr_text: str,
         char_data: dict[str, Any] | None = None,
         quality: str = "llm:auto_inline:low",
+        *,
+        persona_variant: str = "official",
+        jp_beginner_coach: bool = False,
     ) -> None:
         """Record an inline or LLM-verified JP->KO pair into cache and rolling context."""
-        clean_jp = (jp_text or "").strip()
+        clean_jp = str(jp_text or "").strip()
         clean_kr = normalize_korean_subtitle(kr_text)
         if not clean_jp or not clean_kr:
             return
-        self._cache_put(self._cache_key(clean_jp, char_data), clean_kr, quality=quality)
+        self._cache_put(
+            self._cache_key(
+                clean_jp,
+                char_data,
+                persona_variant=persona_variant,
+                jp_beginner_coach=jp_beginner_coach,
+            ),
+            clean_kr,
+            quality=quality,
+        )
         with self._ctx_lock:
             self._recent_context.append(f"{clean_jp} => {clean_kr}")
 
+    def clear_context(self) -> None:
+        """Clear rolling dialogue context (e.g. on character or persona switch)."""
+        with self._ctx_lock:
+            self._recent_context.clear()
+
     def should_refine_with_llm(self, engine: str) -> bool:
-        return (engine or "auto_inline") != "fast_nmt" and self._llm_translator is not None and not self._closed
+        with self._state_lock:
+            return (engine or "auto_inline") != "fast_nmt" and self._llm_translator is not None and not self._closed
 
     def _get_json_bounded(self, url: str, params: dict[str, str], label: str) -> Any:
         safe_url = _validate_translate_url(url)
@@ -587,18 +783,44 @@ class RealtimeSubtitleTranslator:
             return "".join(parts)
         return ""
 
-    def translate_sync(self, text: str, char_data: dict[str, Any] | None = None) -> str:
+    def _fast_nmt_cache_key(
+        self,
+        clean_text: str,
+        char_data: dict[str, Any] | None,
+    ) -> tuple[str, str]:
+        cid = str(char_data.get("id") or "") if isinstance(char_data, dict) else ""
+        return f"{cid}|__fast_nmt__", clean_text
+
+    def translate_sync(
+        self,
+        text: str,
+        char_data: dict[str, Any] | None = None,
+        *,
+        persona_variant: str = "official",
+        jp_beginner_coach: bool = False,
+    ) -> str:
         """Translate Japanese spoken text into natural Korean subtitles cleanly and safely."""
-        clean = (text or "").strip()
+        clean = str(text or "").strip()
         if not clean:
             return ""
         if not contains_japanese(clean):
             return clean
 
-        key = self._cache_key(clean, char_data)
+        key = self._cache_key(
+            clean,
+            char_data,
+            persona_variant=persona_variant,
+            jp_beginner_coach=jp_beginner_coach,
+        )
         cached = self._cache_get(key)
         if cached is not None:
             return cached
+
+        fast_key = self._fast_nmt_cache_key(clean, char_data)
+        fast_cached = self._cache_get(fast_key)
+        if fast_cached is not None:
+            self._cache_put(key, fast_cached, quality="fast")
+            return fast_cached
 
         prepared = self.glossary.prepare_for_translation(clean, char_data=char_data)
         raw_ko = ""
@@ -612,30 +834,62 @@ class RealtimeSubtitleTranslator:
 
         normalized = normalize_korean_subtitle(raw_ko)
         if normalized:
+            self._cache_put(fast_key, normalized, quality="fast")
             self._cache_put(key, normalized, quality="fast")
         return normalized
 
-    def submit(self, text: str, char_data: dict[str, Any] | None = None) -> Future[str]:
+    def submit(
+        self,
+        text: str,
+        char_data: dict[str, Any] | None = None,
+        *,
+        persona_variant: str = "official",
+        jp_beginner_coach: bool = False,
+    ) -> Future[str]:
         """Schedule asynchronous translation (or resolve immediately if cached / already Korean)."""
-        clean = (text or "").strip()
+        clean = str(text or "").strip()
         if not clean or not contains_japanese(clean):
             fut: Future[str] = Future()
             fut.set_result(clean)
             return fut
 
-        key = self._cache_key(clean, char_data)
+        key = self._cache_key(
+            clean,
+            char_data,
+            persona_variant=persona_variant,
+            jp_beginner_coach=jp_beginner_coach,
+        )
         cached = self._cache_get(key)
         if cached is not None:
             fut = Future()
             fut.set_result(cached)
             return fut
 
-        if self._closed:
+        fast_key = self._fast_nmt_cache_key(clean, char_data)
+        fast_cached = self._cache_get(fast_key)
+        if fast_cached is not None:
+            self._cache_put(key, fast_cached, quality="fast")
             fut = Future()
-            fut.set_result("")
+            fut.set_result(fast_cached)
             return fut
 
-        return self._executor.submit(self.translate_sync, clean, char_data)
+        with self._state_lock:
+            if self._closed:
+                fut = Future()
+                fut.set_result("")
+                return fut
+            try:
+                return self._executor.submit(
+                    self.translate_sync,
+                    clean,
+                    char_data,
+                    persona_variant=persona_variant,
+                    jp_beginner_coach=jp_beginner_coach,
+                )
+            except RuntimeError:
+                fut = Future()
+                fut.set_result("")
+                return fut
 
     def submit_progressive(
         self,
@@ -644,6 +898,9 @@ class RealtimeSubtitleTranslator:
         engine: str = "auto_inline",
         thinking_level: str = "low",
         on_refined: Callable[[str], None] | None = None,
+        *,
+        persona_variant: str = "official",
+        jp_beginner_coach: bool = False,
     ) -> tuple[Future[str], bool]:
         """
         Return `(fast_future, will_refine)` for 2-stage progressive subtitles:
@@ -651,7 +908,7 @@ class RealtimeSubtitleTranslator:
         2. When `will_refine=True`, `_llm_executor` runs context- & persona-aware LLM refinement
            in the background, caches at `llm:<engine>:<thinking_level>` quality, and invokes `on_refined`.
         """
-        clean = (text or "").strip()
+        clean = str(text or "").strip()
         if not clean or not contains_japanese(clean):
             fut: Future[str] = Future()
             fut.set_result(clean)
@@ -661,7 +918,12 @@ class RealtimeSubtitleTranslator:
         eff_lvl = thinking_level if thinking_level in ("low", "medium", "high", "xhigh") else "low"
         wanted_q = f"llm:{eff_eng}:{eff_lvl}"
 
-        key = self._cache_key(clean, char_data)
+        key = self._cache_key(
+            clean,
+            char_data,
+            persona_variant=persona_variant,
+            jp_beginner_coach=jp_beginner_coach,
+        )
         cached_entry = self._cache_get_entry(key)
         if cached_entry is not None:
             val, quality = cached_entry
@@ -669,15 +931,36 @@ class RealtimeSubtitleTranslator:
             fut.set_result(val)
             if not self.should_refine_with_llm(eff_eng) or quality == wanted_q:
                 return fut, False
-            self._schedule_llm_refinement(clean, char_data, eff_eng, eff_lvl, on_refined)
-            return fut, True
+            scheduled = self._schedule_llm_refinement(
+                clean,
+                char_data,
+                eff_eng,
+                eff_lvl,
+                on_refined,
+                persona_variant=persona_variant,
+                jp_beginner_coach=jp_beginner_coach,
+            )
+            return fut, scheduled
 
-        fast_fut = self.submit(clean, char_data=char_data)
+        fast_fut = self.submit(
+            clean,
+            char_data=char_data,
+            persona_variant=persona_variant,
+            jp_beginner_coach=jp_beginner_coach,
+        )
         if not self.should_refine_with_llm(eff_eng):
             return fast_fut, False
 
-        self._schedule_llm_refinement(clean, char_data, eff_eng, eff_lvl, on_refined)
-        return fast_fut, True
+        scheduled = self._schedule_llm_refinement(
+            clean,
+            char_data,
+            eff_eng,
+            eff_lvl,
+            on_refined,
+            persona_variant=persona_variant,
+            jp_beginner_coach=jp_beginner_coach,
+        )
+        return fast_fut, scheduled
 
     def _schedule_llm_refinement(
         self,
@@ -686,11 +969,15 @@ class RealtimeSubtitleTranslator:
         engine: str,
         thinking_level: str,
         on_refined: Callable[[str], None] | None,
-    ) -> None:
-        if self._closed or self._llm_translator is None:
-            return
-        cb = self._llm_translator
-        accepts_level = self._llm_accepts_level
+        *,
+        persona_variant: str = "official",
+        jp_beginner_coach: bool = False,
+    ) -> bool:
+        with self._state_lock:
+            cb = self._llm_translator
+            if self._closed or cb is None:
+                return False
+            accepts_level = self._llm_accepts_level
         wanted_q = f"llm:{engine}:{thinking_level}"
 
         def _worker() -> None:
@@ -700,14 +987,25 @@ class RealtimeSubtitleTranslator:
                     return
                 with self._ctx_lock:
                     ctx = list(self._recent_context)
-                style_guide = build_character_ko_style_guide(char_data)
+                style_guide = build_character_ko_style_guide(
+                    char_data,
+                    jp_beginner_coach=jp_beginner_coach,
+                    persona_variant=persona_variant,
+                )
                 if accepts_level:
                     raw = cb(clean_jp, style_guide, ctx, engine, thinking_level)
                 else:
                     raw = cb(clean_jp, style_guide, ctx, engine)
                 refined_clean = normalize_korean_subtitle(raw)
                 if refined_clean:
-                    self.record_dialogue_pair(clean_jp, refined_clean, char_data=char_data, quality=wanted_q)
+                    self.record_dialogue_pair(
+                        clean_jp,
+                        refined_clean,
+                        char_data=char_data,
+                        quality=wanted_q,
+                        persona_variant=persona_variant,
+                        jp_beginner_coach=jp_beginner_coach,
+                    )
             except Exception:
                 refined_clean = ""
             finally:
@@ -717,7 +1015,14 @@ class RealtimeSubtitleTranslator:
                     except Exception:
                         pass
 
-        self._llm_executor.submit(_worker)
+        with self._state_lock:
+            if self._closed:
+                return False
+            try:
+                self._llm_executor.submit(_worker)
+                return True
+            except RuntimeError:
+                return False
 
     def warmup_async(self) -> None:
         """Warm TCP+TLS socket in background so first live subtitle incurs minimal latency."""
@@ -726,24 +1031,28 @@ class RealtimeSubtitleTranslator:
 
         def _worker() -> None:
             try:
-                self._query_primary("先生")
+                if not self._closed:
+                    self._query_primary("先生")
             except Exception:
                 pass
 
         threading.Thread(target=_worker, daemon=True, name="sub-ko-warmup").start()
 
     def close(self) -> None:
-        self._closed = True
-        for pool in (self._executor, self._llm_executor):
-            try:
-                pool.shutdown(wait=False, cancel_futures=True)
-            except Exception:
-                pass
-        if self._owns_client and self._http is not None:
-            try:
-                self._http.close()
-            except Exception:
-                pass
+        with self._state_lock:
+            self._closed = True
+            for pool in (self._executor, self._llm_executor):
+                try:
+                    pool.shutdown(wait=False, cancel_futures=True)
+                except Exception:
+                    pass
+        with self._http_lock:
+            if self._owns_client and self._http is not None:
+                try:
+                    self._http.close()
+                except Exception:
+                    pass
+                self._http = None
 
 
 def format_subtitle_entries_plain(entries: list[SubtitleEntry], mode: str) -> str:
