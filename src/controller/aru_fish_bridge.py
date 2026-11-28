@@ -10915,9 +10915,16 @@ class AruFishBridgeApp:
                                 "ko": Tokenizer(cand_model.hf_tokenizer, True, task="transcribe", language="ko"),
                             }
                             if cand_dev == "cuda":
-                                # Warm up CUDA Dynamic-Mel (4s/6s/8s/12s buckets) with waveform-padded silence
-                                prompt_w = cand_model.get_prompt(cand_toks["ja"], [], without_timestamps=True)
-                                for bucket_sec in (4, 6, 8, 12):
+                                from src.controller.local_mic_stt import _is_128mel_whisper_model
+
+                                use_std_30s_w = _is_128mel_whisper_model(cand_model, cand_name)
+                                warmup_buckets = (30,) if use_std_30s_w else (4, 6, 8, 12)
+                                prompt_w = cand_model.get_prompt(
+                                    cand_toks["ja"],
+                                    [],
+                                    without_timestamps=(not use_std_30s_w),
+                                )
+                                for bucket_sec in warmup_buckets:
                                     dummy_wave = np.zeros(WHISPER_SR * bucket_sec, dtype=np.float32)
                                     dummy_feats = cand_model.feature_extractor(
                                         dummy_wave,
@@ -10935,7 +10942,7 @@ class AruFishBridgeApp:
                                     else:
                                         dummy_feats = dummy_feats[:, :n_f]
                                     enc_w = cand_model.encode(dummy_feats)
-                                    if bucket_sec == 8:
+                                    if use_std_30s_w or bucket_sec == 8:
                                         cand_model.model.generate(enc_w, [prompt_w], beam_size=3, max_length=64)
                             loaded_model = cand_model
                             loaded_tokenizers = cand_toks
@@ -15071,9 +15078,12 @@ class AruFishBridgeApp:
             t0 = time.time()
             self._active_stt_busy = True
             try:
+                from src.controller.local_mic_stt import _is_128mel_whisper_model, _text_compression_ratio
+
+                use_std_30s = _is_128mel_whisper_model(w_model, getattr(self, "_whisper_loaded_model", ""))
                 trail = np.concatenate([audio_16k, np.zeros(int(WHISPER_SR * 0.15), dtype=np.float32)])
                 need_sec = len(trail) / float(WHISPER_SR) + 0.35
-                cl = next((b for b in (4, 6, 8, 12, 16, 24, 30) if b >= need_sec), 30)
+                cl = 30 if use_std_30s else next((b for b in (4, 6, 8, 12, 16, 24, 30) if b >= need_sec), 30)
                 target_samples = cl * WHISPER_SR
                 if len(trail) < target_samples:
                     padded = np.pad(trail, (0, target_samples - len(trail)), mode="constant", constant_values=0.0)
@@ -15114,7 +15124,7 @@ class AruFishBridgeApp:
 
                 c = self.current_char
 
-                def _decode_with_lang(lang_code: str):
+                def _decode_with_lang(lang_code: str, *, anti_repeat: bool = False):
                     tok_l = w_tokenizers.get(lang_code) or Tokenizer(
                         w_model.hf_tokenizer, True, task="transcribe", language=lang_code
                     )
@@ -15123,17 +15133,18 @@ class AruFishBridgeApp:
                         if (lang_code == "ja" and raw_peak >= 0.018)
                         else []
                     )
-                    prompt_l = w_model.get_prompt(tok_l, hint_toks, without_timestamps=True)
+                    prompt_l = w_model.get_prompt(tok_l, hint_toks, without_timestamps=(not use_std_30s))
                     supp_l = _resolve_whisper_suppressed_tokens(w_model, tok_l)
+                    use_anti_rep = anti_repeat or (not use_std_30s)
                     gen_res = w_model.model.generate(
                         enc,
                         [prompt_l],
                         beam_size=beam_sz,
-                        max_length=160,
+                        max_length=224 if use_std_30s else 160,
                         suppress_blank=True,
                         suppress_tokens=supp_l,
-                        no_repeat_ngram_size=3,
-                        repetition_penalty=1.08,
+                        no_repeat_ngram_size=3 if use_anti_rep else 0,
+                        repetition_penalty=1.08 if use_anti_rep else 1.0,
                         return_no_speech_prob=True,
                     )[0]
                     return tok_l, gen_res
@@ -15154,8 +15165,22 @@ class AruFishBridgeApp:
                 if res.no_speech_prob > 0.58:
                     continue
 
-                tokens = [t for t in res.sequences_ids[0] if t < tok.eot]
-                text = tok.decode(tokens).strip()
+                def _tokens_to_text(tok_obj: Any, gen_obj: Any) -> str:
+                    ts_b = getattr(tok_obj, "timestamp_begin", None)
+                    if not isinstance(ts_b, int) or isinstance(ts_b, bool):
+                        ts_b = None
+                    seq_ids = getattr(gen_obj, "sequences_ids", None) or []
+                    first_s = seq_ids[0] if seq_ids else []
+                    toks_clean = [t for t in first_s if t < tok_obj.eot and (ts_b is None or t < ts_b)]
+                    return " ".join(tok_obj.decode(toks_clean).split()).strip()
+
+                text = _tokens_to_text(tok, res)
+                orig_cr = _text_compression_ratio(text) if use_std_30s else 0.0
+                if use_std_30s and orig_cr > 2.4:
+                    tok_r, res_r = _decode_with_lang(det_lang, anti_repeat=True)
+                    retry_text = _tokens_to_text(tok_r, res_r)
+                    if retry_text and _text_compression_ratio(retry_text) < orig_cr:
+                        tok, res, text = tok_r, res_r, retry_text
                 dt = time.time() - t0
                 if not text or text in HALLUCINATION_PHRASES or contains_trigger_echo(text):
                     continue

@@ -13,6 +13,7 @@ import queue
 import re
 import threading
 import time
+import zlib
 from collections import deque
 from math import gcd
 from typing import Any, Callable
@@ -244,7 +245,10 @@ def _run_silero_vad_trim(audio_16k: np.ndarray, pad_ms: int = 250) -> tuple[np.n
                     return audio_16k, False
 
     try:
+        safe_pad_ms = max(0, min(1000, int(pad_ms)))
         vad_in = audio_16k.astype(np.float32, copy=False)
+        if not np.all(np.isfinite(vad_in)):
+            vad_in = np.nan_to_num(vad_in, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
         peak = float(np.max(np.abs(vad_in))) if vad_in.size else 0.0
         if 0.0 < peak < 0.15:
             vad_gain = min(10.0, 0.30 / peak)
@@ -255,7 +259,7 @@ def _run_silero_vad_trim(audio_16k: np.ndarray, pad_ms: int = 250) -> tuple[np.n
             neg_threshold=0.18,
             min_speech_duration_ms=90,
             min_silence_duration_ms=300,
-            speech_pad_ms=pad_ms,
+            speech_pad_ms=safe_pad_ms,
         )
         with _SILERO_VAD_LOCK:
             speeches = _SILERO_VAD_FN(vad_in, vad_options=vad_opts, sampling_rate=WHISPER_SR)
@@ -263,6 +267,36 @@ def _run_silero_vad_trim(audio_16k: np.ndarray, pad_ms: int = 250) -> tuple[np.n
             return None, True
         start = max(0, int(speeches[0].get("start", 0)))
         end = min(len(audio_16k), int(speeches[-1].get("end", len(audio_16k))))
+
+        # Active-speech envelope guard: once Silero confirms real speech exists,
+        # check 20ms frame RMS outside [start, end] so expressive/high-pitched
+        # speech onsets or offsets are never chopped off while isolated clicks
+        # and steady background noise stay excluded.
+        frame_n = max(1, int(WHISPER_SR * 0.02))
+        n_frames = vad_in.size // frame_n
+        if n_frames >= 6 and end > start:
+            framed = vad_in[: n_frames * frame_n].reshape(n_frames, frame_n)
+            frame_rms = np.sqrt(np.mean(framed * framed, axis=1))
+            s_idx = max(0, min(n_frames - 1, start // frame_n))
+            e_idx = max(s_idx + 1, min(n_frames, (end + frame_n - 1) // frame_n))
+            in_rms = frame_rms[s_idx:e_idx]
+            speech_ref = float(np.percentile(in_rms, 75)) if in_rms.size else 0.0
+            noise_floor = float(np.percentile(frame_rms, 15))
+            if math.isfinite(speech_ref) and math.isfinite(noise_floor) and speech_ref > 0.0:
+                expand_thresh = max(0.012, speech_ref * 0.30, noise_floor * 2.5)
+                active = frame_rms >= expand_thresh
+                # Require >= 3 consecutive 20ms frames (60ms) so short clicks/bumps never expand bounds
+                sustained = active[:-2] & active[1:-1] & active[2:]
+                hit_idx = np.flatnonzero(sustained)
+                if hit_idx.size:
+                    pad_samples = int(WHISPER_SR * (safe_pad_ms / 1000.0))
+                    first_s = max(0, int(hit_idx[0]) * frame_n - pad_samples)
+                    last_e = min(len(audio_16k), int(hit_idx[-1] + 3) * frame_n + pad_samples)
+                    if first_s < start:
+                        start = first_s
+                    if last_e > end:
+                        end = last_e
+
         if end - start >= int(WHISPER_SR * 0.08):
             return audio_16k[start:end], True
         return audio_16k, True
@@ -294,6 +328,43 @@ def _resolve_suppressed_tokens(model: Any, tok: Any) -> list[int]:
     except Exception:
         pass
     return []
+
+
+def _is_128mel_whisper_model(model: Any, model_name: str = "") -> bool:
+    """
+    Detect 128-mel Whisper v3 / turbo models (`large-v3-turbo`, `large-v3`).
+    These models must use standard 30s mel windows with timestamp tokens enabled
+    to avoid short-mel `<|endoftext|>` collapse and repetition loops.
+    """
+    inner = getattr(model, "model", None)
+    fe = getattr(model, "feature_extractor", None)
+    for raw_n in (
+        getattr(inner, "n_mels", None),
+        getattr(model, "n_mels", None),
+        getattr(fe, "feature_size", None),
+        getattr(fe, "n_mels", None),
+    ):
+        if isinstance(raw_n, int) and not isinstance(raw_n, bool) and raw_n >= 128:
+            return True
+    mel_filters = getattr(fe, "mel_filters", None)
+    shape = getattr(mel_filters, "shape", None)
+    if isinstance(shape, tuple) and shape and isinstance(shape[0], int) and not isinstance(shape[0], bool):
+        if shape[0] >= 128:
+            return True
+    low_name = str(model_name or "").strip().lower()
+    if low_name and ("large-v3" in low_name or "turbo" in low_name or "v3" in low_name):
+        return True
+    return False
+
+
+def _text_compression_ratio(text: str) -> float:
+    """Compute Whisper-style UTF-8 zlib compression ratio to catch runaway repetition loops."""
+    raw = (text or "").encode("utf-8")
+    if len(raw) < 24:
+        return 0.0
+    comp = zlib.compress(raw)
+    return float(len(raw)) / float(max(1, len(comp)))
+
 
 MIC_HALLUCINATIONS = {
     "ご視聴ありがとうございました",
@@ -1125,10 +1196,14 @@ class LocalMicSttEngine:
                     and hasattr(model, "encode")
                     and hasattr(model, "feature_extractor")
                 ):
-                    cl = next(
-                        (b for b in (4, 6, 8, 12) if b * WHISPER_SR >= len(audio_16k) + tail_pad_samples),
-                        12,
-                    )
+                    use_std_30s = _is_128mel_whisper_model(model)
+                    if use_std_30s:
+                        cl = 30
+                    else:
+                        cl = next(
+                            (b for b in (4, 6, 8, 12) if b * WHISPER_SR >= len(audio_16k) + tail_pad_samples),
+                            12,
+                        )
                     pad_samples = max(len(audio_16k), cl * WHISPER_SR)
                     padded = (
                         np.pad(
@@ -1169,17 +1244,17 @@ class LocalMicSttEngine:
 
                     tok = tokenizers[det_lang]
                     prev_tokens = self._get_prompt_hint_tokens(det_lang, tok) if raw_peak >= 0.012 else []
-                    prompt_ids = model.get_prompt(tok, prev_tokens, without_timestamps=True)
+                    prompt_ids = model.get_prompt(tok, prev_tokens, without_timestamps=(not use_std_30s))
                     supp_ids = _resolve_suppressed_tokens(model, tok)
                     gen_list = model.model.generate(
                         enc,
                         [prompt_ids],
                         beam_size=eff_beam,
-                        max_length=96,
+                        max_length=224 if use_std_30s else 96,
                         suppress_blank=True,
                         suppress_tokens=supp_ids,
-                        no_repeat_ngram_size=3,
-                        repetition_penalty=1.08,
+                        no_repeat_ngram_size=0 if use_std_30s else 3,
+                        repetition_penalty=1.0 if use_std_30s else 1.08,
                         return_scores=True,
                         return_no_speech_prob=True,
                     )
@@ -1188,8 +1263,36 @@ class LocalMicSttEngine:
                         mean_nsp = float(getattr(gen_res, "no_speech_prob", 0.0))
                         seq_ids = getattr(gen_res, "sequences_ids", None) or []
                         first_seq = seq_ids[0] if seq_ids else []
-                        tokens = [t for t in first_seq if t < tok.eot]
+                        ts_begin = getattr(tok, "timestamp_begin", None)
+                        if not isinstance(ts_begin, int) or isinstance(ts_begin, bool):
+                            ts_begin = None
+                        tokens = [t for t in first_seq if t < tok.eot and (ts_begin is None or t < ts_begin)]
                         text = _WS_MULTI_RE.sub(" ", tok.decode(tokens)).strip()
+                        orig_cr = _text_compression_ratio(text) if use_std_30s else 0.0
+                        if use_std_30s and orig_cr > 2.4:
+                            retry_list = model.model.generate(
+                                enc,
+                                [prompt_ids],
+                                beam_size=eff_beam,
+                                max_length=224,
+                                suppress_blank=True,
+                                suppress_tokens=supp_ids,
+                                no_repeat_ngram_size=3,
+                                repetition_penalty=1.08,
+                                return_scores=True,
+                                return_no_speech_prob=True,
+                            )
+                            if retry_list:
+                                retry_res = retry_list[0]
+                                retry_seq_ids = getattr(retry_res, "sequences_ids", None) or []
+                                retry_first = retry_seq_ids[0] if retry_seq_ids else []
+                                retry_tokens = [
+                                    t for t in retry_first if t < tok.eot and (ts_begin is None or t < ts_begin)
+                                ]
+                                retry_text = _WS_MULTI_RE.sub(" ", tok.decode(retry_tokens)).strip()
+                                if retry_text and _text_compression_ratio(retry_text) < orig_cr:
+                                    text = retry_text
+                                    mean_nsp = float(getattr(retry_res, "no_speech_prob", mean_nsp))
                     else:
                         mean_nsp = 1.0
                         text = ""
